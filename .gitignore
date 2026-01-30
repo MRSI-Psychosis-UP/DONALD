@@ -1,0 +1,6 @@
+__pycache__/
+bids_mrsi_viewer.py
+build/
+install_connectome_viewer.sh
+mrsiviewer.egg-info/
+set_cupy_path.sh

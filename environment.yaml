@@ -1,0 +1,29 @@
+name: mrsiviewer
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - nibabel
+  - python-dotenv
+  - tqdm
+  - rich
+  - pyqt        # Qt5 via conda (preferred)
+  - pyqtgraph   # optional plotting helper used in some tools
+  - pip:
+      - .
+      # Qt6 stack for parcel_viewer_qt (pip wheels)
+      - PyQt6
+      - PyQt6-Qt6
+      - PyQt6-sip
+      # Explicit PyQt5 wheels to satisfy bids_mrsi_viewer.py if conda pyqt is missing
+      - PyQt5
+      - PyQt5-Qt5
+      - PyQt5-sip
+      - PyQt6
+      - PyQt6-Qt6
+      - PyQt6-sip
