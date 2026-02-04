@@ -27,6 +27,7 @@ try:
         QListWidgetItem,
         QMainWindow,
         QPushButton,
+        QSplitter,
         QSpinBox,
         QVBoxLayout,
         QWidget,
@@ -50,6 +51,7 @@ except ImportError:
         QListWidgetItem,
         QMainWindow,
         QPushButton,
+        QSplitter,
         QSpinBox,
         QVBoxLayout,
         QWidget,
@@ -475,8 +477,13 @@ class ConnectomeViewer(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget(self)
         main_layout = QHBoxLayout(central)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setHandleWidth(10)
+        self.main_splitter.setChildrenCollapsible(False)
+        main_layout.addWidget(self.main_splitter)
 
-        controls_layout = QVBoxLayout()
+        left_panel = QWidget()
+        controls_layout = QVBoxLayout(left_panel)
 
         header = QLabel("Connectome matrices (.npz)")
         controls_layout.addWidget(header)
@@ -635,7 +642,8 @@ class ConnectomeViewer(QMainWindow):
 
         controls_layout.addStretch(1)
 
-        right_layout = QVBoxLayout()
+        center_panel = QWidget()
+        right_layout = QVBoxLayout(center_panel)
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
         self.canvas.mpl_connect("motion_notify_event", self._on_hover)
@@ -645,13 +653,18 @@ class ConnectomeViewer(QMainWindow):
         self.hover_label.setWordWrap(True)
         right_layout.addWidget(self.hover_label, 0)
 
-        right_panel_layout = QVBoxLayout()
+        right_panel = QWidget()
+        right_panel_layout = QVBoxLayout(right_panel)
         right_panel_layout.addWidget(gradients_group)
         right_panel_layout.addStretch(1)
 
-        main_layout.addLayout(controls_layout, 0)
-        main_layout.addLayout(right_layout, 1)
-        main_layout.addLayout(right_panel_layout, 0)
+        self.main_splitter.addWidget(left_panel)
+        self.main_splitter.addWidget(center_panel)
+        self.main_splitter.addWidget(right_panel)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
+        self.main_splitter.setSizes([420, 1000, 280])
 
         self.setCentralWidget(central)
         self.statusBar().showMessage("Ready.")
