@@ -3,3 +3,4 @@ bids_mrsi_viewer.py
 build/
 mrsiviewer.egg-info/
 set_cupy_path.sh
+*__init__.py
