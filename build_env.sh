@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ENV_NAME="mrsiviewer"
+ENV_NAME="donald"
 ENV_FILE="environment.yaml"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

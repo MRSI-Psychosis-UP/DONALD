@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import json
 import math
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -18,12 +20,14 @@ try:
         QApplication,
         QAbstractItemView,
         QDialog,
+        QGridLayout,
         QFileDialog,
         QCheckBox,
         QGroupBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QMessageBox,
         QComboBox,
         QListWidget,
         QListWidgetItem,
@@ -36,20 +40,23 @@ try:
         QVBoxLayout,
         QWidget,
     )
-    from PyQt6.QtGui import QIcon, QFontMetrics, QPixmap, QColor
+    from PyQt6.QtGui import QAction, QIcon, QFontMetrics, QPixmap, QColor
     QT_LIB = 6
 except ImportError:
     from PyQt5.QtCore import Qt, QSize
     from PyQt5.QtWidgets import (
+        QAction,
         QApplication,
         QAbstractItemView,
         QDialog,
+        QGridLayout,
         QFileDialog,
         QCheckBox,
         QGroupBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QMessageBox,
         QComboBox,
         QListWidget,
         QListWidgetItem,
@@ -64,6 +71,17 @@ except ImportError:
     )
     from PyQt5.QtGui import QIcon, QFontMetrics, QPixmap, QColor
     QT_LIB = 5
+
+try:
+    if QT_LIB == 6:
+        from PyQt6.QtGui import QPainter
+        from PyQt6.QtSvg import QSvgRenderer
+    else:
+        from PyQt5.QtGui import QPainter
+        from PyQt5.QtSvg import QSvgRenderer
+except Exception:
+    QPainter = None
+    QSvgRenderer = None
 
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -102,6 +120,42 @@ else:
         pass
 
 DEFAULT_COLORMAP = "plasma"
+DEFAULT_GRADIENT_COLORMAP = "spectrum_fsl"
+
+
+def _first_env_value(*names: str) -> str:
+    for name in names:
+        value = str(os.getenv(name, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+_MATLAB_FROM_ENV = _first_env_value(
+    "MRSI_MATLAB_CMD",
+    "MATLAB_CMD",
+    "MATLAB_EXECUTABLE",
+)
+_MATLAB_FROM_PATH = shutil.which("matlab")
+_MATLAB_DEFAULT_CANDIDATE = _MATLAB_FROM_ENV or _MATLAB_FROM_PATH or ""
+if _MATLAB_DEFAULT_CANDIDATE:
+    _matlab_path = Path(_MATLAB_DEFAULT_CANDIDATE).expanduser()
+    DEFAULT_MATLAB_CMD = str(_matlab_path.resolve()) if _matlab_path.exists() else str(_matlab_path)
+else:
+    DEFAULT_MATLAB_CMD = ""
+
+_NBS_FROM_ENV = _first_env_value(
+    "MRSI_NBS_PATH",
+    "MATLAB_NBS_PATH",
+    "NBS_PATH",
+)
+if _NBS_FROM_ENV:
+    _nbs_path = Path(_NBS_FROM_ENV).expanduser()
+    DEFAULT_MATLAB_NBS_PATH = str(_nbs_path.resolve()) if _nbs_path.exists() else str(_nbs_path)
+else:
+    DEFAULT_MATLAB_NBS_PATH = ""
+_CONFIG_HOME = Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config"))).expanduser()
+CONFIG_PATH = _CONFIG_HOME / "mrsi_viewer" / "connectome_viewer.json"
 COLORMAPS = [
     "plasma",
     "viridis",
@@ -150,6 +204,16 @@ def _user_role():
 USER_ROLE = _user_role()
 
 
+def _dialog_accepted_code():
+    accepted = getattr(QDialog, "Accepted", None)
+    if accepted is not None:
+        return accepted
+    dialog_code = getattr(QDialog, "DialogCode", None)
+    if dialog_code is not None and hasattr(dialog_code, "Accepted"):
+        return dialog_code.Accepted
+    return 1
+
+
 def _is_valid_matrix_shape(shape) -> bool:
     if len(shape) == 2:
         return shape[0] == shape[1]
@@ -175,7 +239,7 @@ def _average_to_square(matrix: np.ndarray) -> np.ndarray:
 
 
 def _load_matrix_from_npz(path: Path, key: str, average: bool = True) -> np.ndarray:
-    with np.load(path) as npz:
+    with np.load(path, allow_pickle=True) as npz:
         if key not in npz:
             raise KeyError(f"Key '{key}' not found")
         matrix = npz[key]
@@ -187,7 +251,7 @@ def _load_matrix_from_npz(path: Path, key: str, average: bool = True) -> np.ndar
 def _load_parcel_metadata(path: Path):
     labels = None
     names = None
-    with np.load(path) as npz:
+    with np.load(path, allow_pickle=True) as npz:
         for key in PARCEL_LABEL_KEYS:
             if key in npz:
                 labels = npz[key]
@@ -199,11 +263,11 @@ def _load_parcel_metadata(path: Path):
     if labels is None:
         labels_path = path.with_name("parcel_labels_group.npy")
         if labels_path.exists():
-            labels = np.load(labels_path)
+            labels = np.load(labels_path, allow_pickle=True)
     if names is None:
         names_path = path.with_name("parcel_names_group.npy")
         if names_path.exists():
-            names = np.load(names_path)
+            names = np.load(names_path, allow_pickle=True)
     return labels, names
 
 
@@ -380,7 +444,7 @@ def _parse_participant_id(value: str):
 def _get_valid_keys(path: Path):
     keys = []
     try:
-        with np.load(path) as npz:
+        with np.load(path, allow_pickle=True) as npz:
             for key in npz.files:
                 if key == "covars" or key in PARCEL_LABEL_KEYS or key in PARCEL_NAME_KEYS:
                     continue
@@ -514,6 +578,136 @@ class HistogramDialog(QDialog):
         self.canvas.draw_idle()
 
 
+class PreferencesDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        theme_name: str,
+        matrix_cmap: str,
+        gradient_cmap: str,
+        matlab_cmd: str,
+        matlab_nbs_path: str,
+        colormap_names,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.resize(720, 340)
+        self._colormap_names = list(colormap_names or [])
+        self._build_ui(
+            theme_name=theme_name,
+            matrix_cmap=matrix_cmap,
+            gradient_cmap=gradient_cmap,
+            matlab_cmd=matlab_cmd,
+            matlab_nbs_path=matlab_nbs_path,
+        )
+
+    def _build_ui(
+        self,
+        *,
+        theme_name: str,
+        matrix_cmap: str,
+        gradient_cmap: str,
+        matlab_cmd: str,
+        matlab_nbs_path: str,
+    ) -> None:
+        layout = QVBoxLayout(self)
+        form = QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(10)
+
+        row = 0
+        form.addWidget(QLabel("Theme"), row, 0)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Dark", "Light", "Teya", "Donald"])
+        if self.theme_combo.findText(theme_name) >= 0:
+            self.theme_combo.setCurrentText(theme_name)
+        else:
+            self.theme_combo.setCurrentText("Dark")
+        form.addWidget(self.theme_combo, row, 1, 1, 3)
+
+        row += 1
+        form.addWidget(QLabel("Default matrix color map"), row, 0)
+        self.matrix_cmap_combo = QComboBox()
+        self.matrix_cmap_combo.addItems(self._colormap_names)
+        if self.matrix_cmap_combo.findText(matrix_cmap) >= 0:
+            self.matrix_cmap_combo.setCurrentText(matrix_cmap)
+        elif self.matrix_cmap_combo.count() > 0:
+            self.matrix_cmap_combo.setCurrentIndex(0)
+        form.addWidget(self.matrix_cmap_combo, row, 1, 1, 3)
+
+        row += 1
+        form.addWidget(QLabel("Default gradients color map"), row, 0)
+        self.gradients_cmap_combo = QComboBox()
+        self.gradients_cmap_combo.addItems(self._colormap_names)
+        if self.gradients_cmap_combo.findText(gradient_cmap) >= 0:
+            self.gradients_cmap_combo.setCurrentText(gradient_cmap)
+        elif self.gradients_cmap_combo.count() > 0:
+            self.gradients_cmap_combo.setCurrentIndex(0)
+        form.addWidget(self.gradients_cmap_combo, row, 1, 1, 3)
+
+        row += 1
+        form.addWidget(QLabel("MATLAB executable"), row, 0)
+        self.matlab_cmd_edit = QLineEdit(str(matlab_cmd or DEFAULT_MATLAB_CMD))
+        form.addWidget(self.matlab_cmd_edit, row, 1, 1, 2)
+        matlab_browse_button = QPushButton("Browse")
+        matlab_browse_button.clicked.connect(self._browse_matlab_cmd)
+        form.addWidget(matlab_browse_button, row, 3)
+
+        row += 1
+        form.addWidget(QLabel("NBS path"), row, 0)
+        self.nbs_path_edit = QLineEdit(str(matlab_nbs_path or DEFAULT_MATLAB_NBS_PATH))
+        form.addWidget(self.nbs_path_edit, row, 1, 1, 2)
+        nbs_browse_button = QPushButton("Browse")
+        nbs_browse_button.clicked.connect(self._browse_nbs_path)
+        form.addWidget(nbs_browse_button, row, 3)
+
+        layout.addLayout(form)
+        layout.addStretch(1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(self.cancel_button)
+        self.save_button = QPushButton("Save Configuration")
+        self.save_button.clicked.connect(self.accept)
+        button_row.addWidget(self.save_button)
+        layout.addLayout(button_row)
+
+    def _browse_matlab_cmd(self) -> None:
+        current = self.matlab_cmd_edit.text().strip()
+        start_dir = str(Path(current).parent) if current else str(Path.home())
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select MATLAB executable",
+            start_dir,
+            "All files (*)",
+        )
+        if selected:
+            self.matlab_cmd_edit.setText(str(Path(selected).resolve()))
+
+    def _browse_nbs_path(self) -> None:
+        current = self.nbs_path_edit.text().strip()
+        start_dir = str(Path(current).expanduser()) if current else str(Path.home())
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select NBS directory",
+            start_dir,
+        )
+        if selected:
+            self.nbs_path_edit.setText(str(Path(selected).resolve()))
+
+    def values(self):
+        return {
+            "theme": self.theme_combo.currentText().strip(),
+            "matrix_colormap": self.matrix_cmap_combo.currentText().strip(),
+            "gradient_colormap": self.gradients_cmap_combo.currentText().strip(),
+            "matlab_cmd": self.matlab_cmd_edit.text().strip(),
+            "matlab_nbs_path": self.nbs_path_edit.text().strip(),
+        }
+
+
 class ConnectomeViewer(QMainWindow):
     _global_font_adjusted = False
 
@@ -530,21 +724,40 @@ class ConnectomeViewer(QMainWindow):
         self._current_axes = None
         self._colorbar = ColorBar()
         self._custom_cmaps = set()
+        self._preferences = self._load_preferences()
         self._last_gradients = None
         self._active_parcellation_path = None
         self._active_parcellation_img = None
         self._active_parcellation_data = None
         self._surface_dialog = None
         self._nbs_dialog = None
+        self._selector_dialog = None
+        self._harmonize_dialog = None
         self._left_panel_saved_width = 320
         self._right_panel_saved_width = 240
         self._plot_title_full = ""
         self._plot_title_tooltip = ""
-        self.setWindowTitle("Connectome Viewer")
+        self._theme_name = self._preferences["theme"]
+        self._default_matrix_colormap = self._preferences["matrix_colormap"]
+        self._default_gradient_colormap = self._preferences["gradient_colormap"]
+        self._matlab_cmd_default = self._preferences["matlab_cmd"]
+        self._matlab_nbs_path_default = self._preferences["matlab_nbs_path"]
+        self._zoom_level = int(self._preferences.get("zoom_level", 0))
+        self._base_app_font_point_size = None
+        app = QApplication.instance()
+        if app is not None:
+            app_font = app.font()
+            if app_font.pointSize() > 0:
+                self._base_app_font_point_size = app_font.pointSize()
+        self._compact_ui = False
+        self._styled_groups = []
+        self.setWindowTitle("Donald")
         self._set_window_icon()
         self.setAcceptDrops(True)
         self._hist_dialog = None
         self._build_ui()
+        self._build_menu_bar()
+        self._apply_zoom_level(self._zoom_level)
 
     @classmethod
     def _increase_global_font_size(cls) -> None:
@@ -570,6 +783,281 @@ class ConnectomeViewer(QMainWindow):
         app.setFont(font)
         cls._global_font_adjusted = True
 
+    @staticmethod
+    def _normalize_theme_name(theme_name: str) -> str:
+        theme = str(theme_name or "Dark").strip().title()
+        if theme not in {"Light", "Dark", "Teya", "Donald"}:
+            theme = "Dark"
+        return theme
+
+    def _default_preferences(self):
+        return {
+            "theme": "Dark",
+            "matrix_colormap": DEFAULT_COLORMAP,
+            "gradient_colormap": DEFAULT_GRADIENT_COLORMAP,
+            "matlab_cmd": DEFAULT_MATLAB_CMD,
+            "matlab_nbs_path": DEFAULT_MATLAB_NBS_PATH,
+            "zoom_level": 0,
+        }
+
+    def _available_colormap_names(self):
+        custom = _discover_custom_cmaps()
+        self._custom_cmaps = set(custom)
+        names = []
+        seen = set()
+        for name in COLORMAPS + COLORBAR_BARS + custom:
+            if name and name not in seen:
+                names.append(name)
+                seen.add(name)
+        return names
+
+    @staticmethod
+    def _normalize_executable_path(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        path = Path(text).expanduser()
+        if path.is_file():
+            try:
+                return str(path.resolve())
+            except Exception:
+                return str(path)
+        resolved = shutil.which(text)
+        if resolved:
+            try:
+                return str(Path(resolved).resolve())
+            except Exception:
+                return resolved
+        return text
+
+    @staticmethod
+    def _normalize_directory_path(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        path = Path(text).expanduser()
+        if path.is_dir():
+            try:
+                return str(path.resolve())
+            except Exception:
+                return str(path)
+        return str(path)
+
+    def _sanitize_preferences(self, raw_values):
+        prefs = dict(self._default_preferences())
+        if isinstance(raw_values, dict):
+            prefs.update(raw_values)
+        names = self._available_colormap_names()
+        fallback_matrix = (
+            DEFAULT_COLORMAP if DEFAULT_COLORMAP in names else (names[0] if names else DEFAULT_COLORMAP)
+        )
+        fallback_gradient = (
+            DEFAULT_GRADIENT_COLORMAP
+            if DEFAULT_GRADIENT_COLORMAP in names
+            else (names[0] if names else DEFAULT_GRADIENT_COLORMAP)
+        )
+        prefs["theme"] = self._normalize_theme_name(prefs.get("theme"))
+        matrix_name = str(prefs.get("matrix_colormap", fallback_matrix) or "").strip()
+        gradient_name = str(prefs.get("gradient_colormap", fallback_gradient) or "").strip()
+        prefs["matrix_colormap"] = matrix_name if matrix_name in names else fallback_matrix
+        prefs["gradient_colormap"] = gradient_name if gradient_name in names else fallback_gradient
+        matlab_cmd = str(prefs.get("matlab_cmd", DEFAULT_MATLAB_CMD) or "").strip()
+        matlab_cmd = self._normalize_executable_path(matlab_cmd)
+        default_matlab_cmd = self._normalize_executable_path(DEFAULT_MATLAB_CMD)
+        prefs["matlab_cmd"] = matlab_cmd or default_matlab_cmd or ""
+        matlab_nbs_path = str(prefs.get("matlab_nbs_path", DEFAULT_MATLAB_NBS_PATH) or "").strip()
+        matlab_nbs_path = self._normalize_directory_path(matlab_nbs_path)
+        default_nbs_path = self._normalize_directory_path(DEFAULT_MATLAB_NBS_PATH)
+        prefs["matlab_nbs_path"] = matlab_nbs_path or default_nbs_path or ""
+        try:
+            zoom_level = int(prefs.get("zoom_level", 0))
+        except Exception:
+            zoom_level = 0
+        prefs["zoom_level"] = max(-6, min(12, zoom_level))
+        return prefs
+
+    def _validate_nbs_preferences(self) -> bool:
+        matlab_cmd = self._normalize_executable_path(self._matlab_cmd_default)
+        nbs_path = self._normalize_directory_path(self._matlab_nbs_path_default)
+
+        matlab_ok = False
+        if matlab_cmd:
+            matlab_path = Path(matlab_cmd)
+            if matlab_path.is_file():
+                matlab_ok = True
+            elif shutil.which(matlab_cmd):
+                matlab_ok = True
+
+        nbs_ok = bool(nbs_path) and Path(nbs_path).is_dir()
+
+        if matlab_ok and nbs_ok:
+            self._matlab_cmd_default = matlab_cmd
+            self._matlab_nbs_path_default = nbs_path
+            return True
+
+        message = (
+            "NBS is not configured.\n"
+            "Go to Settings > Preferences and select valid MATLAB executable and NBS paths."
+        )
+        try:
+            QMessageBox.warning(self, "NBS Configuration Required", message)
+        except Exception:
+            pass
+        self.statusBar().showMessage(
+            "NBS blocked: configure MATLAB and NBS paths in Settings > Preferences."
+        )
+        return False
+
+    def _load_preferences(self):
+        if not CONFIG_PATH.exists():
+            return self._sanitize_preferences({})
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            raw = {}
+        return self._sanitize_preferences(raw)
+
+    def _save_preferences(self) -> bool:
+        payload = {
+            "theme": self._theme_name,
+            "matrix_colormap": self._default_matrix_colormap,
+            "gradient_colormap": self._default_gradient_colormap,
+            "matlab_cmd": self._matlab_cmd_default,
+            "matlab_nbs_path": self._matlab_nbs_path_default,
+            "zoom_level": int(self._zoom_level),
+        }
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+            return True
+        except Exception as exc:
+            self.statusBar().showMessage(f"Failed to save preferences: {exc}")
+            return False
+
+    def _build_menu_bar(self) -> None:
+        bar = self.menuBar()
+        bar.clear()
+
+        file_menu = bar.addMenu("File")
+        self.add_npz_action = QAction("Add NPZ", self)
+        self.add_npz_action.setShortcut("Ctrl+O")
+        self.add_npz_action.triggered.connect(self._open_files)
+        file_menu.addAction(self.add_npz_action)
+
+        file_menu.addSeparator()
+        close_action = QAction("Exit", self)
+        close_action.setShortcut("Ctrl+Q")
+        close_action.triggered.connect(self.close)
+        file_menu.addAction(close_action)
+
+        view_menu = bar.addMenu("View")
+        zoom_in_action = QAction("Zoom In", self)
+        zoom_in_action.setShortcut("Ctrl+=")
+        zoom_in_action.triggered.connect(self._zoom_in)
+        view_menu.addAction(zoom_in_action)
+
+        zoom_out_action = QAction("Zoom Out", self)
+        zoom_out_action.setShortcut("Ctrl+-")
+        zoom_out_action.triggered.connect(self._zoom_out)
+        view_menu.addAction(zoom_out_action)
+
+        zoom_reset_action = QAction("Reset Zoom", self)
+        zoom_reset_action.setShortcut("Ctrl+0")
+        zoom_reset_action.triggered.connect(self._zoom_reset)
+        view_menu.addAction(zoom_reset_action)
+
+        analysis_menu = bar.addMenu("Analysis")
+        self.compute_gradients_action = QAction("Compute Gradients", self)
+        self.compute_gradients_action.triggered.connect(self._compute_gradients)
+        analysis_menu.addAction(self.compute_gradients_action)
+
+        self.nbs_prepare_action = QAction("NBS Prepare", self)
+        self.nbs_prepare_action.triggered.connect(self._open_nbs_prepare_dialog)
+        analysis_menu.addAction(self.nbs_prepare_action)
+
+        self.harmonize_prepare_action = QAction("Harmonize Prepare", self)
+        self.harmonize_prepare_action.triggered.connect(self._open_harmonize_prepare_dialog)
+        analysis_menu.addAction(self.harmonize_prepare_action)
+
+        settings_menu = bar.addMenu("Settings")
+        preferences_action = QAction("Preferences", self)
+        preferences_action.triggered.connect(self._open_preferences_dialog)
+        settings_menu.addAction(preferences_action)
+
+        self._update_nbs_prepare_button()
+
+    def _apply_zoom_level(self, zoom_level: int, show_status: bool = False) -> None:
+        try:
+            level = int(zoom_level)
+        except Exception:
+            level = 0
+        level = max(-6, min(12, level))
+        self._zoom_level = level
+        if self._base_app_font_point_size is None:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        target_pt = max(7, self._base_app_font_point_size + level)
+        font = app.font()
+        if font.pointSize() <= 0:
+            return
+        font.setPointSize(target_pt)
+        app.setFont(font)
+        if show_status:
+            self.statusBar().showMessage(f"UI zoom: {target_pt} pt")
+
+    def _zoom_in(self) -> None:
+        self._apply_zoom_level(self._zoom_level + 1, show_status=True)
+
+    def _zoom_out(self) -> None:
+        self._apply_zoom_level(self._zoom_level - 1, show_status=True)
+
+    def _zoom_reset(self) -> None:
+        self._apply_zoom_level(0, show_status=True)
+
+    def _open_preferences_dialog(self) -> None:
+        names = self._available_colormap_names()
+        dialog = PreferencesDialog(
+            theme_name=self._theme_name,
+            matrix_cmap=self._default_matrix_colormap,
+            gradient_cmap=self._default_gradient_colormap,
+            matlab_cmd=self._matlab_cmd_default,
+            matlab_nbs_path=self._matlab_nbs_path_default,
+            colormap_names=names,
+            parent=self,
+        )
+        if dialog.exec() != _dialog_accepted_code():
+            return
+        new_values = dialog.values()
+        new_values["zoom_level"] = self._zoom_level
+        prefs = self._sanitize_preferences(new_values)
+        self._theme_name = prefs["theme"]
+        self._default_matrix_colormap = prefs["matrix_colormap"]
+        self._default_gradient_colormap = prefs["gradient_colormap"]
+        self._matlab_cmd_default = prefs["matlab_cmd"]
+        self._matlab_nbs_path_default = prefs["matlab_nbs_path"]
+        self._preferences = prefs
+
+        if getattr(self, "_nbs_dialog", None) is not None:
+            try:
+                self._nbs_dialog._matlab_cmd_default = self._matlab_cmd_default
+                self._nbs_dialog._matlab_nbs_path_default = self._matlab_nbs_path_default
+            except Exception:
+                pass
+
+        self._apply_theme(self._theme_name)
+        self._reload_colormaps()
+        if hasattr(self, "cmap_combo") and self.cmap_combo.findText(self._default_matrix_colormap) >= 0:
+            self.cmap_combo.setCurrentText(self._default_matrix_colormap)
+        if hasattr(self, "gradients_cmap_combo") and self.gradients_cmap_combo.findText(self._default_gradient_colormap) >= 0:
+            self.gradients_cmap_combo.setCurrentText(self._default_gradient_colormap)
+
+        if self._save_preferences():
+            self.statusBar().showMessage(f"Preferences saved to {CONFIG_PATH}.")
+
     def _build_ui(self) -> None:
         screen = QApplication.primaryScreen()
         screen_geom = screen.availableGeometry() if screen is not None else None
@@ -578,6 +1066,7 @@ class ConnectomeViewer(QMainWindow):
         if screen_geom is not None:
             compact_ui = screen_geom.width() <= 1600 or screen_geom.height() <= 900
         compact_ui = compact_ui or screen_dpi >= 120.0
+        self._compact_ui = compact_ui
 
         central = QWidget(self)
         main_layout = QHBoxLayout(central)
@@ -600,6 +1089,11 @@ class ConnectomeViewer(QMainWindow):
         self.export_button = QPushButton("Export Grid")
         self.export_button.clicked.connect(self._export_grid)
         export_layout.addWidget(self.export_button)
+
+        self.write_matrix_button = QPushButton("Write to File")
+        self.write_matrix_button.clicked.connect(self._write_selected_matrix_to_file)
+        self.write_matrix_button.setEnabled(False)
+        export_layout.addWidget(self.write_matrix_button)
 
         export_cols_label = QLabel("Export columns:")
         export_layout.addWidget(export_cols_label)
@@ -644,15 +1138,19 @@ class ConnectomeViewer(QMainWindow):
         selector_layout.addWidget(self.covar_combo)
 
         covar_value_label = QLabel("Covar value:")
-        selector_layout.addWidget(covar_value_label)
-
         self.covar_value_edit = QLineEdit("")
         self.covar_value_edit.setPlaceholderText("Numeric value")
-        selector_layout.addWidget(self.covar_value_edit)
+        # Hidden legacy selector widgets kept for compatibility with existing
+        # internals; aggregation now runs via popup dialog.
+        covar_label.hide()
+        self.covar_combo.hide()
+        covar_value_label.hide()
+        self.covar_value_edit.hide()
 
-        self.average_button = QPushButton("Average")
-        self.average_button.clicked.connect(self._average_selected)
-        selector_layout.addWidget(self.average_button)
+        self.selector_prepare_button = QPushButton("Prepare")
+        self.selector_prepare_button.clicked.connect(self._open_selector_prepare_dialog)
+        self.selector_prepare_button.setEnabled(False)
+        selector_layout.addWidget(self.selector_prepare_button)
 
         self.cmap_combo = QComboBox()
         self.cmap_combo.currentIndexChanged.connect(self._plot_selected)
@@ -761,24 +1259,21 @@ class ConnectomeViewer(QMainWindow):
         self.nbs_prepare_button.setEnabled(False)
         nbs_layout.addWidget(self.nbs_prepare_button)
 
-        group_style = (
-            "QGroupBox {"
-            "font-weight: 600;"
-            f"font-size: {'10pt' if compact_ui else '11pt'};"
-            "border: 1px solid #c9ced6;"
-            "border-radius: 6px;"
-            f"margin-top: {'8px' if compact_ui else '10px'};"
-            f"padding-top: {'4px' if compact_ui else '6px'};"
-            "background: #fcfcfc;"
-            "}"
-            "QGroupBox::title {"
-            "subcontrol-origin: margin;"
-            f"left: {'8px' if compact_ui else '10px'};"
-            "padding: 0 4px;"
-            "}"
-        )
-        for group in (list_group, selector_group, export_group, gradients_group, nbs_group):
-            group.setStyleSheet(group_style)
+        harmonize_group = QGroupBox("Harmonize")
+        harmonize_layout = QVBoxLayout(harmonize_group)
+        self.harmonize_prepare_button = QPushButton("Prepare")
+        self.harmonize_prepare_button.clicked.connect(self._open_harmonize_prepare_dialog)
+        self.harmonize_prepare_button.setEnabled(False)
+        harmonize_layout.addWidget(self.harmonize_prepare_button)
+
+        self._styled_groups = [
+            list_group,
+            selector_group,
+            export_group,
+            gradients_group,
+            nbs_group,
+            harmonize_group,
+        ]
 
         controls_layout.addWidget(list_group)
         controls_layout.addWidget(selector_group)
@@ -802,13 +1297,20 @@ class ConnectomeViewer(QMainWindow):
         if title_font.pointSize() > 0:
             title_font.setPointSize(max(title_font.pointSize() - 1, 9))
         self.plot_title_label.setFont(title_font)
-        self.plot_title_label.setStyleSheet("color: #2f3640;")
         self.plot_title_label.setToolTip("")
         plot_toolbar.addWidget(self.plot_title_label, 1)
 
         plot_toolbar.addWidget(QLabel("Color map:"))
         self.cmap_combo.setMinimumWidth(150 if compact_ui else 190)
         plot_toolbar.addWidget(self.cmap_combo)
+
+        plot_toolbar.addWidget(QLabel("Theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Dark", "Light", "Teya", "Donald"])
+        self.theme_combo.setCurrentText(self._theme_name)
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        self.theme_combo.setMinimumWidth(90 if compact_ui else 110)
+        plot_toolbar.addWidget(self.theme_combo)
 
         plot_toolbar.addWidget(QLabel("Display scaling:"))
         self.display_auto_check = QCheckBox("Auto")
@@ -849,6 +1351,7 @@ class ConnectomeViewer(QMainWindow):
         right_panel_layout = QVBoxLayout(right_panel)
         right_panel_layout.addWidget(gradients_group)
         right_panel_layout.addWidget(nbs_group)
+        right_panel_layout.addWidget(harmonize_group)
         right_panel_layout.addStretch(1)
         left_panel.setMinimumWidth(0)
         right_panel.setMinimumWidth(0)
@@ -879,7 +1382,7 @@ class ConnectomeViewer(QMainWindow):
                 self._right_panel_saved_width = current_sizes[2]
 
         self.setCentralWidget(central)
-        self._apply_button_icons(compact_ui=compact_ui)
+        self._apply_theme(self._theme_name)
         self._update_parcellation_label()
         self._refresh_sidebar_toggle_buttons()
         self._set_plot_title("")
@@ -891,13 +1394,245 @@ class ConnectomeViewer(QMainWindow):
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
-    def _svg_icon(self, filename: str) -> QIcon:
+    def _on_theme_changed(self, theme_name: str) -> None:
+        self._apply_theme(theme_name)
+
+    def _theme_icon_color(self) -> str:
+        if self._theme_name == "Dark":
+            return "#e8edf7"
+        if self._theme_name == "Teya":
+            return "#06b6b0"
+        if self._theme_name == "Donald":
+            return "#ffffff"
+        return "#1f2937"
+
+    def _base_theme_stylesheet(self) -> str:
+        if self._theme_name == "Dark":
+            return (
+                "QMainWindow, QWidget { background-color: #1f2430; color: #e5e7eb; }"
+                "QLabel { color: #e5e7eb; }"
+                "QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QTableWidget, QProgressBar {"
+                "background: #2a3140; color: #e5e7eb; border: 1px solid #556070; border-radius: 5px; padding: 4px;"
+                "}"
+                "QPushButton {"
+                "background: #2d3646; color: #e5e7eb; border: 1px solid #5f6d82; border-radius: 6px; padding: 5px 10px;"
+                "}"
+                "QPushButton:hover { background: #374256; }"
+                "QPushButton:pressed { background: #2b3444; }"
+                "QPushButton:disabled { color: #8e98a8; background: #252c38; border-color: #464f5e; }"
+                "QListWidget::item:selected, QTableWidget::item:selected { background: #3b82f6; color: #ffffff; }"
+                "QComboBox QAbstractItemView { background: #2a3140; color: #e5e7eb; selection-background-color: #3b82f6; }"
+                "QStatusBar { background: #242a35; color: #e5e7eb; border-top: 1px solid #3d4556; }"
+                "QToolTip { background-color: #101722; color: #e5e7eb; border: 1px solid #4b5563; }"
+            )
+        if self._theme_name == "Teya":
+            return (
+                "QMainWindow, QWidget { background-color: #ffd0e5; color: #0b7f7a; }"
+                "QLabel { color: #0b7f7a; }"
+                "QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QTableWidget, QProgressBar {"
+                "background: #ffe6f1; color: #0b7f7a; border: 1px solid #1db8b2; border-radius: 5px; padding: 4px;"
+                "}"
+                "QPushButton {"
+                "background: #ffc0dc; color: #0b7f7a; border: 1px solid #1db8b2; border-radius: 6px; padding: 5px 10px;"
+                "}"
+                "QPushButton:hover { background: #ffb1d5; }"
+                "QPushButton:pressed { background: #ffa3cd; }"
+                "QPushButton:disabled { color: #68a9a6; background: #ffd9ea; border-color: #87cfcb; }"
+                "QListWidget::item:selected, QTableWidget::item:selected { background: #2ecfc9; color: #073f3c; }"
+                "QComboBox QAbstractItemView { background: #ffe6f1; color: #0b7f7a; selection-background-color: #2ecfc9; }"
+                "QStatusBar { background: #ffbddb; color: #0b7f7a; border-top: 1px solid #1db8b2; }"
+                "QToolTip { background-color: #ffeef6; color: #0b7f7a; border: 1px solid #1db8b2; }"
+            )
+        if self._theme_name == "Donald":
+            return (
+                "QMainWindow, QWidget { background-color: #d97706; color: #ffffff; }"
+                "QLabel { color: #ffffff; }"
+                "QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QTableWidget, QProgressBar {"
+                "background: #c96a04; color: #ffffff; border: 1px solid #f3a451; border-radius: 5px; padding: 4px;"
+                "}"
+                "QPushButton {"
+                "background: #b85f00; color: #ffffff; border: 1px solid #f3a451; border-radius: 6px; padding: 5px 10px;"
+                "}"
+                "QPushButton:hover { background: #c76b06; }"
+                "QPushButton:pressed { background: #a85400; }"
+                "QPushButton:disabled { color: #ffe3be; background: #d58933; border-color: #f0b97c; }"
+                "QListWidget::item:selected, QTableWidget::item:selected { background: #2563eb; color: #ffffff; }"
+                "QComboBox QAbstractItemView { background: #c96a04; color: #ffffff; selection-background-color: #2563eb; }"
+                "QStatusBar { background: #b85f00; color: #ffffff; border-top: 1px solid #f3a451; }"
+                "QToolTip { background-color: #f08c19; color: #ffffff; border: 1px solid #ffd19e; }"
+            )
+        return (
+            "QMainWindow, QWidget { background-color: #f3f5f8; color: #1f2937; }"
+            "QLabel { color: #1f2937; }"
+            "QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QTableWidget, QProgressBar {"
+            "background: #ffffff; color: #111827; border: 1px solid #c9d0da; border-radius: 5px; padding: 4px;"
+            "}"
+            "QPushButton {"
+            "background: #ffffff; color: #1f2937; border: 1px solid #b7c0cc; border-radius: 6px; padding: 5px 10px;"
+            "}"
+            "QPushButton:hover { background: #edf2f7; }"
+            "QPushButton:pressed { background: #e6ebf2; }"
+            "QPushButton:disabled { color: #9099a5; background: #edf1f5; border-color: #d2d9e2; }"
+            "QListWidget::item:selected, QTableWidget::item:selected { background: #2563eb; color: #ffffff; }"
+            "QComboBox QAbstractItemView { background: #ffffff; color: #111827; selection-background-color: #2563eb; }"
+            "QStatusBar { background: #e8edf3; color: #1f2937; border-top: 1px solid #cfd7e2; }"
+            "QToolTip { background-color: #ffffff; color: #1f2937; border: 1px solid #c9d0da; }"
+        )
+
+    def _groupbox_stylesheet(self) -> str:
+        font_pt = "10pt" if self._compact_ui else "11pt"
+        margin_top = "8px" if self._compact_ui else "10px"
+        title_left = "8px" if self._compact_ui else "10px"
+        padding_top = "4px" if self._compact_ui else "6px"
+        if self._theme_name == "Dark":
+            border_color = "#4f5a6b"
+            bg_color = "#242b36"
+            text_color = "#e5e7eb"
+        elif self._theme_name == "Teya":
+            border_color = "#1db8b2"
+            bg_color = "#ffe0ef"
+            text_color = "#0b7f7a"
+        elif self._theme_name == "Donald":
+            border_color = "#f3a451"
+            bg_color = "#c96a04"
+            text_color = "#ffffff"
+        else:
+            border_color = "#c9ced6"
+            bg_color = "#fcfcfc"
+            text_color = "#1f2937"
+        return (
+            "QGroupBox {"
+            "font-weight: 600;"
+            f"font-size: {font_pt};"
+            f"color: {text_color};"
+            f"border: 1px solid {border_color};"
+            "border-radius: 6px;"
+            f"margin-top: {margin_top};"
+            f"padding-top: {padding_top};"
+            f"background: {bg_color};"
+            "}"
+            "QGroupBox::title {"
+            "subcontrol-origin: margin;"
+            f"left: {title_left};"
+            "padding: 0 4px;"
+            "}"
+        )
+
+    def _apply_groupbox_style(self) -> None:
+        style = self._groupbox_stylesheet()
+        for group in self._styled_groups:
+            if group is not None:
+                group.setStyleSheet(style)
+
+    def _apply_theme(self, theme_name: str) -> None:
+        theme = (theme_name or "Dark").strip().title()
+        if theme not in {"Light", "Dark", "Teya", "Donald"}:
+            theme = "Dark"
+        self._theme_name = theme
+        if hasattr(self, "theme_combo") and self.theme_combo.currentText() != theme:
+            self.theme_combo.blockSignals(True)
+            self.theme_combo.setCurrentText(theme)
+            self.theme_combo.blockSignals(False)
+
+        self.setStyleSheet(self._base_theme_stylesheet())
+        self._apply_groupbox_style()
+        if hasattr(self, "plot_title_label"):
+            if theme == "Dark":
+                plot_color = "#e5e7eb"
+            elif theme == "Teya":
+                plot_color = "#0b7f7a"
+            elif theme == "Donald":
+                plot_color = "#ffffff"
+            else:
+                plot_color = "#2f3640"
+            self.plot_title_label.setStyleSheet(f"color: {plot_color};")
+        self._apply_button_icons(
+            compact_ui=self._compact_ui,
+            color=self._theme_icon_color(),
+        )
+        if getattr(self, "_nbs_dialog", None) is not None and hasattr(self._nbs_dialog, "set_theme"):
+            try:
+                self._nbs_dialog.set_theme(theme)
+            except Exception:
+                pass
+        if getattr(self, "_selector_dialog", None) is not None and hasattr(self._selector_dialog, "set_theme"):
+            try:
+                self._selector_dialog.set_theme(theme)
+            except Exception:
+                pass
+        if getattr(self, "_harmonize_dialog", None) is not None and hasattr(self._harmonize_dialog, "set_theme"):
+            try:
+                self._harmonize_dialog.set_theme(theme)
+            except Exception:
+                pass
+        if getattr(self, "_surface_dialog", None) is not None and hasattr(
+            self._surface_dialog, "set_theme"
+        ):
+            try:
+                self._surface_dialog.set_theme(theme)
+            except Exception:
+                pass
+
+    def _svg_icon(self, filename: str, color: str = None) -> QIcon:
         icon_path = Path(__file__).with_name("icons") / "svg" / filename
-        if icon_path.exists():
-            return QIcon(str(icon_path))
+        if not icon_path.exists():
+            return QIcon()
+
+        svg_text = None
+        if color:
+            try:
+                svg_text = icon_path.read_text(encoding="utf-8")
+                svg_text = svg_text.replace("currentColor", color).replace("currentcolor", color)
+            except Exception:
+                svg_text = None
+
+        if svg_text:
+            try:
+                pixmap = QPixmap()
+                if pixmap.loadFromData(svg_text.encode("utf-8"), "SVG"):
+                    return QIcon(pixmap)
+            except Exception:
+                pass
+            if QSvgRenderer is not None and QPainter is not None:
+                try:
+                    renderer = QSvgRenderer(svg_text.encode("utf-8"))
+                    if renderer.isValid():
+                        size = renderer.defaultSize()
+                        if not size.isValid():
+                            size = QSize(24, 24)
+                        pixmap = QPixmap(size)
+                        transparent = Qt.GlobalColor.transparent if QT_LIB == 6 else Qt.transparent
+                        pixmap.fill(transparent)
+                        painter = QPainter(pixmap)
+                        renderer.render(painter)
+                        painter.end()
+                        return QIcon(pixmap)
+                except Exception:
+                    pass
+
+        icon = QIcon(str(icon_path))
+        if not icon.isNull():
+            return icon
+
+        if QSvgRenderer is not None and QPainter is not None:
+            try:
+                renderer = QSvgRenderer(str(icon_path))
+                if renderer.isValid():
+                    size = renderer.defaultSize()
+                    if not size.isValid():
+                        size = QSize(24, 24)
+                    pixmap = QPixmap(size)
+                    transparent = Qt.GlobalColor.transparent if QT_LIB == 6 else Qt.transparent
+                    pixmap.fill(transparent)
+                    painter = QPainter(pixmap)
+                    renderer.render(painter)
+                    painter.end()
+                    return QIcon(pixmap)
+            except Exception:
+                pass
         return QIcon()
 
-    def _apply_button_icons(self, compact_ui: bool = False) -> None:
+    def _apply_button_icons(self, compact_ui: bool = False, color: str = None) -> None:
         icon_size = QSize(16, 16) if compact_ui else QSize(18, 18)
         mapping = [
             (getattr(self, "add_button", None), "folder_plus.svg"),
@@ -905,20 +1640,22 @@ class ConnectomeViewer(QMainWindow):
             (getattr(self, "clear_button", None), "broom_clear.svg"),
             (getattr(self, "hist_button", None), "histogram.svg"),
             (getattr(self, "export_button", None), "export_grid.svg"),
+            (getattr(self, "write_matrix_button", None), "save_disk.svg"),
             (getattr(self, "move_up_button", None), "arrow_up.svg"),
             (getattr(self, "move_down_button", None), "arrow_down.svg"),
             (getattr(self, "gradients_compute_button", None), "play_circle_compute.svg"),
             (getattr(self, "gradients_save_button", None), "save_disk.svg"),
             (getattr(self, "gradients_render_button", None), "cube_3d.svg"),
             (getattr(self, "nbs_prepare_button", None), "wrench_prepare.svg"),
+            (getattr(self, "harmonize_prepare_button", None), "wrench_prepare.svg"),
             (getattr(self, "select_parcellation_button", None), "settings_sliders.svg"),
-            (getattr(self, "average_button", None), "filter_threshold.svg"),
+            (getattr(self, "selector_prepare_button", None), "filter_threshold.svg"),
             (getattr(self, "sample_add_button", None), "folder_plus.svg"),
         ]
         for button, icon_name in mapping:
             if button is None:
                 continue
-            icon = self._svg_icon(icon_name)
+            icon = self._svg_icon(icon_name, color=color)
             if icon.isNull():
                 continue
             button.setIcon(icon)
@@ -1050,9 +1787,64 @@ class ConnectomeViewer(QMainWindow):
         return {"path": source_path, "key": key, "stack_len": int(raw.shape[axis])}
 
     def _update_nbs_prepare_button(self) -> None:
+        enabled = self._current_nbs_source() is not None
         if not hasattr(self, "nbs_prepare_button"):
+            if hasattr(self, "nbs_prepare_action"):
+                self.nbs_prepare_action.setEnabled(enabled)
+            self._update_selector_prepare_button()
+            self._update_harmonize_prepare_button()
             return
-        self.nbs_prepare_button.setEnabled(self._current_nbs_source() is not None)
+        self.nbs_prepare_button.setEnabled(enabled)
+        if hasattr(self, "nbs_prepare_action"):
+            self.nbs_prepare_action.setEnabled(enabled)
+        self._update_selector_prepare_button()
+        self._update_harmonize_prepare_button()
+
+    def _current_selector_source(self):
+        return self._current_nbs_source()
+
+    def _current_harmonize_source(self):
+        return self._current_nbs_source()
+
+    def _update_selector_prepare_button(self) -> None:
+        if not hasattr(self, "selector_prepare_button"):
+            return
+        source = self._current_selector_source()
+        enabled = False
+        if source is not None:
+            source_path = source["path"]
+            info = self._covars_cache.get(source_path)
+            if info is None:
+                info = _load_covars_info(source_path)
+                self._covars_cache[source_path] = info
+            enabled = bool(_covars_columns(info))
+        self.selector_prepare_button.setEnabled(enabled)
+        self._update_harmonize_prepare_button()
+        self._update_write_to_file_button()
+
+    def _update_harmonize_prepare_button(self) -> None:
+        if not hasattr(self, "harmonize_prepare_button"):
+            if hasattr(self, "harmonize_prepare_action"):
+                self.harmonize_prepare_action.setEnabled(False)
+            return
+        source = self._current_harmonize_source()
+        enabled = False
+        if source is not None:
+            source_path = source["path"]
+            info = self._covars_cache.get(source_path)
+            if info is None:
+                info = _load_covars_info(source_path)
+                self._covars_cache[source_path] = info
+            enabled = bool(_covars_columns(info))
+        self.harmonize_prepare_button.setEnabled(enabled)
+        if hasattr(self, "harmonize_prepare_action"):
+            self.harmonize_prepare_action.setEnabled(enabled)
+
+    def _update_write_to_file_button(self) -> None:
+        if not hasattr(self, "write_matrix_button"):
+            return
+        entry = self._current_entry()
+        self.write_matrix_button.setEnabled(entry is not None)
 
     def _open_nbs_prepare_dialog(self) -> None:
         source = self._current_nbs_source()
@@ -1060,6 +1852,8 @@ class ConnectomeViewer(QMainWindow):
             self.statusBar().showMessage(
                 "NBS Prepare requires a file-based matrix stack (multiple matrices)."
             )
+            return
+        if not self._validate_nbs_preferences():
             return
 
         source_path = source["path"]
@@ -1098,12 +1892,199 @@ class ConnectomeViewer(QMainWindow):
             covars_info=covars_info,
             source_path=source_path,
             matrix_key=source["key"],
+            matlab_cmd_default=self._matlab_cmd_default,
+            matlab_nbs_path_default=self._matlab_nbs_path_default,
+            theme_name=self._theme_name,
             parent=self,
         )
         self._nbs_dialog.show()
         self.statusBar().showMessage(
             f"Opened NBS Prepare ({source_path.name}, key={source['key']})."
         )
+
+    def _open_selector_prepare_dialog(self) -> None:
+        source = self._current_selector_source()
+        if source is None:
+            self.statusBar().showMessage(
+                "Selector Prepare requires a file-based matrix stack (multiple matrices)."
+            )
+            return
+
+        source_path = source["path"]
+        covars_info = self._covars_cache.get(source_path)
+        if covars_info is None:
+            covars_info = _load_covars_info(source_path)
+            self._covars_cache[source_path] = covars_info
+        if covars_info is None:
+            self.statusBar().showMessage("Covars not found in selected file.")
+            return
+
+        covars_len = 0
+        df = covars_info.get("df")
+        if df is not None:
+            covars_len = len(df)
+        else:
+            data = covars_info.get("data")
+            if data is not None:
+                covars_len = len(data)
+        if covars_len and covars_len != source["stack_len"]:
+            self.statusBar().showMessage("Covars length does not match matrix stack size.")
+            return
+
+        try:
+            from window.selector_prepare import SelectorPrepareDialog
+        except Exception:
+            try:
+                from mrsi_viewer.window.selector_prepare import SelectorPrepareDialog
+            except Exception as exc:
+                self.statusBar().showMessage(f"Failed to open Selector window: {exc}")
+                return
+
+        self._selector_dialog = SelectorPrepareDialog(
+            covars_info=covars_info,
+            source_path=source_path,
+            matrix_key=source["key"],
+            theme_name=self._theme_name,
+            export_callback=self._import_selector_aggregate,
+            parent=self,
+        )
+        self._selector_dialog.show()
+        self.statusBar().showMessage(
+            f"Opened Selector Prepare ({source_path.name}, key={source['key']})."
+        )
+
+    def _open_harmonize_prepare_dialog(self) -> None:
+        source = self._current_harmonize_source()
+        if source is None:
+            self.statusBar().showMessage(
+                "Harmonize Prepare requires a file-based matrix stack (multiple matrices)."
+            )
+            return
+
+        source_path = source["path"]
+        covars_info = self._covars_cache.get(source_path)
+        if covars_info is None:
+            covars_info = _load_covars_info(source_path)
+            self._covars_cache[source_path] = covars_info
+        if covars_info is None:
+            self.statusBar().showMessage("Covars not found in selected file.")
+            return
+
+        covars_len = 0
+        df = covars_info.get("df")
+        if df is not None:
+            covars_len = len(df)
+        else:
+            data = covars_info.get("data")
+            if data is not None:
+                covars_len = len(data)
+        if covars_len and covars_len != source["stack_len"]:
+            self.statusBar().showMessage("Covars length does not match matrix stack size.")
+            return
+
+        try:
+            from window.harmonize_prepare import HarmonizePrepareDialog
+        except Exception:
+            try:
+                from mrsi_viewer.window.harmonize_prepare import HarmonizePrepareDialog
+            except Exception as exc:
+                self.statusBar().showMessage(f"Failed to open Harmonize window: {exc}")
+                return
+
+        self._harmonize_dialog = HarmonizePrepareDialog(
+            covars_info=covars_info,
+            source_path=source_path,
+            matrix_key=source["key"],
+            theme_name=self._theme_name,
+            export_callback=self._import_harmonized_result,
+            parent=self,
+        )
+        self._harmonize_dialog.show()
+        self.statusBar().showMessage(
+            f"Opened Harmonize Prepare ({source_path.name}, key={source['key']})."
+        )
+
+    def _import_harmonized_result(self, payload) -> bool:
+        output_raw = str(payload.get("output_path") or "").strip()
+        if not output_raw:
+            self.statusBar().showMessage("Harmonize export payload missing output path.")
+            return False
+        output_path = Path(output_raw)
+        if not output_path.is_file():
+            self.statusBar().showMessage(f"Harmonized file not found: {output_path}")
+            return False
+
+        self._add_files([str(output_path)])
+        target_id = self._file_entry_id(output_path)
+        selected = False
+        for row in range(self.file_list.count()):
+            item = self.file_list.item(row)
+            if item is None:
+                continue
+            if item.data(USER_ROLE) == target_id:
+                self.file_list.setCurrentItem(item)
+                selected = True
+                break
+        if not selected:
+            self.statusBar().showMessage(
+                f"Harmonized file saved to {output_path.name} (already in workspace)."
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Imported harmonized matrix stack: {output_path.name}."
+            )
+        return True
+
+    def _import_selector_aggregate(self, payload) -> bool:
+        try:
+            matrix = np.asarray(payload.get("matrix"), dtype=float)
+        except Exception as exc:
+            self.statusBar().showMessage(f"Invalid aggregated matrix payload: {exc}")
+            return False
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            self.statusBar().showMessage("Aggregated matrix must be square.")
+            return False
+
+        source_path_raw = str(payload.get("source_path", "")).strip()
+        source_path = Path(source_path_raw) if source_path_raw else None
+        source_name = source_path.name if source_path is not None else "matrix"
+        matrix_key = str(payload.get("matrix_key") or "matrix")
+        method = str(payload.get("method") or "mean").strip().lower()
+        method_label = "zfisher" if method == "zfisher" else "avg"
+        selected_rows = list(payload.get("selected_rows") or [])
+        n_selected = len(selected_rows)
+        n_total = int(payload.get("n_total_rows") or n_selected)
+        filter_covar = str(payload.get("filter_covar") or "").strip()
+        filter_values = [str(v) for v in (payload.get("filter_values") or []) if str(v) != ""]
+
+        if filter_covar and filter_values:
+            filter_text = f"{filter_covar}={','.join(filter_values)}"
+        else:
+            filter_text = f"n={n_selected}/{n_total}"
+        label = f"{method_label} {matrix_key} [{filter_text}] ({source_name})"
+
+        derived_id = self._new_derived_id()
+        self._entries[derived_id] = {
+            "id": derived_id,
+            "kind": "derived",
+            "matrix": matrix,
+            "source_path": source_path,
+            "selected_key": matrix_key,
+            "sample_index": None,
+            "auto_title": True,
+            "label": label,
+            "aggregation_method": method,
+            "selected_rows": selected_rows,
+            "covar_name": filter_covar or None,
+            "covar_value": ",".join(filter_values) if filter_values else None,
+        }
+        self.titles[derived_id] = label
+        item = QListWidgetItem(label)
+        item.setData(USER_ROLE, derived_id)
+        self.file_list.addItem(item)
+        self.file_list.setCurrentItem(item)
+        self.statusBar().showMessage(f"Imported aggregated matrix ({method_label}).")
+        return True
 
     def _open_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1191,9 +2172,10 @@ class ConnectomeViewer(QMainWindow):
         if info is None:
             info = _load_covars_info(source_path)
             self._covars_cache[source_path] = info
+        columns = _covars_columns(info)
+        # Keep legacy fields populated for compatibility with existing metadata.
         self.covar_combo.blockSignals(True)
         self.covar_combo.clear()
-        columns = _covars_columns(info)
         for col in columns:
             self.covar_combo.addItem(col)
         covar_name = entry.get("covar_name")
@@ -1202,7 +2184,7 @@ class ConnectomeViewer(QMainWindow):
         self.covar_combo.blockSignals(False)
         enabled = self.covar_combo.count() > 0
         self.covar_combo.setEnabled(enabled)
-        self.average_button.setEnabled(enabled)
+        self._update_selector_prepare_button()
 
     def _default_title_for_entry(self, entry) -> str:
         base_label = entry.get("label", "Matrix")
@@ -1300,27 +2282,24 @@ class ConnectomeViewer(QMainWindow):
         self.sample_spin.blockSignals(False)
 
     def _reload_colormaps(self) -> None:
-        custom = _discover_custom_cmaps()
-        self._custom_cmaps = set(custom)
+        names = self._available_colormap_names()
         current = self.cmap_combo.currentText() if hasattr(self, "cmap_combo") else ""
         current_3d = (
             self.gradients_cmap_combo.currentText()
             if hasattr(self, "gradients_cmap_combo")
             else ""
         )
-        names = []
-        seen = set()
-        for name in COLORMAPS + COLORBAR_BARS + custom:
-            if name not in seen:
-                names.append(name)
-                seen.add(name)
         self.cmap_combo.blockSignals(True)
         self.cmap_combo.clear()
         self.cmap_combo.addItems(names)
         if current and current in names:
             self.cmap_combo.setCurrentText(current)
+        elif self._default_matrix_colormap in names:
+            self.cmap_combo.setCurrentText(self._default_matrix_colormap)
         elif DEFAULT_COLORMAP in names:
             self.cmap_combo.setCurrentText(DEFAULT_COLORMAP)
+        elif names:
+            self.cmap_combo.setCurrentIndex(0)
         self.cmap_combo.blockSignals(False)
 
         if hasattr(self, "gradients_cmap_combo"):
@@ -1329,6 +2308,8 @@ class ConnectomeViewer(QMainWindow):
             self.gradients_cmap_combo.addItems(names)
             if current_3d and current_3d in names:
                 self.gradients_cmap_combo.setCurrentText(current_3d)
+            elif self._default_gradient_colormap in names:
+                self.gradients_cmap_combo.setCurrentText(self._default_gradient_colormap)
             elif "spectrum_fsl" in names:
                 self.gradients_cmap_combo.setCurrentText("spectrum_fsl")
             elif names:
@@ -1549,6 +2530,122 @@ class ConnectomeViewer(QMainWindow):
             matrix = raw
         return matrix, key
 
+    @staticmethod
+    def _safe_name_fragment(text: str) -> str:
+        token = str(text or "").strip()
+        if not token:
+            return "matrix"
+        cleaned = []
+        for ch in token:
+            if ch.isalnum() or ch in {"-", "_"}:
+                cleaned.append(ch)
+            else:
+                cleaned.append("_")
+        out = "".join(cleaned).strip("_")
+        while "__" in out:
+            out = out.replace("__", "_")
+        return out or "matrix"
+
+    def _collect_export_metadata(self, entry, selected_key):
+        metadata = {}
+        labels = None
+        names = None
+
+        source_path_raw = entry.get("source_path", entry.get("path"))
+        source_path = Path(source_path_raw) if source_path_raw else None
+        if source_path is not None and source_path.exists():
+            try:
+                with np.load(source_path, allow_pickle=True) as npz:
+                    for key in PARCEL_LABEL_KEYS:
+                        if key in npz:
+                            labels = np.asarray(npz[key])
+                            break
+                    for key in PARCEL_NAME_KEYS:
+                        if key in npz:
+                            names = np.asarray(npz[key])
+                            break
+                    for key in ("group", "modality", "metabolites"):
+                        if key in npz:
+                            metadata[key] = np.asarray(npz[key])
+            except Exception:
+                pass
+
+            if labels is None or names is None:
+                try:
+                    extra_labels, extra_names = _load_parcel_metadata(source_path)
+                    if labels is None and extra_labels is not None:
+                        labels = np.asarray(extra_labels)
+                    if names is None and extra_names is not None:
+                        names = np.asarray(extra_names)
+                except Exception:
+                    pass
+
+        if labels is None and self._current_parcel_labels:
+            labels = np.asarray(self._current_parcel_labels)
+        if names is None and self._current_parcel_names:
+            names = np.asarray(self._current_parcel_names)
+
+        if labels is not None:
+            metadata["parcel_labels_group"] = labels
+        if names is not None:
+            metadata["parcel_names_group"] = names
+        if source_path is not None:
+            metadata["source_file"] = np.asarray(str(source_path))
+        if selected_key:
+            metadata["source_key"] = np.asarray(str(selected_key))
+        sample_index = entry.get("sample_index")
+        if sample_index is not None:
+            try:
+                metadata["sample_index"] = np.asarray(int(sample_index))
+            except Exception:
+                pass
+        return metadata
+
+    def _write_selected_matrix_to_file(self) -> None:
+        entry = self._current_entry()
+        if entry is None:
+            self.statusBar().showMessage("No matrix selected.")
+            return
+
+        try:
+            matrix, selected_key = self._matrix_for_entry(entry)
+        except Exception as exc:
+            self.statusBar().showMessage(f"Failed to resolve selected matrix: {exc}")
+            return
+
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            self.statusBar().showMessage("Selected matrix is not a square 2D matrix.")
+            return
+
+        source_path_raw = entry.get("source_path", entry.get("path"))
+        source_path = Path(source_path_raw) if source_path_raw else None
+        source_stem = source_path.stem if source_path is not None else self._safe_name_fragment(entry.get("label", "matrix"))
+        key_part = self._safe_name_fragment(selected_key or "matrix")
+        default_name = f"{self._safe_name_fragment(source_stem)}_{key_part}_matrix_pop_avg.npz"
+        start_dir = self._default_dialog_dir()
+
+        save_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Write selected matrix to NPZ",
+            str(start_dir / default_name),
+            "NumPy archive (*.npz);;All files (*)",
+        )
+        if not save_path:
+            return
+        output_path = Path(save_path)
+        if output_path.suffix.lower() != ".npz":
+            output_path = output_path.with_suffix(".npz")
+
+        payload = {"matrix_pop_avg": matrix}
+        payload.update(self._collect_export_metadata(entry, selected_key))
+        try:
+            np.savez(output_path, **payload)
+        except Exception as exc:
+            self.statusBar().showMessage(f"Failed to write NPZ: {exc}")
+            return
+        self.statusBar().showMessage(f"Wrote selected matrix to {output_path.name}.")
+
     def _export_grid(self) -> None:
         if self.file_list.count() == 0:
             self.statusBar().showMessage("No matrices to export.")
@@ -1666,6 +2763,7 @@ class ConnectomeViewer(QMainWindow):
         else:
             self.title_edit.setText(self.titles.get(entry_id, entry.get("label", "Matrix")))
         self._plot_selected()
+        self._update_write_to_file_button()
 
     def _plot_selected(self, *_args) -> None:
         entry_id = self._current_entry_id()
@@ -1806,7 +2904,7 @@ class ConnectomeViewer(QMainWindow):
             return
 
         try:
-            with np.load(source_path) as npz:
+            with np.load(source_path, allow_pickle=True) as npz:
                 if key not in npz:
                     raise KeyError(f"Key '{key}' not found")
                 matrix = npz[key]
@@ -2125,6 +3223,7 @@ class ConnectomeViewer(QMainWindow):
                 title=title,
                 cmap=self._selected_surface_colormap(),
                 cmap_name=cmap_name,
+                theme_name=self._theme_name,
                 parent=self,
             )
             screen = QApplication.primaryScreen()
@@ -2151,6 +3250,7 @@ class ConnectomeViewer(QMainWindow):
         self._set_plot_title("")
         self._reset_gradients_output()
         self._update_nbs_prepare_button()
+        self._update_write_to_file_button()
         self.hover_label.setText("")
         self.canvas.draw_idle()
 
@@ -2254,7 +3354,7 @@ def main() -> int:
 
     window = ConnectomeViewer()
     if splash is not None:
-        splash.showMessage("Starting Connectome Viewer...", splash_align, QColor("white"))
+        splash.showMessage("Starting Donald...", splash_align, QColor("white"))
         app.processEvents()
     window.showMaximized()
     if splash is not None:

@@ -1,4 +1,4 @@
-name: mrsiviewer
+name: donald
 channels:
   - conda-forge
   - defaults
@@ -14,9 +14,7 @@ dependencies:
   - rich
   - pyqtgraph   # optional plotting helper used in some tools
   - pip:
-      - .
-      - mrsitoolbox>=1.0.0
-      # Qt6 stack used by connectome_viewer.py and bids_mrsi_viewer.py
+      - mrsitoolbox==1.0.11
       - PyQt6
       - PyQt6-Qt6
       - PyQt6-sip

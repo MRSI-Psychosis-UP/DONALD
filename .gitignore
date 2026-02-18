@@ -1,9 +1,12 @@
 __pycache__/
 bids_mrsi_viewer.py
 build/
-mrsiviewer.egg-info/
+*.egg-info/
 set_cupy_path.sh
+gui_v01.py
 *__init__.py
 config/connectome_viewer.json
 results/
 data/
+viewer_popup.py
+dist/

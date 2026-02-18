@@ -55,6 +55,7 @@ class MSModeSurfaceDialog(QDialog):
         parent=None,
         cmap=None,
         cmap_name="spectrum_fsl",
+        theme_name="Dark",
     ):
         super().__init__(parent)
         self._img = nib.as_closest_canonical(volume_img)
@@ -68,6 +69,7 @@ class MSModeSurfaceDialog(QDialog):
         self._title = title
         self._cmap_name = str(cmap_name or "spectrum_fsl")
         self._cmap = cmap if cmap is not None else self._default_cmap(self._cmap_name)
+        self._theme_name = "Dark"
         self.setWindowTitle(title)
 
         self.figure = Figure(
@@ -92,8 +94,40 @@ class MSModeSurfaceDialog(QDialog):
         layout.addLayout(controls)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas, 1)
+        self.set_theme(theme_name)
 
         self._render()
+
+    def set_theme(self, theme_name="Dark"):
+        theme = str(theme_name or "Dark").strip().title()
+        if theme not in {"Light", "Dark", "Teya", "Donald"}:
+            theme = "Dark"
+        self._theme_name = theme
+        if theme == "Dark":
+            style = (
+                "QDialog, QWidget { background: #1f2430; color: #e5e7eb; }"
+                "QPushButton { background: #2d3646; color: #e5e7eb; border: 1px solid #5f6d82; border-radius: 6px; padding: 5px 10px; }"
+                "QPushButton:hover { background: #374256; }"
+            )
+        elif theme == "Teya":
+            style = (
+                "QDialog, QWidget { background: #ffd0e5; color: #0b7f7a; }"
+                "QPushButton { background: #ffc0dc; color: #0b7f7a; border: 1px solid #1db8b2; border-radius: 6px; padding: 5px 10px; }"
+                "QPushButton:hover { background: #ffb1d5; }"
+            )
+        elif theme == "Donald":
+            style = (
+                "QDialog, QWidget { background: #d97706; color: #ffffff; }"
+                "QPushButton { background: #b85f00; color: #ffffff; border: 1px solid #f3a451; border-radius: 6px; padding: 5px 10px; }"
+                "QPushButton:hover { background: #c76b06; }"
+            )
+        else:
+            style = (
+                "QDialog, QWidget { background: #f4f6f9; color: #1f2937; }"
+                "QPushButton { background: #ffffff; color: #1f2937; border: 1px solid #b7c0cc; border-radius: 6px; padding: 5px 10px; }"
+                "QPushButton:hover { background: #edf2f7; }"
+            )
+        self.setStyleSheet(style)
 
     @staticmethod
     def _default_cmap(cmap_name):
@@ -125,6 +159,7 @@ class MSModeSurfaceDialog(QDialog):
         parent=None,
         cmap=None,
         cmap_name="spectrum_fsl",
+        theme_name="Dark",
     ):
         """Create dialog from ndarray + affine."""
         arr = np.asarray(volume_data, dtype=float)
@@ -139,6 +174,7 @@ class MSModeSurfaceDialog(QDialog):
             parent=parent,
             cmap=cmap,
             cmap_name=cmap_name,
+            theme_name=theme_name,
         )
 
     @classmethod

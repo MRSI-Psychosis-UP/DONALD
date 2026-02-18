@@ -1,5 +1,10 @@
 import os,re,glob
+import json
+import shutil
 import sys
+import time
+import uuid
+import hashlib
 from os.path import join, isdir, isfile, dirname, abspath
 from pathlib import Path
 import argparse
@@ -19,6 +24,13 @@ from mrsitoolbox.connectomics.nbs import NBS
 from mrsitoolbox.graphplot.brain3d import Brain3D
 from rich.table import Table
 
+
+_SCRIPT_PATH = Path(__file__).resolve()
+_VIEWER_ROOT = _SCRIPT_PATH.parents[1]
+if not os.getenv("DEVANALYSEPATH"):
+    os.environ["DEVANALYSEPATH"] = str(_VIEWER_ROOT)
+if not os.getenv("BIDSDATAPATH") or os.getenv("BIDSDATAPATH") == ".":
+    os.environ["BIDSDATAPATH"] = str(_VIEWER_ROOT / "data" / "BIDS")
 
 debug    = Debug()
 dutils   = DataUtils()
@@ -166,6 +178,22 @@ def _format_mean_std(values: np.ndarray) -> str:
     mean = float(np.nanmean(values))
     std = float(np.nanstd(values))
     return f"{mean:.3f}±{std:.3f}"
+
+
+def _display_text(value) -> str:
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            value = value.item()
+        elif value.size == 1:
+            value = value.reshape(-1)[0]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode()
+        except Exception:
+            value = str(value)
+    return "" if value is None else str(value)
 
 
 def _is_integer_like(values: np.ndarray) -> bool:
@@ -397,21 +425,248 @@ def _load_covars_info(path: Path):
     return {"data": covars, "df": df, "columns": columns}
 
 
-def _run_matlab_batch(matlab_cmd: str, matlab_call: str) -> None:
-    progress_re = re.compile(r"^\|\s*\d+\s*/\s*\d+\s*\|")
-    process = subprocess.Popen(
-        [matlab_cmd, "-batch", matlab_call],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+def _escape_matlab_string(value: str) -> str:
+    return str(value).replace("'", "''")
+
+
+def _default_matlab_session_dir(matlab_cmd: str, nbs_path: str) -> str:
+    key_src = f"{str(matlab_cmd)}|{str(nbs_path)}|{os.getenv('USER','user')}"
+    key = hashlib.sha1(key_src.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return str(Path.home() / ".cache" / "mrsi_viewer" / "matlab_nbs" / key)
+
+
+def _pid_is_running(pid: int) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _read_pid_file(pid_path: str) -> int | None:
+    try:
+        text = Path(pid_path).read_text(encoding="utf-8").strip()
+        if text:
+            return int(text)
+    except Exception:
+        return None
+    return None
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_suffix(target.suffix + f".tmp.{uuid.uuid4().hex}")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(str(tmp_path), str(target))
+
+
+def _tail_file_since(path: str, offset: int) -> tuple[int, list[str]]:
+    if not isfile(path):
+        return offset, []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            f.seek(max(0, int(offset)))
+            chunk = f.read()
+            new_offset = f.tell()
+    except Exception:
+        return offset, []
+    if not chunk:
+        return new_offset, []
+    lines = [line.rstrip() for line in chunk.splitlines() if line.strip()]
+    return new_offset, lines
+
+
+def _format_matlab_worker_call(script_dir: str, session_dir: str) -> str:
+    return (
+        f"addpath('{_escape_matlab_string(script_dir)}');"
+        f"nbs_worker_loop('{_escape_matlab_string(session_dir)}')"
     )
+
+
+def _ensure_matlab_worker_running(matlab_cmd: str, script_dir: str, session_dir: str) -> str:
+    session_root = Path(session_dir).expanduser().resolve()
+    worker_script = Path(script_dir) / "nbs_worker_loop.m"
+    if not worker_script.is_file():
+        raise FileNotFoundError(
+            f"Persistent MATLAB worker script not found: {worker_script}"
+        )
+    commands_dir = session_root / "commands"
+    responses_dir = session_root / "responses"
+    session_root.mkdir(parents=True, exist_ok=True)
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    responses_dir.mkdir(parents=True, exist_ok=True)
+    ready_path = session_root / "ready.json"
+    pid_path = session_root / "worker.pid"
+    log_path = session_root / "worker.log"
+
+    pid = _read_pid_file(str(pid_path))
+    if pid is not None and _pid_is_running(pid) and ready_path.is_file():
+        return str(log_path)
+
+    if ready_path.exists() and (pid is None or not _pid_is_running(pid)):
+        try:
+            ready_path.unlink()
+        except Exception:
+            pass
+
+    worker_call = _format_matlab_worker_call(str(script_dir), str(session_root))
+    debug.info(f"Starting persistent MATLAB worker via: {matlab_cmd} -batch \"{worker_call}\"")
+    try:
+        with open(log_path, "a", encoding="utf-8") as log_stream:
+            proc = subprocess.Popen(
+                [matlab_cmd, "-batch", worker_call],
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to launch persistent MATLAB worker with `{matlab_cmd}`. ({exc})"
+        ) from exc
+    try:
+        pid_path.write_text(str(proc.pid), encoding="utf-8")
+    except Exception:
+        pass
+
+    startup_timeout_s = 180.0
+    t0 = time.time()
+    while (time.time() - t0) < startup_timeout_s:
+        if ready_path.is_file():
+            return str(log_path)
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    offset, tail_lines = _tail_file_since(str(log_path), max(0, os.path.getsize(log_path) - 12000) if log_path.exists() else 0)
+    _ = offset
+    message = "Persistent MATLAB worker did not become ready."
+    if tail_lines:
+        message += " Last log lines:\n" + "\n".join(tail_lines[-20:])
+    raise RuntimeError(message)
+
+
+def _run_matlab_persistent(
+    matlab_cmd: str,
+    matlab_call: str,
+    *,
+    script_dir: str,
+    session_dir: str,
+    expected_output: str | None = None,
+) -> None:
+    progress_re = re.compile(r"^\|\s*\d+\s*/\s*\d+\s*\|")
+    log_path = _ensure_matlab_worker_running(matlab_cmd, script_dir, session_dir)
+    session_root = Path(session_dir).expanduser().resolve()
+    commands_dir = session_root / "commands"
+    responses_dir = session_root / "responses"
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    responses_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = uuid.uuid4().hex
+    command_path = commands_dir / f"{job_id}.json"
+    response_path = responses_dir / f"{job_id}.json"
+    payload = {
+        "job_id": job_id,
+        "matlab_call": matlab_call,
+    }
+    log_offset = os.path.getsize(log_path) if isfile(log_path) else 0
+    debug.info(f"Persistent MATLAB call: {matlab_call}")
+    _write_json_atomic(str(command_path), payload)
+    debug.info(f"Submitted MATLAB job {job_id} to persistent session: {session_root}")
+
+    last_progress = False
+    wait_timeout_s = 24 * 3600
+    t0 = time.time()
+    output_lines: list[str] = []
+    while True:
+        log_offset, lines = _tail_file_since(log_path, log_offset)
+        for text in lines:
+            output_lines.append(text)
+            if progress_re.match(text):
+                sys.stdout.write("\r" + text)
+                sys.stdout.flush()
+                last_progress = True
+            elif "error" in text.lower() or "exception" in text.lower():
+                if last_progress:
+                    sys.stdout.write("\n")
+                    last_progress = False
+                debug.error(text)
+            else:
+                if last_progress:
+                    sys.stdout.write("\n")
+                    last_progress = False
+                debug.info(text)
+
+        if response_path.is_file():
+            break
+        if (time.time() - t0) > wait_timeout_s:
+            raise TimeoutError(
+                f"Timed out waiting for MATLAB persistent job {job_id} response."
+            )
+        time.sleep(0.25)
+
+    if last_progress:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    try:
+        with open(response_path, "r", encoding="utf-8") as f:
+            response = json.load(f)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read persistent MATLAB job response {response_path}: {exc}"
+        ) from exc
+    finally:
+        try:
+            response_path.unlink()
+        except Exception:
+            pass
+
+    ok = bool(response.get("ok", False))
+    err_message = str(response.get("message", "")).strip()
+    if not ok:
+        if expected_output and isfile(expected_output):
+            debug.warning(
+                f"MATLAB persistent job failed, but output exists at {expected_output}. Proceeding."
+            )
+            return
+        if err_message:
+            for line in err_message.splitlines()[-20:]:
+                debug.error(line)
+        elif output_lines:
+            debug.error("MATLAB persistent job failed. Last output lines:")
+            for line in output_lines[-12:]:
+                debug.error(line)
+        raise subprocess.CalledProcessError(1, [matlab_cmd, "-batch", matlab_call])
+
+
+def _run_matlab_batch(matlab_cmd: str, matlab_call: str, expected_output: str | None = None) -> None:
+    progress_re = re.compile(r"^\|\s*\d+\s*/\s*\d+\s*\|")
+    try:
+        process = subprocess.Popen(
+            [matlab_cmd, "-batch", matlab_call],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to launch MATLAB command `{matlab_cmd}`. Check --matlab-cmd and PATH. ({exc})"
+        ) from exc
     last_progress = False
     header_lines = []
     header_shown = False
+    output_lines = []
     if process.stdout:
         for line in process.stdout:
             text = line.rstrip()
+            if text:
+                output_lines.append(text)
             if progress_re.match(text):
                 if header_lines and not header_shown:
                     for h in header_lines:
@@ -421,18 +676,49 @@ def _run_matlab_batch(matlab_cmd: str, matlab_call: str) -> None:
                 sys.stdout.flush()
                 last_progress = True
             elif text.startswith("|") and ("Permutation" in text or "Random" in text or "p-value" in text):
+                if last_progress:
+                    sys.stdout.write("\n")
+                    last_progress = False
                 header_lines.append(text)
+                debug.info(text)
             elif "error" in text.lower() or "exception" in text.lower():
                 if last_progress:
                     sys.stdout.write("\n")
                     last_progress = False
                 debug.error(text)
+            elif text:
+                if last_progress:
+                    sys.stdout.write("\n")
+                    last_progress = False
+                debug.info(text)
     rc = process.wait()
     if last_progress:
         sys.stdout.write("\n")
         sys.stdout.flush()
     if rc != 0:
+        if expected_output and isfile(expected_output):
+            debug.warning(
+                f"MATLAB exited with code {rc}, but output exists at {expected_output}. Proceeding."
+            )
+            return
+        if output_lines:
+            debug.error("MATLAB NBS failed. Last output lines:")
+            for line in output_lines[-12:]:
+                debug.error(line)
         raise subprocess.CalledProcessError(rc, [matlab_cmd, "-batch", matlab_call])
+
+
+def _resolve_matlab_helper_dir() -> str:
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir,
+        script_dir.parents[1] / "mrsitoolbox" / "experiments" / "MetSiM_analysis",
+    ]
+    for candidate in candidates:
+        if (candidate / "nbs_run_cli.m").is_file():
+            return str(candidate)
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Could not locate nbs_run_cli.m. Searched: {searched}")
 
 
 def _to_dense_bool(mat):
@@ -615,16 +901,59 @@ parser.add_argument('--select', '-s', dest='select', action='append', default=[]
 parser.add_argument('--engine', type=str, default="matlab",
                     choices=["python", "matlab"],
                     help="Choose implementation to run: python or matlab (default: python).")
-parser.add_argument('--matlab-cmd', type=str, default="matlab",
-                    help="MATLAB executable for -batch runs (default: matlab).")
-parser.add_argument('--matlab-nbs-path', type=str, default="/home/flucchetti/Connectome/Dev/NBS1.2",
-                    help="Path to NBS MATLAB folder containing NBSrun.m (optional).")
+default_matlab_cmd = (
+    os.getenv("MRSI_MATLAB_CMD")
+    or os.getenv("MATLAB_CMD")
+    or os.getenv("MATLAB_EXECUTABLE")
+    or shutil.which("matlab")
+    or ""
+)
+default_matlab_nbs_path = (
+    os.getenv("MRSI_NBS_PATH")
+    or os.getenv("MATLAB_NBS_PATH")
+    or os.getenv("NBS_PATH")
+    or ""
+)
+parser.add_argument('--matlab-cmd', type=str, default=default_matlab_cmd,
+                    help="MATLAB executable for -batch runs (default: env/PATH lookup, else empty).")
+parser.add_argument('--matlab-nbs-path', type=str, default=default_matlab_nbs_path,
+                    help="Path to NBS MATLAB folder containing NBSrun.m (default: env lookup, else empty).")
 parser.add_argument('--matlab-test', type=str, default="t",
                     choices=["t", "F"], help="MATLAB NBS test type (t or F).")
 parser.add_argument('--matlab-size', type=str, default="extent",
                     choices=["extent", "intensity"], help="MATLAB NBS size metric.")
+parser.add_argument(
+    "--matlab-no-precompute",
+    action="store_true",
+    help=(
+        "Force MATLAB NBS to skip precomputing permutation statistics. "
+        "Can reduce peak memory but is often slower."
+    ),
+)
+parser.add_argument(
+    "--matlab-persistent",
+    action="store_true",
+    help=(
+        "Use a persistent MATLAB worker session so repeated runs reuse the same "
+        "MATLAB process and worker pool."
+    ),
+)
+parser.add_argument(
+    "--matlab-session-dir",
+    type=str,
+    default=None,
+    help=(
+        "Optional session directory used for persistent MATLAB worker IPC/state. "
+        "If omitted, a default cache directory is used."
+    ),
+)
 parser.add_argument('--input', '-i', type=str, default=None,
                     help="Optional full path to the connectivity .npz file. Defaults to group connectivity.")
+parser.add_argument('--parcellation-path', type=str, default=None,
+                    help="Optional full path to a parcellation NIfTI (.nii/.nii.gz) overriding atlas lookup.")
+parser.add_argument('--modality', type=str, default=None,
+                    choices=["fmri", "mrsi", "dwi", "anat", "morph", "pet", "other"],
+                    help="Optional modality override used for results output path.")
 
 
 args = parser.parse_args()
@@ -687,17 +1016,28 @@ else:
 ########################### parcel image: ###########################
 atlas              = f"cubic-{scale}" if "cubic" in parc_scheme else f"chimera-{parc_scheme}-{scale}"
 gm_mask            = datasets.load_mni152_gm_mask().get_fdata().astype(bool)
-parcel_mni_img_nii = nib.load(join(dutils.DEVDATAPATH, "atlas", f"{atlas}", f"{atlas}.nii.gz"))
+if args.parcellation_path:
+    parcellation_path = abspath(os.path.expanduser(args.parcellation_path))
+    if not isfile(parcellation_path):
+        raise FileNotFoundError(f"Parcellation file not found: {parcellation_path}")
+    debug.info(f"Using parcellation override: {parcellation_path}")
+    parcel_mni_img_nii = nib.load(parcellation_path)
+else:
+    parcel_mni_img_nii = nib.load(join(dutils.DEVDATAPATH, "atlas", f"{atlas}", f"{atlas}.nii.gz"))
 parcel_mni_img_np  = parcel_mni_img_nii.get_fdata().astype(int)
 
 data           = np.load(connectivity_path,allow_pickle=True)
-group = str(data["group"]) if "group" in data else None
-modality = str(data["modality"]) if "modality" in data else None
-if not group or not modality:
-    raise ValueError("Connectivity NPZ missing group/modality; re-generate with construct_MeSiM_pop.py.")
+group = _display_text(data["group"]).strip() if "group" in data else ""
+modality_npz = _display_text(data["modality"]).strip().lower() if "modality" in data else ""
+modality_override = (args.modality or "").strip().lower()
+modality = modality_override or modality_npz
+if not group:
+    raise ValueError("Connectivity NPZ missing group.")
+if not modality:
+    raise ValueError("Connectivity NPZ missing modality. Provide --modality from {fmri,mrsi,dwi,anat,morph,pet,other}.")
 resultdirname = f"{group}-{diag}-population_average"
 parc_scale_dir = f"parc-{_slugify_fragment(parc_scheme)}_scale-{scale}"
-base_dir      = join(dutils.ANARESULTSPATH, "controls_vs_patients", "nbs", group, modality, parc_scale_dir)
+base_dir      = join(dutils.ANARESULTSPATH, "nbs", group, modality, parc_scale_dir)
 MeSiM_pop_avg  = data["matrix_pop_avg"]
 MeSiM_list     = np.asarray(data["matrix_subj_list"])
 subject_id_all = np.asarray(data["subject_id_list"])
@@ -1034,12 +1374,28 @@ if export_paths:
             else:
                 contrast_specs = [("pos", "right", 1.0)]
 
-        def _escape_matlab(value: str) -> str:
-            return str(value).replace("'", "''")
-
         script_dir = dirname(__file__)
+        matlab_helper_dir = _resolve_matlab_helper_dir()
         nbs_path = args.matlab_nbs_path or ""
-        matlab_cmd = args.matlab_cmd or "matlab"
+        matlab_cmd = args.matlab_cmd or ""
+        if not matlab_cmd:
+            raise ValueError(
+                "MATLAB executable is not configured. Set it in GUI Preferences "
+                "or pass --matlab-cmd."
+            )
+        if not nbs_path:
+            raise ValueError(
+                "NBS path is not configured. Set it in GUI Preferences "
+                "or pass --matlab-nbs-path."
+            )
+        matlab_persistent = bool(args.matlab_persistent)
+        matlab_session_dir = (
+            str(Path(args.matlab_session_dir).expanduser().resolve())
+            if args.matlab_session_dir
+            else _default_matlab_session_dir(matlab_cmd, nbs_path)
+        )
+        if matlab_persistent:
+            debug.info(f"MATLAB persistent session enabled: {matlab_session_dir}")
         matlab_outputs = []
         for suffix, tail_for_run, sign in contrast_specs:
             if is_f_test:
@@ -1068,7 +1424,11 @@ if export_paths:
                     vec[-1] = str(int(sign)) if sign is not None else "1"
                     matlab_contrast = " ".join(vec)
                     output_mat = "nbs_results.mat" if len(contrast_specs) == 1 else f"nbs_results_{suffix}.mat"
+            helper_dir_esc = _escape_matlab_string(matlab_helper_dir)
+            script_dir_esc = _escape_matlab_string(script_dir)
+            addpath_helper = "" if matlab_helper_dir == script_dir else f"addpath('{helper_dir_esc}');"
             matlab_call = (
+                "{addpath_helper}"
                 "addpath('{script_dir}');"
                 "nbs_run_cli('export_dir','{export_dir}',"
                 "'nbs_path','{nbs_path}',"
@@ -1079,22 +1439,40 @@ if export_paths:
                 "'alpha',{alpha},"
                 "'perms',{perms},"
                 "'tail','{tail}',"
+                "'nthreads',{nthreads},"
+                "'no_precompute',{no_precompute},"
                 "'output_mat','{output_mat}')"
             ).format(
-                export_dir=_escape_matlab(export_dir),
-                script_dir=_escape_matlab(script_dir),
-                nbs_path=_escape_matlab(nbs_path),
-                contrast=_escape_matlab(matlab_contrast),
-                test=_escape_matlab(args.matlab_test),
-                size=_escape_matlab(args.matlab_size),
+                addpath_helper=addpath_helper,
+                export_dir=_escape_matlab_string(export_dir),
+                script_dir=script_dir_esc,
+                nbs_path=_escape_matlab_string(nbs_path),
+                contrast=_escape_matlab_string(matlab_contrast),
+                test=_escape_matlab_string(args.matlab_test),
+                size=_escape_matlab_string(args.matlab_size),
                 thresh=args.t_thresh,
                 alpha=args.alpha,
                 perms=args.nperm,
-                tail=_escape_matlab(tail_for_run or tail_value),
-                output_mat=_escape_matlab(output_mat),
+                tail=_escape_matlab_string(tail_for_run or tail_value),
+                nthreads=int(max(1, int(args.nthreads))),
+                no_precompute="true" if bool(args.matlab_no_precompute) else "false",
+                output_mat=_escape_matlab_string(output_mat),
             )
-            debug.info(f"Running MATLAB NBS via: {matlab_cmd} -batch \"{matlab_call}\"")
-            _run_matlab_batch(matlab_cmd, matlab_call)
+            output_path = join(export_dir, output_mat)
+            if matlab_persistent:
+                debug.info(
+                    f"Running MATLAB NBS via persistent worker in {matlab_session_dir}"
+                )
+                _run_matlab_persistent(
+                    matlab_cmd,
+                    matlab_call,
+                    script_dir=script_dir,
+                    session_dir=matlab_session_dir,
+                    expected_output=output_path,
+                )
+            else:
+                debug.info(f"Running MATLAB NBS via: {matlab_cmd} -batch \"{matlab_call}\"")
+                _run_matlab_batch(matlab_cmd, matlab_call, expected_output=output_path)
             matlab_outputs.append((suffix, output_mat))
         matlab_results = []
         for suffix, output_mat in matlab_outputs:
@@ -1140,6 +1518,7 @@ if export_paths:
 ids_sig    = np.where(np.array(results_dict["comp_pvals"]) < args.alpha)[0]
 n_sig_comp = len(ids_sig)
 pvalue_arr = np.array(results_dict["comp_pvals"])
+global_pvalue = float(np.nanmin(pvalue_arr)) if pvalue_arr.size else float("nan")
 if n_sig_comp:
     debug.success(f"Found {n_sig_comp} significant component(s). Significant p-values:")
     for i in ids_sig:
@@ -1148,6 +1527,14 @@ else:
     debug.warning("No significant components detected; exporting component data anyway.")
     for i, val in enumerate(pvalue_arr):
         debug.info(f"Component {i}: pvalue = {val}")
+debug.info(f"Global p-value (min component p): {global_pvalue if np.isfinite(global_pvalue) else 'NA'}")
+summary_payload = {
+    "n_significant": int(n_sig_comp),
+    "significant_indices": [int(i) for i in ids_sig.tolist()],
+    "significant_pvalues": [float(pvalue_arr[i]) for i in ids_sig.tolist()],
+    "global_pvalue": (float(global_pvalue) if np.isfinite(global_pvalue) else None),
+}
+print(f"[NBS_SUMMARY]{json.dumps(summary_payload, separators=(',', ':'))}", flush=True)
 
 regressor_values_out_all = regressor_values_raw
 if regressor_values_out_all is None and expanded_info:
@@ -1194,6 +1581,7 @@ np.savez(
     comp_edges=comp_edges_all,
 )
 debug.success("Bundled component results saved to", components_all_path)
+print(f"[NBS_RESULT]{components_all_path}", flush=True)
 
 summary_rows: list[dict[str, object]] = []
 total_components = len(pvalue_arr)
