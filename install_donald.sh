@@ -22,7 +22,7 @@ fi
 
 DATA_URL="${DONALD_DATA_URL:-${CONNECTOME_VIEWER_DATA_URL:-}}"
 DATA_SHA256="${DONALD_DATA_SHA256:-${CONNECTOME_VIEWER_DATA_SHA256:-}}"
-DATA_RELEASE_REPO="${DONALD_DATA_REPO:-${CONNECTOME_VIEWER_DATA_REPO:-fedlucchetti/ConnectomeViewer}}"
+DATA_RELEASE_REPO="${DONALD_DATA_REPO:-${CONNECTOME_VIEWER_DATA_REPO:-}}"
 DATA_RELEASE_TAG="${DONALD_DATA_TAG:-${CONNECTOME_VIEWER_DATA_TAG:-}}"
 DATA_SHA256_URL=""
 RESOLVED_DATA_RELEASE_TAG=""
@@ -52,7 +52,8 @@ Options:
   --data-url URL        Public archive URL containing top-level data/ folder
   --data-sha256 HASH    Optional SHA256 checksum for data archive
   --data-repo OWNER/REPO  GitHub repo used for auto data release lookup
-                          (default: fedlucchetti/ConnectomeViewer)
+                          (default: origin remote repo, fallback:
+                          fedlucchetti/ConnectomeViewer)
   --data-tag TAG        Use a specific data release tag (default: newest release
                         containing a matching data archive asset)
   --skip-data           Do not download/extract data archive
@@ -81,6 +82,23 @@ need_cmd() {
     echo "Missing required command: $1" >&2
     exit 1
   fi
+}
+
+detect_repo_slug() {
+  local remote
+  remote="$(git -C "${BASE_DIR}" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "${remote}" ]]; then
+    return 1
+  fi
+  if [[ "${remote}" =~ ^git@github.com:([^/]+)/([^/]+)(\.git)?$ ]]; then
+    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" | sed 's/\.git$//'
+    return 0
+  fi
+  if [[ "${remote}" =~ ^https://github.com/([^/]+)/([^/]+)(\.git)?$ ]]; then
+    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" | sed 's/\.git$//'
+    return 0
+  fi
+  return 1
 }
 
 expand_home_path() {
@@ -194,6 +212,12 @@ resolve_latest_data_release() {
 
   need_cmd curl
   need_cmd python3
+  if [[ -z "${DATA_RELEASE_REPO}" ]]; then
+    DATA_RELEASE_REPO="$(detect_repo_slug || true)"
+  fi
+  if [[ -z "${DATA_RELEASE_REPO}" ]]; then
+    DATA_RELEASE_REPO="fedlucchetti/ConnectomeViewer"
+  fi
 
   local api_url
   if [[ -n "${DATA_RELEASE_TAG}" ]]; then
@@ -207,13 +231,18 @@ resolve_latest_data_release() {
     return 1
   fi
 
+  local json_file
+  json_file="$(mktemp)"
+  printf '%s' "${release_json}" > "${json_file}"
   local parsed
-  if ! parsed="$(printf '%s' "${release_json}" | python3 - <<'PY'
+  if ! parsed="$(python3 - "${json_file}" <<'PY'
 import json
+from pathlib import Path
 import re
 import sys
 
-text = sys.stdin.read()
+json_path = sys.argv[1]
+text = Path(json_path).read_text(encoding="utf-8")
 if not text.strip():
     raise SystemExit(1)
 
@@ -256,8 +285,10 @@ if sha:
     print(f"SHA_URL={sha.get('browser_download_url', '')}")
 PY
 )"; then
+    rm -f "${json_file}"
     return 1
   fi
+  rm -f "${json_file}"
 
   local key value
   while IFS='=' read -r key value; do
@@ -297,7 +328,11 @@ ensure_conda_env() {
 
 download_data_if_needed() {
   [[ "${SKIP_DATA}" -eq 0 ]] || return 0
-  if [[ -d "${DATA_DIR}" && "${FORCE_DATA}" -eq 0 ]]; then
+  local data_dir_has_files=0
+  if [[ -d "${DATA_DIR}" && -n "$(find "${DATA_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    data_dir_has_files=1
+  fi
+  if [[ "${data_dir_has_files}" -eq 1 && "${FORCE_DATA}" -eq 0 ]]; then
     if [[ -n "${DATA_URL}" ]]; then
       echo "Data folder already exists: ${DATA_DIR} (skip download). Use --force-data to refresh."
       return 0
@@ -318,6 +353,9 @@ download_data_if_needed() {
       echo "Data folder already exists: ${DATA_DIR} (skip download; could not resolve latest release)."
       return 0
     fi
+  fi
+  if [[ -d "${DATA_DIR}" && "${data_dir_has_files}" -eq 0 ]]; then
+    echo "Data folder exists but is empty: ${DATA_DIR}. Downloading release asset..."
   fi
   if [[ -z "${DATA_URL}" ]]; then
     if resolve_latest_data_release; then
