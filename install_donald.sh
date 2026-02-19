@@ -198,12 +198,6 @@ upsert_env_key() {
   fi
 }
 
-run_conda_with_solver() {
-  local solver="$1"
-  shift
-  CONDA_CHANNEL_PRIORITY=strict conda "$@" --solver "${solver}"
-}
-
 probe_release_asset_for_tag() {
   local tag="$1"
   [[ -n "${tag}" ]] || return 1
@@ -373,15 +367,19 @@ ensure_conda_env() {
 
   if conda env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
     echo "Updating conda env '${ENV_NAME}' from ${ENV_FILE_PATH} ..."
-    if ! run_conda_with_solver libmamba env update -n "${ENV_NAME}" -f "${ENV_FILE_PATH}" --prune; then
-      echo "libmamba solver failed; falling back to classic solver..."
-      run_conda_with_solver classic env update -n "${ENV_NAME}" -f "${ENV_FILE_PATH}" --prune
+    if ! conda env update -n "${ENV_NAME}" -f "${ENV_FILE_PATH}" --prune; then
+      echo "Conda failed to update env '${ENV_NAME}' from ${ENV_FILE_PATH}." >&2
+      echo "No alternative solver fallback is used by this installer." >&2
+      echo "Fix the conda error above and re-run install_donald.sh." >&2
+      exit 1
     fi
   else
     echo "Creating conda env '${ENV_NAME}' from ${ENV_FILE_PATH} ..."
-    if ! run_conda_with_solver libmamba env create -n "${ENV_NAME}" -f "${ENV_FILE_PATH}"; then
-      echo "libmamba solver failed; falling back to classic solver..."
-      run_conda_with_solver classic env create -n "${ENV_NAME}" -f "${ENV_FILE_PATH}"
+    if ! conda env create -n "${ENV_NAME}" -f "${ENV_FILE_PATH}"; then
+      echo "Conda failed to create env '${ENV_NAME}' from ${ENV_FILE_PATH}." >&2
+      echo "No alternative solver fallback is used by this installer." >&2
+      echo "Fix the conda error above and re-run install_donald.sh." >&2
+      exit 1
     fi
   fi
 }
