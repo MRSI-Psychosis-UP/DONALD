@@ -235,7 +235,7 @@ probe_release_asset_for_tag() {
   return 1
 }
 
-resolve_latest_data_release() {
+resolve_latest_data_release_from_repo() {
   [[ -n "${DATA_URL}" ]] && return 0
 
   need_cmd curl
@@ -325,7 +325,7 @@ if sha:
 PY
 )"; then
     rm -f "${json_file}"
-    echo "Warning: release metadata was fetched but no compatible data asset was detected." >&2
+    echo "Warning: release metadata was fetched for ${DATA_RELEASE_REPO}, but no compatible data asset was detected." >&2
     return 1
   fi
   rm -f "${json_file}"
@@ -341,6 +341,26 @@ PY
   done <<< "${parsed}"
 
   [[ -n "${DATA_URL}" ]]
+}
+
+resolve_latest_data_release() {
+  local primary_repo="${DATA_RELEASE_REPO}"
+  local legacy_repo="fedlucchetti/ConnectomeViewer"
+
+  if resolve_latest_data_release_from_repo; then
+    return 0
+  fi
+
+  if [[ "${primary_repo}" != "${legacy_repo}" ]]; then
+    echo "Warning: no compatible data asset found in ${primary_repo}; trying fallback repo ${legacy_repo}."
+    DATA_RELEASE_REPO="${legacy_repo}"
+    if resolve_latest_data_release_from_repo; then
+      return 0
+    fi
+  fi
+
+  DATA_RELEASE_REPO="${primary_repo}"
+  return 1
 }
 
 ensure_conda_env() {
@@ -369,8 +389,12 @@ ensure_conda_env() {
 download_data_if_needed() {
   [[ "${SKIP_DATA}" -eq 0 ]] || return 0
   local data_dir_has_files=0
+  local data_has_bids=0
   if [[ -d "${DATA_DIR}" && -n "$(find "${DATA_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     data_dir_has_files=1
+  fi
+  if [[ -d "${DATA_DIR}/BIDS" ]]; then
+    data_has_bids=1
   fi
   if [[ "${data_dir_has_files}" -eq 1 && "${FORCE_DATA}" -eq 0 ]]; then
     if [[ -n "${DATA_URL}" ]]; then
@@ -403,8 +427,13 @@ download_data_if_needed() {
       echo "Using data asset: ${RESOLVED_DATA_ASSET_NAME:-$(basename "${DATA_URL%%\?*}")}"
     else
       echo "No data URL configured and auto-resolution failed."
+      echo "Tried release repo(s): ${DATA_RELEASE_REPO} and fallback fedlucchetti/ConnectomeViewer."
       echo "Set DONALD_DATA_URL, or pass --data-url, or set --data-repo/--data-tag."
-      echo "Continuing without downloading data."
+      if [[ "${FORCE_DATA}" -eq 1 || "${data_dir_has_files}" -eq 0 || "${data_has_bids}" -eq 0 ]]; then
+        echo "Data download was requested but no valid release asset was found. Aborting." >&2
+        exit 1
+      fi
+      echo "Keeping existing local data at ${DATA_DIR}."
       return 0
     fi
   fi

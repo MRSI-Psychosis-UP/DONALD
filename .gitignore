@@ -7,6 +7,14 @@ gui_v01.py
 *__init__.py
 config/connectome_viewer.json
 results/
-data/
 viewer_popup.py
 dist/
+data/atlas/chimera-LFIIIIFIS-3.xml
+data/atlas/chimera-LFMIHIFIF-2.xml
+data/atlas/chimera-LFMIHIFIF-3.xml
+data/atlas/chimera-LFMIHIFIF-4.xml
+data/atlas/chimera-LFMIHIFIS-3.xml
+data/atlas/aal_SPM12/
+data/atlas/allen_brain/
+data/atlas/allen_human_reference_atlas_3d_2020/
+data/atlas/destrieux_2009/
