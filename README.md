@@ -1,4 +1,4 @@
-# DONALD: Distributed Open-source Network AnaLysis Dashboard
+# DONALD
 
 ![Donald](icons/donald_title.png)
 
