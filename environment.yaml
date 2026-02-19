@@ -12,9 +12,11 @@ dependencies:
   - python-dotenv
   - tqdm
   - rich
-  - pyqtgraph   # optional plotting helper used in some tools
+  - pyqtgraph  
   - pip:
-      - mrsitoolbox==1.0.11
+      - mrsitoolbox
       - PyQt6
       - PyQt6-Qt6
       - PyQt6-sip
+      - bctpy
+      - neuroCombat
