@@ -60,7 +60,7 @@ Options:
                         containing a matching data archive asset)
   --skip-data           Do not download/extract data archive
   --force-data          Re-download and overwrite existing data/ folder
-  --skip-desktop        Skip desktop integration (Linux .desktop / macOS shortcut)
+  --skip-desktop        Skip desktop integration (Linux .desktop / macOS .app + shortcut)
   --shell-rc FILE       Shell rc file to append PATH update (default auto:
                         ~/.bashrc on Linux, ~/.zprofile + ~/.zshrc on macOS)
   --non-interactive     Do not prompt; use defaults for unanswered values
@@ -227,6 +227,92 @@ ensure_bin_dir_on_path() {
       echo "Added ${BIN_DIR} to PATH in ${rc_file}."
     fi
   done
+}
+
+build_macos_icns() {
+  local source_png="$1"
+  local output_icns="$2"
+
+  need_cmd sips
+  need_cmd iconutil
+
+  local tmp_dir iconset_dir size retina
+  tmp_dir="$(mktemp -d)"
+  iconset_dir="${tmp_dir}/AppIcon.iconset"
+  mkdir -p "${iconset_dir}"
+
+  for size in 16 32 128 256 512; do
+    retina=$((size * 2))
+    sips -z "${size}" "${size}" "${source_png}" --out "${iconset_dir}/icon_${size}x${size}.png" >/dev/null
+    sips -z "${retina}" "${retina}" "${source_png}" --out "${iconset_dir}/icon_${size}x${size}@2x.png" >/dev/null
+  done
+
+  if ! iconutil -c icns "${iconset_dir}" -o "${output_icns}"; then
+    rm -rf "${tmp_dir}"
+    echo "Failed to generate macOS app icon from ${source_png}." >&2
+    exit 1
+  fi
+  rm -rf "${tmp_dir}"
+}
+
+install_macos_bundle() {
+  local app_dir="${HOME}/Applications"
+  local app_bundle="${app_dir}/Donald.app"
+  local app_contents="${app_bundle}/Contents"
+  local app_macos="${app_contents}/MacOS"
+  local app_resources="${app_contents}/Resources"
+  local app_exec="${app_macos}/donald"
+  local app_plist="${app_contents}/Info.plist"
+  local app_icon="${app_resources}/AppIcon.icns"
+  local shortcut="${app_dir}/Donald.command"
+
+  mkdir -p "${app_macos}" "${app_resources}"
+
+  cat > "${app_exec}" <<MACAPP
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${BIN_LINK}" "\$@"
+MACAPP
+  chmod +x "${app_exec}"
+
+  build_macos_icns "${ICON_PATH}" "${app_icon}"
+
+  cat > "${app_plist}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Donald</string>
+  <key>CFBundleDisplayName</key>
+  <string>Donald</string>
+  <key>CFBundleIdentifier</key>
+  <string>org.connectome.donald</string>
+  <key>CFBundleVersion</key>
+  <string>1.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleExecutable</key>
+  <string>donald</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
+  cat > "${shortcut}" <<MACSHORTCUT
+#!/usr/bin/env bash
+exec "${BIN_LINK}" "\$@"
+MACSHORTCUT
+  chmod +x "${shortcut}"
+  touch "${app_bundle}"
+
+  echo "Installed macOS app bundle at ${app_bundle}"
+  echo "Installed macOS launcher shortcut at ${shortcut}"
 }
 
 probe_release_asset_for_tag() {
@@ -554,17 +640,61 @@ configure_env_file() {
 }
 
 install_launcher() {
+  local conda_hint=""
+  if command -v conda >/dev/null 2>&1; then
+    conda_hint="$(command -v conda)"
+  fi
+
   mkdir -p "${BIN_DIR}"
   cat > "${BIN_LINK}" <<LAUNCHER
 #!/usr/bin/env bash
 set -euo pipefail
 APP_PATH="${APP_PATH}"
 ENV_NAME="${ENV_NAME}"
+CONDA_HINT="${conda_hint}"
 
-if command -v conda >/dev/null 2>&1; then
-  exec conda run --no-capture-output -n "\${ENV_NAME}" python "\${APP_PATH}" "\$@"
+CONDA_BIN=""
+if [[ -n "\${CONDA_HINT}" && -x "\${CONDA_HINT}" ]]; then
+  CONDA_BIN="\${CONDA_HINT}"
+elif command -v conda >/dev/null 2>&1; then
+  CONDA_BIN="\$(command -v conda)"
+else
+  for candidate in \
+    "\${HOME}/miniconda3/bin/conda" \
+    "\${HOME}/anaconda3/bin/conda" \
+    "\${HOME}/mambaforge/bin/conda" \
+    "\${HOME}/miniforge3/bin/conda"; do
+    if [[ -x "\${candidate}" ]]; then
+      CONDA_BIN="\${candidate}"
+      break
+    fi
+  done
 fi
-exec python "\${APP_PATH}" "\$@"
+
+if [[ -n "\${CONDA_BIN}" ]]; then
+  exec "\${CONDA_BIN}" run --no-capture-output -n "\${ENV_NAME}" python "\${APP_PATH}" "\$@"
+fi
+
+for candidate_python in \
+  "\${HOME}/miniconda3/envs/\${ENV_NAME}/bin/python" \
+  "\${HOME}/anaconda3/envs/\${ENV_NAME}/bin/python" \
+  "\${HOME}/mambaforge/envs/\${ENV_NAME}/bin/python" \
+  "\${HOME}/miniforge3/envs/\${ENV_NAME}/bin/python"; do
+  if [[ -x "\${candidate_python}" ]]; then
+    exec "\${candidate_python}" "\${APP_PATH}" "\$@"
+  fi
+done
+
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 "\${APP_PATH}" "\$@"
+fi
+if command -v python >/dev/null 2>&1; then
+  exec python "\${APP_PATH}" "\$@"
+fi
+
+echo "Unable to launch Donald: conda and python were not found." >&2
+echo "Expected conda env: \${ENV_NAME}" >&2
+exit 1
 LAUNCHER
   chmod +x "${BIN_LINK}"
   ensure_bin_dir_on_path
@@ -583,15 +713,7 @@ install_desktop_entry() {
   fi
 
   if [[ "${OS_NAME}" == "Darwin" ]]; then
-    local app_dir="${HOME}/Applications"
-    local shortcut="${app_dir}/Donald.command"
-    mkdir -p "${app_dir}"
-    cat > "${shortcut}" <<MACSHORTCUT
-#!/usr/bin/env bash
-exec "${BIN_LINK}" "\$@"
-MACSHORTCUT
-    chmod +x "${shortcut}"
-    echo "Installed macOS launcher shortcut at ${shortcut}"
+    install_macos_bundle
     return 0
   fi
 
@@ -604,6 +726,8 @@ Comment=View connectome similarity matrices
 Exec=${BIN_LINK}
 Icon=${ICON_PATH}
 Terminal=false
+StartupNotify=true
+StartupWMClass=donald
 Categories=Science;Utility;
 DESKTOP
 
@@ -691,6 +815,7 @@ echo "Installation complete."
 echo "Launcher: ${BIN_LINK}"
 echo "CLI launch: donald"
 if [[ "${OS_NAME}" == "Darwin" ]]; then
+  echo "macOS app: ${HOME}/Applications/Donald.app"
   echo "macOS shortcut: ${HOME}/Applications/Donald.command"
 fi
 if [[ "${SKIP_ENV}" -eq 0 ]]; then

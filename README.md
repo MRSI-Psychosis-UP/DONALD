@@ -16,7 +16,7 @@ Donald is a Qt GUI to load, inspect, aggregate, harmonize, and analyze connectom
 
 ## Platform Support
 - Linux: fully supported (`.desktop` launcher installed)
-- macOS: supported (`~/Applications/Donald.command` shortcut installed)
+- macOS: supported (`~/Applications/Donald.app` + `~/Applications/Donald.command` installed)
 
 ## Prerequisites
 - `conda` (Miniconda/Anaconda), initialized in shell
@@ -53,7 +53,7 @@ After first install, if needed:
 ```bash
 source ~/.bashrc   # Linux
 # or on macOS:
-source ~/.zshrc
+source ~/.zprofile && source ~/.zshrc
 ```
 
 Launch:

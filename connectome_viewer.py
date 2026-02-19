@@ -3336,6 +3336,14 @@ class ConnectomeViewer(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    if sys.platform.startswith("linux"):
+        app.setApplicationName("donald")
+        if hasattr(app, "setDesktopFileName"):
+            app.setDesktopFileName("donald")
+    elif sys.platform == "darwin":
+        app.setApplicationName("Donald")
+        if hasattr(app, "setApplicationDisplayName"):
+            app.setApplicationDisplayName("Donald")
     app_icon = _load_app_icon()
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
