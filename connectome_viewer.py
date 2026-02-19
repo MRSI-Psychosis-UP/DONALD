@@ -188,6 +188,10 @@ PARCEL_NAME_KEYS = ("parcel_names_group", "parcel_names_group.npy")
 CMAPS_DIR = Path(colorbar_module.__file__).with_name("cmaps")
 ROOTDIR = Path(__file__).resolve().parent
 DEFAULT_PARCELLATION_DIR = ROOTDIR / "data"
+APP_ICON_CANDIDATES = (
+    ROOTDIR / "icons" / "conviewer.png",
+    ROOTDIR / "icons" / "conviewer_2.png",
+)
 
 if QT_LIB == 6:
     Qt.Horizontal = Qt.Orientation.Horizontal
@@ -212,6 +216,16 @@ def _dialog_accepted_code():
     if dialog_code is not None and hasattr(dialog_code, "Accepted"):
         return dialog_code.Accepted
     return 1
+
+
+def _load_app_icon() -> QIcon:
+    for icon_path in APP_ICON_CANDIDATES:
+        if not icon_path.exists():
+            continue
+        icon = QIcon(str(icon_path))
+        if not icon.isNull():
+            return icon
+    return QIcon()
 
 
 def _is_valid_matrix_shape(shape) -> bool:
@@ -1390,9 +1404,13 @@ class ConnectomeViewer(QMainWindow):
         self.statusBar().showMessage("Ready.")
 
     def _set_window_icon(self) -> None:
-        icon_path = Path(__file__).with_name("icons") / "conviewer.png"
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+        icon = _load_app_icon()
+        if icon.isNull():
+            return
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
 
     def _on_theme_changed(self, theme_name: str) -> None:
         self._apply_theme(theme_name)
@@ -3318,6 +3336,9 @@ class ConnectomeViewer(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app_icon = _load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     splash_candidates = [
         ROOTDIR / "assets" / "splash.png",
         ROOTDIR / "icons" / "conviewer_2.png",

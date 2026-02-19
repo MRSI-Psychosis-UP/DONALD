@@ -14,10 +14,14 @@ DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 DESKTOP_FILE="${DESKTOP_DIR}/donald.desktop"
 BIN_DIR="${HOME}/.local/bin"
 BIN_LINK="${BIN_DIR}/donald"
+declare -a PATH_RC_FILES
+SHELL_RC_OVERRIDE=0
 if [[ "${OS_NAME}" == "Darwin" ]]; then
   SHELL_RC="${HOME}/.zshrc"
+  PATH_RC_FILES=("${HOME}/.zprofile" "${HOME}/.zshrc")
 else
   SHELL_RC="${HOME}/.bashrc"
+  PATH_RC_FILES=("${HOME}/.bashrc")
 fi
 
 DATA_URL="${DONALD_DATA_URL:-${CONNECTOME_VIEWER_DATA_URL:-}}"
@@ -58,7 +62,7 @@ Options:
   --force-data          Re-download and overwrite existing data/ folder
   --skip-desktop        Skip desktop integration (Linux .desktop / macOS shortcut)
   --shell-rc FILE       Shell rc file to append PATH update (default auto:
-                        ~/.bashrc on Linux, ~/.zshrc on macOS)
+                        ~/.bashrc on Linux, ~/.zprofile + ~/.zshrc on macOS)
   --non-interactive     Do not prompt; use defaults for unanswered values
   -h, --help            Show this help
 
@@ -196,6 +200,33 @@ upsert_env_key() {
   else
     printf '%s="%s"\n' "${key}" "${escaped}" >> "${file}"
   fi
+}
+
+ensure_bin_dir_on_path() {
+  local files=()
+  local rc_file
+
+  if [[ "${SHELL_RC_OVERRIDE}" -eq 1 ]]; then
+    files=("${SHELL_RC}")
+  else
+    files=("${PATH_RC_FILES[@]}")
+  fi
+
+  for rc_file in "${files[@]}"; do
+    rc_file="$(expand_home_path "${rc_file}")"
+    [[ -n "${rc_file}" ]] || continue
+
+    mkdir -p "$(dirname "${rc_file}")"
+    touch "${rc_file}"
+    if ! grep -Fq "export PATH=\"${BIN_DIR}:\$PATH\"" "${rc_file}" 2>/dev/null; then
+      {
+        echo ""
+        echo "# Added by donald installer"
+        echo "export PATH=\"${BIN_DIR}:\$PATH\""
+      } >> "${rc_file}"
+      echo "Added ${BIN_DIR} to PATH in ${rc_file}."
+    fi
+  done
 }
 
 probe_release_asset_for_tag() {
@@ -536,17 +567,11 @@ fi
 exec python "\${APP_PATH}" "\$@"
 LAUNCHER
   chmod +x "${BIN_LINK}"
+  ensure_bin_dir_on_path
 
   if ! command -v donald >/dev/null 2>&1; then
-    if ! grep -q "${BIN_DIR}" "${SHELL_RC}" 2>/dev/null; then
-      {
-        echo ""
-        echo "# Added by donald installer"
-        echo "export PATH=\"${BIN_DIR}:\$PATH\""
-      } >> "${SHELL_RC}"
-      echo "Added ${BIN_DIR} to PATH in ${SHELL_RC}."
-      echo "Run: source ${SHELL_RC}"
-    fi
+    echo "donald is installed at ${BIN_LINK}"
+    echo "Open a new terminal, or run: source ${SHELL_RC}"
   fi
 }
 
@@ -631,6 +656,8 @@ while [[ $# -gt 0 ]]; do
     --shell-rc)
       [[ $# -ge 2 ]] || { echo "Missing value for --shell-rc" >&2; exit 1; }
       SHELL_RC="$2"
+      SHELL_RC_OVERRIDE=1
+      PATH_RC_FILES=("${SHELL_RC}")
       shift 2
       ;;
     --non-interactive)
