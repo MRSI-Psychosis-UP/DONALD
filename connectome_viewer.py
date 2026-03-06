@@ -89,6 +89,10 @@ except ImportError:
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.transforms as mtransforms
+try:
+    from matplotlib.widgets import RectangleSelector
+except Exception:
+    RectangleSelector = None
 
 from mrsitoolbox.graphplot.simmatrix import SimMatrixPlot
 from mrsitoolbox.graphplot.colorbar import ColorBar
@@ -736,6 +740,9 @@ class ConnectomeViewer(QMainWindow):
         self._current_parcel_labels = None
         self._current_parcel_names = None
         self._current_axes = None
+        self._zoom_selector = None
+        self._matrix_full_xlim = None
+        self._matrix_full_ylim = None
         self._colorbar = ColorBar()
         self._custom_cmaps = set()
         self._preferences = self._load_preferences()
@@ -1345,6 +1352,24 @@ class ConnectomeViewer(QMainWindow):
         self.display_max_edit.setEnabled(False)
         self.display_max_edit.editingFinished.connect(self._on_display_scaling_changed)
         plot_toolbar.addWidget(self.display_max_edit)
+
+        plot_toolbar.addWidget(QLabel("Scale:"))
+        self.display_scale_combo = QComboBox()
+        self.display_scale_combo.addItems(["Linear", "Log"])
+        self.display_scale_combo.setCurrentText("Linear")
+        self.display_scale_combo.currentTextChanged.connect(self._on_display_scaling_changed)
+        self.display_scale_combo.setFixedWidth(78 if compact_ui else 92)
+        plot_toolbar.addWidget(self.display_scale_combo)
+
+        self.zoom_region_check = QCheckBox("Zoom region")
+        self.zoom_region_check.setToolTip("Drag on the matrix to zoom into a region.")
+        self.zoom_region_check.stateChanged.connect(self._on_zoom_region_toggled)
+        plot_toolbar.addWidget(self.zoom_region_check)
+
+        self.zoom_reset_button = QPushButton("Reset view")
+        self.zoom_reset_button.setEnabled(False)
+        self.zoom_reset_button.clicked.connect(self._reset_matrix_zoom)
+        plot_toolbar.addWidget(self.zoom_reset_button)
 
         self.right_sidebar_button = QPushButton("▶")
         self.right_sidebar_button.setFixedWidth(30)
@@ -2386,12 +2411,137 @@ class ConnectomeViewer(QMainWindow):
             return None, None, "Display min must be smaller than max."
         return vmin, vmax, None
 
+    def _current_display_scale(self) -> str:
+        if not hasattr(self, "display_scale_combo"):
+            return "linear"
+        choice = self.display_scale_combo.currentText().strip().lower()
+        if choice.startswith("log"):
+            return "log"
+        return "linear"
+
+    def _log_scale_error(self, matrix, vmin, vmax):
+        if matrix is None:
+            return "Log scale requires matrix values."
+        values = np.asarray(matrix, dtype=float)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return "Log scale requires finite values."
+        max_val = float(np.max(finite))
+        if max_val <= 0:
+            return "Log scale requires positive values (max > 0)."
+        min_val = float(np.min(finite))
+        if min_val < 0:
+            return "Log scale does not support negative values."
+        if vmin is not None and vmin <= 0:
+            return "Display min must be > 0 for log scale."
+        if vmax is not None and vmax <= 0:
+            return "Display max must be > 0 for log scale."
+        return None
+
     def _on_display_scaling_changed(self, *_args) -> None:
         auto_scale = self.display_auto_check.isChecked()
         self.display_min_edit.setEnabled(not auto_scale)
         self.display_max_edit.setEnabled(not auto_scale)
         if self._current_entry_id() is not None:
             self._plot_selected()
+
+    def _on_zoom_region_toggled(self, *_args) -> None:
+        if not hasattr(self, "zoom_region_check"):
+            return
+        if self.zoom_region_check.isChecked():
+            self._enable_zoom_selector()
+            self.statusBar().showMessage("Drag on the matrix to zoom into a region.")
+        else:
+            self._reset_zoom_selector()
+
+    def _update_zoom_selector(self) -> None:
+        self._reset_zoom_selector()
+        if hasattr(self, "zoom_region_check") and self.zoom_region_check.isChecked():
+            self._enable_zoom_selector()
+
+    def _enable_zoom_selector(self) -> None:
+        if RectangleSelector is None:
+            self.statusBar().showMessage("Region zoom is unavailable (matplotlib widgets missing).")
+            if hasattr(self, "zoom_region_check"):
+                self.zoom_region_check.blockSignals(True)
+                self.zoom_region_check.setChecked(False)
+                self.zoom_region_check.blockSignals(False)
+            return
+        if self._current_axes is None:
+            return
+        if self._zoom_selector is not None:
+            try:
+                self._zoom_selector.set_active(True)
+            except Exception:
+                pass
+            return
+        self._zoom_selector = RectangleSelector(
+            self._current_axes,
+            self._on_zoom_region_selected,
+            useblit=False,
+            button=[1],
+            minspanx=1,
+            minspany=1,
+        )
+        try:
+            self._zoom_selector.set_active(True)
+        except Exception:
+            pass
+
+    def _reset_zoom_selector(self) -> None:
+        if self._zoom_selector is None:
+            return
+        try:
+            self._zoom_selector.set_active(False)
+        except Exception:
+            pass
+        self._zoom_selector = None
+
+    def _on_zoom_region_selected(self, eclick, erelease) -> None:
+        if self._current_axes is None or self._current_matrix is None:
+            return
+        if (
+            eclick.xdata is None
+            or eclick.ydata is None
+            or erelease.xdata is None
+            or erelease.ydata is None
+        ):
+            return
+        x0, x1 = eclick.xdata, erelease.xdata
+        y0, y1 = eclick.ydata, erelease.ydata
+        if abs(x1 - x0) < 1 or abs(y1 - y0) < 1:
+            return
+        nrows, ncols = self._current_matrix.shape[:2]
+        x0 = max(-0.5, min(ncols - 0.5, x0))
+        x1 = max(-0.5, min(ncols - 0.5, x1))
+        y0 = max(-0.5, min(nrows - 0.5, y0))
+        y1 = max(-0.5, min(nrows - 0.5, y1))
+        xmin, xmax = sorted([x0, x1])
+        ymin, ymax = sorted([y0, y1])
+        ax = self._current_axes
+        if ax.xaxis_inverted():
+            ax.set_xlim(xmax, xmin)
+        else:
+            ax.set_xlim(xmin, xmax)
+        if ax.yaxis_inverted():
+            ax.set_ylim(ymax, ymin)
+        else:
+            ax.set_ylim(ymin, ymax)
+        if hasattr(self, "zoom_reset_button"):
+            self.zoom_reset_button.setEnabled(True)
+        self.canvas.draw_idle()
+
+    def _reset_matrix_zoom(self) -> None:
+        if self._current_axes is None:
+            return
+        if self._matrix_full_xlim is not None and self._matrix_full_ylim is not None:
+            self._current_axes.set_xlim(self._matrix_full_xlim)
+            self._current_axes.set_ylim(self._matrix_full_ylim)
+        else:
+            self._current_axes.autoscale()
+        if hasattr(self, "zoom_reset_button"):
+            self.zoom_reset_button.setEnabled(False)
+        self.canvas.draw_idle()
 
     def _on_splitter_moved(self, *_args) -> None:
         sizes = self.main_splitter.sizes()
@@ -2691,6 +2841,7 @@ class ConnectomeViewer(QMainWindow):
         if scaling_error:
             self.statusBar().showMessage(scaling_error)
             return
+        zscale = self._current_display_scale()
         matrices = []
         titles = []
         skipped = []
@@ -2704,6 +2855,12 @@ class ConnectomeViewer(QMainWindow):
                 label = entry.get("label", entry_id)
                 skipped.append(f"{label} ({exc})")
                 continue
+            if zscale == "log":
+                log_error = self._log_scale_error(matrix, vmin, vmax)
+                if log_error:
+                    label = entry.get("label", entry_id)
+                    self.statusBar().showMessage(f"{label}: {log_error}")
+                    return
             matrices.append(matrix)
             titles.append(self.titles.get(entry_id, entry.get("label", "Matrix")))
 
@@ -2730,6 +2887,7 @@ class ConnectomeViewer(QMainWindow):
                 colormap=colormap,
                 vmin=vmin,
                 vmax=vmax,
+                zscale=zscale,
             )
             _remove_axes_border(ax)
             if rotate:
@@ -2849,7 +3007,14 @@ class ConnectomeViewer(QMainWindow):
             return
 
         colormap = self._selected_colormap()
+        zscale = self._current_display_scale()
+        if zscale == "log":
+            log_error = self._log_scale_error(matrix, vmin, vmax)
+            if log_error:
+                self.statusBar().showMessage(log_error)
+                return
         self.figure.clear()
+        self._reset_zoom_selector()
         ax = self.figure.add_subplot(111)
         SimMatrixPlot.plot_simmatrix(
             matrix,
@@ -2858,9 +3023,15 @@ class ConnectomeViewer(QMainWindow):
             colormap=colormap,
             vmin=vmin,
             vmax=vmax,
+            zscale=zscale,
         )
         _remove_axes_border(ax)
         self._current_axes = ax
+        self._matrix_full_xlim = ax.get_xlim()
+        self._matrix_full_ylim = ax.get_ylim()
+        if hasattr(self, "zoom_reset_button"):
+            self.zoom_reset_button.setEnabled(False)
+        self._update_zoom_selector()
         title_tooltip = str(source_path) if source_path is not None else current_title
         self._set_plot_title(current_title, tooltip_text=title_tooltip)
         self._reset_gradients_output()
@@ -3265,6 +3436,11 @@ class ConnectomeViewer(QMainWindow):
         self._current_parcel_labels = None
         self._current_parcel_names = None
         self._current_axes = None
+        self._reset_zoom_selector()
+        self._matrix_full_xlim = None
+        self._matrix_full_ylim = None
+        if hasattr(self, "zoom_reset_button"):
+            self.zoom_reset_button.setEnabled(False)
         self._set_plot_title("")
         self._reset_gradients_output()
         self._update_nbs_prepare_button()
