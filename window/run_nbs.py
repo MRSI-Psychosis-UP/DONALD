@@ -11,22 +11,35 @@ import argparse
 import numpy as np
 import pandas as pd
 import subprocess
-import sys
 from nilearn import datasets
 import nibabel as nib
 from scipy.io import loadmat
 
-from mrsitoolbox.tools.datautils import DataUtils
-from mrsitoolbox.tools.debug import Debug
-from mrsitoolbox.tools.participants import ParticipantSelector
-from mrsitoolbox.connectomics.nettools import NetTools
-from mrsitoolbox.connectomics.nbs import NBS
-from mrsitoolbox.graphplot.brain3d import Brain3D
+_SCRIPT_PATH = Path(__file__).resolve()
+_VIEWER_ROOT = _SCRIPT_PATH.parents[1]
+_LOCAL_MRSI_ROOT = _VIEWER_ROOT.parent / "mrsitoolbox"
+if _LOCAL_MRSI_ROOT.exists():
+    _local_path = str(_LOCAL_MRSI_ROOT)
+    if _local_path not in sys.path:
+        sys.path.insert(0, _local_path)
+
+try:
+    from tools.datautils import DataUtils
+    from tools.debug import Debug
+    from tools.participants import ParticipantSelector
+    from connectomics.nettools import NetTools
+    from connectomics.nbs import NBS
+    from graphplot.brain3d import Brain3D
+except Exception:
+    from mrsitoolbox.tools.datautils import DataUtils
+    from mrsitoolbox.tools.debug import Debug
+    from mrsitoolbox.tools.participants import ParticipantSelector
+    from mrsitoolbox.connectomics.nettools import NetTools
+    from mrsitoolbox.connectomics.nbs import NBS
+    from mrsitoolbox.graphplot.brain3d import Brain3D
 from rich.table import Table
 
 
-_SCRIPT_PATH = Path(__file__).resolve()
-_VIEWER_ROOT = _SCRIPT_PATH.parents[1]
 if not os.getenv("DEVANALYSEPATH"):
     os.environ["DEVANALYSEPATH"] = str(_VIEWER_ROOT)
 if not os.getenv("BIDSDATAPATH") or os.getenv("BIDSDATAPATH") == ".":
@@ -868,8 +881,7 @@ parser.add_argument(
     ),
 )
 parser.add_argument('-c', '--contrast', type=str, default=None,
-                help="Contrast vector for MATLAB NBS (e.g., '[0 0 1 1 1]'). "
-                     "For python runs, the sign is used to infer the tail.")
+                help="GLM contrast vector (e.g., '[0 0 1 1 1]').")
 parser.add_argument('--nperm', type=int, default=1500,
                     help="Number of permutations used by the NBS (default: 1000)")
 parser.add_argument('--nthreads', type=int, default=8,
@@ -900,7 +912,17 @@ parser.add_argument('--select', '-s', dest='select', action='append', default=[]
                          "Format: COVARNAME,VALUE or COVARNAME,>VALUE (e.g., --select Diag,0).")
 parser.add_argument('--engine', type=str, default="matlab",
                     choices=["python", "matlab"],
-                    help="Choose implementation to run: python or matlab (default: python).")
+                    help="Choose implementation to run: python or matlab.")
+parser.add_argument(
+    "--python-impl",
+    type=str,
+    default="matlab_compat",
+    choices=["matlab_compat", "legacy"],
+    help=(
+        "Python engine backend: 'matlab_compat' mirrors MATLAB NBS GLM behavior, "
+        "'legacy' uses the older python implementation."
+    ),
+)
 default_matlab_cmd = (
     os.getenv("MRSI_MATLAB_CMD")
     or os.getenv("MATLAB_CMD")
@@ -968,6 +990,8 @@ if not regressor_name:
 nuisance_cli = [s.strip().lower() for s in args.nuisance.split(",")] if args.nuisance else []
 nuisance_cli = [n for n in nuisance_cli if n]
 run_matlab = args.engine == "matlab"
+run_python_compat = args.engine == "python" and args.python_impl == "matlab_compat"
+run_python_legacy = args.engine == "python" and args.python_impl == "legacy"
 contrast_cli = (args.contrast or "").strip() or None
 contrast_tokens, contrast_has_b = _parse_contrast_with_placeholder(contrast_cli) if contrast_cli else (None, False)
 tail_value = "both" if contrast_has_b else (_infer_tail_from_contrast(contrast_cli) or "both")
@@ -1244,11 +1268,14 @@ else:
 nuisance_terms_preview = list(nuisance_cli)
 _print_covariate_distribution(regressor_name, designmat_dict, nuisance_terms_preview, debug)
 
+requested_test = str(args.matlab_test).upper()
+requested_size = str(args.matlab_size).lower()
+
 matlab_regressor_cols = [regressor_name]
 regressor_for_bct = regressor_name
 expanded_info = None
 add_intercept = True
-if run_matlab and str(args.matlab_test).upper() == "F":
+if (run_matlab or run_python_compat) and requested_test == "F":
     expanded_info = _expand_regressor_for_f(
         designmat_dict, regressor_name, include_reference=True
     )
@@ -1257,19 +1284,19 @@ if run_matlab and str(args.matlab_test).upper() == "F":
         matlab_regressor_cols = list(expanded_info["columns"])
         add_intercept = False
         debug.info(
-            f"MATLAB F-test: expanded '{regressor_name}' into {matlab_regressor_cols} "
+            f"F-test design: expanded '{regressor_name}' into {matlab_regressor_cols} "
             "and removed intercept."
         )
     else:
         debug.warning(
-            "MATLAB F-test requested but regressor has <=2 unique values; using single column."
+            "F-test requested but regressor has <=2 unique values; using single column."
         )
 if nuisance_cli:
     nuisance_terms = list(nuisance_cli)
 else:
     nuisance_terms = []
 nuisance_terms_display = list(nuisance_terms)
-if run_matlab and str(args.matlab_test).upper() == "F" and matlab_regressor_cols:
+if (run_matlab or run_python_compat) and requested_test == "F" and matlab_regressor_cols:
     for col in matlab_regressor_cols:
         if col != regressor_for_bct and col not in nuisance_terms:
             nuisance_terms.append(col)
@@ -1281,46 +1308,132 @@ if selection_suffix:
         selection_tag = f"_{selection_suffix}_{selection_value_tag}"
     else:
         selection_tag = f"_{selection_suffix}"
-test_type_tag = str(args.matlab_test).lower() if run_matlab else "t"
-if run_matlab and str(args.matlab_test).upper() == "F":
+test_type_tag = requested_test.lower() if (run_matlab or run_python_compat) else "t"
+if (run_matlab or run_python_compat) and requested_test == "F":
     tail_tag = "na"
 else:
     tail_tag = "both" if contrast_has_b else tail_value
+size_tag = requested_size if (run_matlab or run_python_compat) else "extent"
 param_tag  = (
     f"perm-{_slugify_fragment(args.permtest)}_nperm-{args.nperm}_th-{args.t_thresh}"
     f"_reg-{_slugify_fragment(regressor_name)}_nuis-{nuis_tag}"
-    f"_lobes-{_slugify_fragment(lobes_choice)}_test-{test_type_tag}_tail-{tail_tag}{selection_tag}"
+    f"_lobes-{_slugify_fragment(lobes_choice)}_test-{test_type_tag}"
+    f"_size-{_slugify_fragment(size_tag)}_tail-{tail_tag}{selection_tag}"
 )
 plot_dir = join(base_dir, "connectome_plots")
 matlab_export_dir = join(base_dir, "matlab_nbs", param_tag)
 os.makedirs(plot_dir, exist_ok=True)
 predictor_label = regressor_for_bct if regressor_for_bct != regressor_name else regressor_name
-if run_matlab and str(args.matlab_test).upper() == "F" and matlab_regressor_cols:
+if (run_matlab or run_python_compat) and requested_test == "F" and matlab_regressor_cols:
     debug.info(
-        f"Start bct_corr with MATLAB F-test across --{', '.join(matlab_regressor_cols)}-- "
+        f"Start bct_corr with F-test across --{', '.join(matlab_regressor_cols)}-- "
         f"and nuisance params -- {nuisance_terms_display} --"
     )
 else:
     debug.info(f"Start bct_corr with predictor --{predictor_label}-- and nuisance params -- {nuisance_terms} --")
 
 ### Start NBS ###
-debug.info(f"Preparing {MeSiM_list.shape[0]} matrices for matlab NBS")
-results_dict = nbs.bct_corr(MeSiM_list,
-             designmat_dict,
-             nuisance = nuisance_terms,
-             regress  = regressor_for_bct,
-             permtest = args.permtest,
-             gm_adj   = gm_adj if args.permtest == "gmadj" else None,
-             t_thresh = args.t_thresh,
-             n_perms  = 0 if run_matlab else args.nperm,
-             nthreads = args.nthreads,
-             tail     = tail_value,
-             export_matlab_dir = matlab_export_dir,
-             node_coords = centroids_world,
-             node_names = parcel_names,
-             subject_ids = subject_id_all,
-             add_intercept = add_intercept,
-             )
+debug.info(f"Preparing {MeSiM_list.shape[0]} matrices for NBS ({args.engine})")
+design_columns_for_run = []
+design_parts = []
+if add_intercept:
+    design_columns_for_run.append("intercept")
+    design_parts.append(np.ones((MeSiM_list.shape[0], 1), dtype=float))
+for col in nuisance_terms:
+    if col not in designmat_dict:
+        raise ValueError(f"Nuisance column '{col}' not found in design matrix.")
+    design_columns_for_run.append(col)
+    design_parts.append(np.asarray(designmat_dict[col], dtype=float).reshape(-1, 1))
+if regressor_for_bct not in designmat_dict:
+    raise ValueError(f"Regressor column '{regressor_for_bct}' not found in design matrix.")
+design_columns_for_run.append(regressor_for_bct)
+design_parts.append(np.asarray(designmat_dict[regressor_for_bct], dtype=float).reshape(-1, 1))
+design_matrix_for_run = np.column_stack(design_parts)
+
+if run_python_compat:
+    if args.permtest != "freedman":
+        raise ValueError(
+            "python matlab_compat backend currently supports only --permtest freedman."
+        )
+    analysis_subject_order = np.argsort(
+        np.asarray([f"subject{i+1}.txt" for i in range(MeSiM_list.shape[0])], dtype=object)
+    )
+    debug.info("python matlab_compat: using MATLAB-style lexicographic subject file ordering.")
+    if contrast_has_b:
+        raise ValueError(
+            "Contrast placeholder 'b' is not supported by python matlab_compat backend. "
+            "Use an explicit numeric contrast vector."
+        )
+    if contrast_tokens is None:
+        contrast_for_python = np.zeros(len(design_columns_for_run), dtype=float)
+        if requested_test == "F":
+            contrast_cols = matlab_regressor_cols or [regressor_for_bct]
+            for col in contrast_cols:
+                if col not in design_columns_for_run:
+                    raise ValueError(f"Contrast column '{col}' not found in design.")
+                contrast_for_python[design_columns_for_run.index(col)] = 1.0
+        else:
+            contrast_for_python[-1] = 1.0
+    else:
+        contrast_for_python = _expand_contrast_tokens(
+            contrast_tokens,
+            design_columns_for_run,
+            matlab_regressor_cols,
+        )
+    results_dict = nbs.bct_glm_matlab_compat(
+        MeSiM_list,
+        design_matrix=design_matrix_for_run,
+        contrast=contrast_for_python,
+        test=requested_test,
+        size=requested_size,
+        t_thresh=args.t_thresh,
+        n_perms=args.nperm,
+        nthreads=args.nthreads,
+        alpha=args.alpha,
+        export_matlab_dir=matlab_export_dir,
+        node_coords=centroids_world,
+        node_names=parcel_names,
+        subject_ids=subject_id_all,
+        design_columns=design_columns_for_run,
+        return_significant_only=True,
+        analysis_subject_order=analysis_subject_order,
+    )
+elif run_python_legacy:
+    results_dict = nbs.bct_corr(
+        MeSiM_list,
+        designmat_dict,
+        nuisance=nuisance_terms,
+        regress=regressor_for_bct,
+        permtest=args.permtest,
+        gm_adj=gm_adj if args.permtest == "gmadj" else None,
+        t_thresh=args.t_thresh,
+        n_perms=args.nperm,
+        nthreads=args.nthreads,
+        tail=tail_value,
+        export_matlab_dir=matlab_export_dir,
+        node_coords=centroids_world,
+        node_names=parcel_names,
+        subject_ids=subject_id_all,
+        add_intercept=add_intercept,
+    )
+else:
+    results_dict = nbs.bct_corr(
+        MeSiM_list,
+        designmat_dict,
+        nuisance=nuisance_terms,
+        regress=regressor_for_bct,
+        permtest=args.permtest,
+        gm_adj=gm_adj if args.permtest == "gmadj" else None,
+        t_thresh=args.t_thresh,
+        n_perms=0,
+        nthreads=args.nthreads,
+        tail=tail_value,
+        export_matlab_dir=matlab_export_dir,
+        node_coords=centroids_world,
+        node_names=parcel_names,
+        subject_ids=subject_id_all,
+        add_intercept=add_intercept,
+    )
 
 
 if parcel_df.shape[0] != results_dict["t_mat"].shape[0]:
@@ -1497,7 +1610,7 @@ if export_paths:
             comp_pvals += [min(1.0, 2.0 * float(p)) for p in neg_res["comp_pvals"]]
             sig_mask = np.zeros_like(pos_res["t_mat"], dtype=bool)
             for p, m in zip(comp_pvals, comp_masks):
-                if p < args.alpha:
+                if p <= args.alpha:
                     if m.shape != sig_mask.shape:
                         continue
                     sig_mask |= m
@@ -1515,7 +1628,7 @@ if export_paths:
             results_dict = matlab_results[0][1]
 
 
-ids_sig    = np.where(np.array(results_dict["comp_pvals"]) < args.alpha)[0]
+ids_sig    = np.where(np.array(results_dict["comp_pvals"]) <= args.alpha)[0]
 n_sig_comp = len(ids_sig)
 pvalue_arr = np.array(results_dict["comp_pvals"])
 global_pvalue = float(np.nanmin(pvalue_arr)) if pvalue_arr.size else float("nan")
@@ -1562,6 +1675,7 @@ np.savez(
     npert=np.array(npert, dtype=int),
     preproc=args.preproc,
     test_type=test_type_tag,
+    test_size=size_tag,
     test_tail=tail_tag,
     connectivity_path=connectivity_path,
     subject_ids=subject_id_all.astype(str),
@@ -1597,6 +1711,7 @@ for comp_idx in range(total_components):
         "npert": npert,
         "preproc": args.preproc,
         "test_type": test_type_tag,
+        "test_size": size_tag,
         "test_tail": tail_tag,
         "connectivity_path": connectivity_path,
         "regressor_name": regressor_name,
@@ -1654,6 +1769,7 @@ for comp_idx in range(total_components):
         npert=np.array(npert, dtype=int),
         preproc=args.preproc,
         test_type=test_type_tag,
+        test_size=size_tag,
         test_tail=tail_tag,
         connectivity_path=connectivity_path,
         subject_ids=subject_id_all.astype(str),

@@ -641,8 +641,10 @@ configure_env_file() {
 
 install_launcher() {
   local conda_hint=""
+  local conda_base_hint=""
   if command -v conda >/dev/null 2>&1; then
     conda_hint="$(command -v conda)"
+    conda_base_hint="$(conda info --base 2>/dev/null || true)"
   fi
 
   mkdir -p "${BIN_DIR}"
@@ -652,30 +654,62 @@ set -euo pipefail
 APP_PATH="${APP_PATH}"
 ENV_NAME="${ENV_NAME}"
 CONDA_HINT="${conda_hint}"
+CONDA_BASE_HINT="${conda_base_hint}"
 
-CONDA_BIN=""
-if [[ -n "\${CONDA_HINT}" && -x "\${CONDA_HINT}" ]]; then
-  CONDA_BIN="\${CONDA_HINT}"
-elif command -v conda >/dev/null 2>&1; then
-  CONDA_BIN="\$(command -v conda)"
-else
+choose_conda_bin() {
+  local candidate resolved
+
+  if [[ -n "\${CONDA_HINT}" && "\${CONDA_HINT}" == */* && -x "\${CONDA_HINT}" ]]; then
+    printf '%s\n' "\${CONDA_HINT}"
+    return 0
+  fi
+
+  if [[ -n "\${CONDA_BASE_HINT}" ]]; then
+    for candidate in \
+      "\${CONDA_BASE_HINT}/bin/conda" \
+      "\${CONDA_BASE_HINT}/condabin/conda"; do
+      if [[ -x "\${candidate}" ]]; then
+        printf '%s\n' "\${candidate}"
+        return 0
+      fi
+    done
+  fi
+
+  if command -v conda >/dev/null 2>&1; then
+    resolved="\$(command -v conda)"
+    if [[ "\${resolved}" == */* && -x "\${resolved}" ]]; then
+      printf '%s\n' "\${resolved}"
+      return 0
+    fi
+  fi
+
   for candidate in \
+    "\${HOME}/miniconda3/condabin/conda" \
     "\${HOME}/miniconda3/bin/conda" \
+    "\${HOME}/anaconda3/condabin/conda" \
     "\${HOME}/anaconda3/bin/conda" \
+    "\${HOME}/mambaforge/condabin/conda" \
     "\${HOME}/mambaforge/bin/conda" \
+    "\${HOME}/miniforge3/condabin/conda" \
     "\${HOME}/miniforge3/bin/conda"; do
     if [[ -x "\${candidate}" ]]; then
-      CONDA_BIN="\${candidate}"
-      break
+      printf '%s\n' "\${candidate}"
+      return 0
     fi
   done
-fi
+  return 1
+}
 
-if [[ -n "\${CONDA_BIN}" ]]; then
-  exec "\${CONDA_BIN}" run --no-capture-output -n "\${ENV_NAME}" python "\${APP_PATH}" "\$@"
+CONDA_BIN=""
+if CONDA_BIN="\$(choose_conda_bin)"; then
+  if "\${CONDA_BIN}" run --no-capture-output -n "\${ENV_NAME}" python "\${APP_PATH}" "\$@"; then
+    exit 0
+  fi
+  echo "Warning: conda launch failed (\${CONDA_BIN}); trying direct env python fallback." >&2
 fi
 
 for candidate_python in \
+  "\${CONDA_BASE_HINT}/envs/\${ENV_NAME}/bin/python" \
   "\${HOME}/miniconda3/envs/\${ENV_NAME}/bin/python" \
   "\${HOME}/anaconda3/envs/\${ENV_NAME}/bin/python" \
   "\${HOME}/mambaforge/envs/\${ENV_NAME}/bin/python" \

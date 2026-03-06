@@ -509,17 +509,35 @@ class NBSPrepareDialog(QDialog):
             self.modality_combo.setCurrentText("mrsi")
         core_grid.addWidget(self.modality_combo, 2, 3)
 
+        core_grid.addWidget(QLabel("Engine"), 3, 0)
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("MATLAB (reference)", "matlab")
+        self.engine_combo.addItem("Python (MATLAB-compatible)", "python")
+        self.engine_combo.setCurrentIndex(0)
+        self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        self.engine_combo.currentIndexChanged.connect(self._update_run_summary)
+        core_grid.addWidget(self.engine_combo, 3, 1)
+
+        core_grid.addWidget(QLabel("Component size"), 3, 2)
+        self.component_size_combo = QComboBox()
+        self.component_size_combo.addItem("Extent", "extent")
+        self.component_size_combo.addItem("Intensity", "intensity")
+        self.component_size_combo.setCurrentIndex(0)
+        self.component_size_combo.currentIndexChanged.connect(self._update_run_summary)
+        core_grid.addWidget(self.component_size_combo, 3, 3)
+
         self.matlab_persistent_check = QCheckBox(
             "Persistent MATLAB session (reuse workers between runs)"
         )
         self.matlab_persistent_check.setChecked(True)
-        core_grid.addWidget(self.matlab_persistent_check, 3, 0, 1, 4)
+        core_grid.addWidget(self.matlab_persistent_check, 4, 0, 1, 4)
 
         self.matlab_no_precompute_check = QCheckBox(
             "Skip MATLAB precompute (lower memory, often slower)"
         )
         self.matlab_no_precompute_check.setChecked(False)
-        core_grid.addWidget(self.matlab_no_precompute_check, 4, 0, 1, 4)
+        core_grid.addWidget(self.matlab_no_precompute_check, 5, 0, 1, 4)
+        self._on_engine_changed()
 
         layout.addWidget(core_group)
         layout.addStretch(1)
@@ -703,6 +721,21 @@ class NBSPrepareDialog(QDialog):
         if selected:
             self.output_dir_edit.setText(selected)
 
+    def _selected_engine(self):
+        if not hasattr(self, "engine_combo"):
+            return "matlab"
+        data = self.engine_combo.currentData()
+        if not data:
+            return "matlab"
+        return str(data).strip().lower()
+
+    def _on_engine_changed(self, *_args):
+        is_matlab = self._selected_engine() == "matlab"
+        if hasattr(self, "matlab_persistent_check"):
+            self.matlab_persistent_check.setEnabled(is_matlab)
+        if hasattr(self, "matlab_no_precompute_check"):
+            self.matlab_no_precompute_check.setEnabled(is_matlab)
+
     def _selected_regressor_type(self):
         mode = self.model_regressor_type_combo.currentText().strip().lower()
         if mode == "categorical":
@@ -741,9 +774,20 @@ class NBSPrepareDialog(QDialog):
             if hasattr(self, "nperm_spin")
             else "NA"
         )
+        engine = self._selected_engine()
+        engine_label = "MATLAB (reference)" if engine == "matlab" else "Python (MATLAB-compatible)"
+        test_label = self.test_combo.currentText().strip() if hasattr(self, "test_combo") else "t-test"
+        size_label = (
+            self.component_size_combo.currentText().strip()
+            if hasattr(self, "component_size_combo")
+            else "Extent"
+        )
         self.run_summary_label.setText(
+            f"Engine: {engine_label}\n"
             f"Regressor: {regressor}\n"
             f"Confounds: {confounds}\n"
+            f"Test: {test_label}\n"
+            f"Component size: {size_label}\n"
             f"N included: {n_included}\n"
             f"Permutations: {nperm}\n"
             f"Threshold: {threshold}"
@@ -1226,6 +1270,12 @@ class NBSPrepareDialog(QDialog):
             "covariates": selected,
             "regressor_classes": self._regressor_classes(),
             "test": self.test_combo.currentText().strip(),
+            "engine": self._selected_engine(),
+            "component_size": (
+                str(self.component_size_combo.currentData() or "extent").strip().lower()
+                if hasattr(self, "component_size_combo")
+                else "extent"
+            ),
             "nthreads": int(self.nthreads_spin.value()),
             "nperm": int(self.nperm_spin.value()),
             "t_thresh": float(self.t_thresh_spin.value()),
@@ -1362,6 +1412,12 @@ class NBSPrepareDialog(QDialog):
         nuisance_terms = selected.get("nuisance") or []
         test_choice = self.test_combo.currentText().strip()
         matlab_test = "F" if test_choice == "Ftest" else "t"
+        engine = self._selected_engine()
+        component_size = (
+            str(self.component_size_combo.currentData() or "extent").strip().lower()
+            if hasattr(self, "component_size_combo")
+            else "extent"
+        )
 
         run_script = Path(__file__).resolve().with_name("run_nbs.py")
         if not run_script.exists():
@@ -1370,7 +1426,7 @@ class NBSPrepareDialog(QDialog):
         command = [
             str(run_script),
             "--engine",
-            "matlab",
+            engine,
             "--input",
             str(conn_subset_path),
             "--nthreads",
@@ -1381,11 +1437,15 @@ class NBSPrepareDialog(QDialog):
             str(int(self.nperm_spin.value())),
             "--matlab-test",
             matlab_test,
+            "--matlab-size",
+            component_size,
             "--regress",
             str(regressor),
             "--diag",
             "group",
         ]
+        if engine == "python":
+            command += ["--python-impl", "matlab_compat"]
         if nuisance_terms:
             command += ["--nuisance", ",".join(str(x) for x in nuisance_terms)]
 
@@ -1405,22 +1465,33 @@ class NBSPrepareDialog(QDialog):
             raise ValueError("Custom contrast is required.")
         command += ["--contrast", contrast_text]
 
-        matlab_cmd = self._matlab_cmd_default
-        if matlab_cmd:
+        if engine == "matlab":
+            matlab_cmd = str(self._matlab_cmd_default or "").strip()
+            matlab_ok = False
+            if matlab_cmd:
+                matlab_path = Path(matlab_cmd)
+                if matlab_path.is_file() or shutil.which(matlab_cmd):
+                    matlab_ok = True
+            matlab_nbs_path = str(self._matlab_nbs_path_default or "").strip()
+            nbs_ok = bool(matlab_nbs_path) and Path(matlab_nbs_path).is_dir()
+            if not matlab_ok or not nbs_ok:
+                raise ValueError(
+                    "MATLAB engine requires valid MATLAB executable and NBS path in Preferences."
+                )
             command += ["--matlab-cmd", matlab_cmd]
-        matlab_nbs_path = self._matlab_nbs_path_default
-        if matlab_nbs_path:
             command += ["--matlab-nbs-path", matlab_nbs_path]
+
         parcellation_path = self.parcellation_path_edit.text().strip()
         if parcellation_path:
             command += ["--parcellation-path", parcellation_path]
         modality = self.modality_combo.currentText().strip().lower()
         if modality:
             command += ["--modality", modality]
-        if self.matlab_persistent_check.isChecked():
-            command.append("--matlab-persistent")
-        if self.matlab_no_precompute_check.isChecked():
-            command.append("--matlab-no-precompute")
+        if engine == "matlab":
+            if self.matlab_persistent_check.isChecked():
+                command.append("--matlab-persistent")
+            if self.matlab_no_precompute_check.isChecked():
+                command.append("--matlab-no-precompute")
         return command
 
     def _build_process_environment(self):
@@ -1439,8 +1510,9 @@ class NBSPrepareDialog(QDialog):
             self._append_terminal_line(f"[NBS] BIDSDATAPATH not set; using {fallback_bids}")
         pythonpath_current = env.value("PYTHONPATH", "")
         pythonpath_parts = [p for p in pythonpath_current.split(os.pathsep) if p]
+        repo_root = str(Path(viewer_root).parent)
         mrsitoolbox_root = str(Path(viewer_root).parent / "mrsitoolbox")
-        for candidate in (viewer_root, mrsitoolbox_root):
+        for candidate in (viewer_root, repo_root, mrsitoolbox_root):
             if candidate and candidate not in pythonpath_parts and Path(candidate).exists():
                 pythonpath_parts.insert(0, candidate)
         if pythonpath_parts:

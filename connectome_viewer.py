@@ -1871,8 +1871,6 @@ class ConnectomeViewer(QMainWindow):
                 "NBS Prepare requires a file-based matrix stack (multiple matrices)."
             )
             return
-        if not self._validate_nbs_preferences():
-            return
 
         source_path = source["path"]
         covars_info = self._covars_cache.get(source_path)
