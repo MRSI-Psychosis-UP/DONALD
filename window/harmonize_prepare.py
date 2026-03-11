@@ -14,6 +14,7 @@ try:
     from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import (
         QAbstractItemView,
+        QCheckBox,
         QComboBox,
         QDialog,
         QFileDialog,
@@ -25,6 +26,7 @@ try:
         QLabel,
         QLineEdit,
         QMessageBox,
+        QPlainTextEdit,
         QPushButton,
         QStackedWidget,
         QTableWidget,
@@ -37,6 +39,7 @@ except Exception:
     from PyQt5.QtCore import Qt
     from PyQt5.QtWidgets import (
         QAbstractItemView,
+        QCheckBox,
         QComboBox,
         QDialog,
         QFileDialog,
@@ -48,6 +51,7 @@ except Exception:
         QLabel,
         QLineEdit,
         QMessageBox,
+        QPlainTextEdit,
         QPushButton,
         QStackedWidget,
         QTableWidget,
@@ -190,6 +194,7 @@ class HarmonizePrepareDialog(QDialog):
         covars_info,
         source_path,
         matrix_key,
+        output_dir_default="",
         theme_name="Dark",
         export_callback=None,
         parent=None,
@@ -197,6 +202,7 @@ class HarmonizePrepareDialog(QDialog):
         super().__init__(parent)
         self._source_path = Path(source_path)
         self._matrix_key = str(matrix_key)
+        self._output_dir_default = str(output_dir_default or "").strip()
         self._columns, self._rows = _covars_to_rows(covars_info)
         self._filtered_indices = list(range(len(self._rows)))
         self._excluded_indices = set()
@@ -371,7 +377,7 @@ class HarmonizePrepareDialog(QDialog):
         output_group = QGroupBox("Output")
         out_grid = QGridLayout(output_group)
         out_grid.addWidget(QLabel("Output folder"), 0, 0)
-        self.output_dir_edit = QLineEdit(str(self._source_path.parent))
+        self.output_dir_edit = QLineEdit(self._output_dir_default or str(self._source_path.parent))
         out_grid.addWidget(self.output_dir_edit, 0, 1)
         self.output_dir_button = QPushButton("Browse")
         self.output_dir_button.clicked.connect(self._browse_output_dir)
@@ -391,6 +397,13 @@ class HarmonizePrepareDialog(QDialog):
 
         run_group = QGroupBox("Run")
         run_layout = QVBoxLayout(run_group)
+        self.fisher_checkbox = QCheckBox("Apply Fisher transform on upper-triangle edges")
+        self.fisher_checkbox.setChecked(True)
+        self.fisher_checkbox.toggled.connect(
+            lambda _checked=False, self=self: self._apply_default_output_name(force=False)
+        )
+        run_layout.addWidget(self.fisher_checkbox)
+
         run_buttons = QHBoxLayout()
         self.run_button = QPushButton("Run neuroCombat")
         self.run_button.clicked.connect(self._run_harmonization)
@@ -406,11 +419,24 @@ class HarmonizePrepareDialog(QDialog):
         self.run_summary_label.setWordWrap(True)
         run_layout.addWidget(self.run_summary_label)
 
+        self.log_output = QPlainTextEdit()
+        self.log_output.setObjectName("harmonizeTerminal")
+        self.log_output.setReadOnly(True)
+        self.log_output.document().setMaximumBlockCount(4000)
+        if QT_LIB == 6:
+            self.log_output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        else:
+            self.log_output.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.log_output.setPlaceholderText("Harmonization progress will appear here.")
+        self.log_output.setMinimumHeight(160)
+        run_layout.addWidget(self.log_output)
+
         self.result_figure = Figure(figsize=(10, 6))
         self.result_canvas = FigureCanvas(self.result_figure)
         run_layout.addWidget(self.result_canvas, 1)
         layout.addWidget(run_group, 1)
 
+        self._apply_terminal_style()
         self._refresh_output_path_preview()
         return page
 
@@ -435,6 +461,35 @@ class HarmonizePrepareDialog(QDialog):
 
     def _set_status(self, text):
         self.status_label.setText(str(text))
+
+    def _append_terminal_line(self, text):
+        if not hasattr(self, "log_output") or self.log_output is None:
+            return
+        if text is None:
+            return
+        lines = str(text).splitlines() or [str(text)]
+        for line in lines:
+            if line.strip() == "":
+                continue
+            self.log_output.appendPlainText(line)
+        scroll = self.log_output.verticalScrollBar()
+        if scroll is not None:
+            scroll.setValue(scroll.maximum())
+
+    def _apply_terminal_style(self):
+        if not hasattr(self, "log_output") or self.log_output is None:
+            return
+        self.log_output.setStyleSheet(
+            "QPlainTextEdit#harmonizeTerminal {"
+            " background-color: #000000;"
+            " color: #b8f7c6;"
+            " border: 1px solid #404040;"
+            " border-radius: 4px;"
+            " selection-background-color: #2d6cdf;"
+            " font-family: 'DejaVu Sans Mono', 'Courier New', monospace;"
+            " font-size: 10.5pt;"
+            "}"
+        )
 
     @staticmethod
     def _parse_filter_values(text):
@@ -664,6 +719,7 @@ class HarmonizePrepareDialog(QDialog):
             return
         batch_col = self.batch_combo.currentText().strip() if hasattr(self, "batch_combo") else "batch"
         categorical, continuous = self._selected_confounds() if hasattr(self, "confound_table") else ([], [])
+        apply_fisher = bool(self.fisher_checkbox.isChecked()) if hasattr(self, "fisher_checkbox") else False
         try:
             default_path = self._harm_mod.build_default_output_path(
                 source_path=self._source_path,
@@ -671,6 +727,7 @@ class HarmonizePrepareDialog(QDialog):
                 batch_col=batch_col or "batch",
                 categorical_cols=categorical,
                 continuous_cols=continuous,
+                apply_fisher=apply_fisher,
                 output_dir=self.output_dir_edit.text().strip() if hasattr(self, "output_dir_edit") else self._source_path.parent,
             )
             self.output_name_edit.setText(default_path.name)
@@ -681,7 +738,7 @@ class HarmonizePrepareDialog(QDialog):
         self._refresh_output_path_preview()
 
     def _browse_output_dir(self):
-        start_dir = self.output_dir_edit.text().strip() or str(self._source_path.parent)
+        start_dir = self.output_dir_edit.text().strip() or self._output_dir_default or str(self._source_path.parent)
         selected = QFileDialog.getExistingDirectory(self, "Select output folder", start_dir)
         if selected:
             self.output_dir_edit.setText(selected)
@@ -729,12 +786,21 @@ class HarmonizePrepareDialog(QDialog):
         categorical, continuous = self._selected_confounds()
         categorical = [col for col in categorical if col != batch_col]
         continuous = [col for col in continuous if col != batch_col]
+        apply_fisher = bool(self.fisher_checkbox.isChecked()) if hasattr(self, "fisher_checkbox") else False
 
         output_path = self._output_path()
 
         self._set_busy(True)
         self._set_status("Running neuroCombat harmonization...")
         self.run_summary_label.setText("Running...")
+        if hasattr(self, "log_output") and self.log_output is not None:
+            self.log_output.clear()
+        self._append_terminal_line(
+            (
+                f"[HARMONIZE] Starting run for {self._source_path.name} "
+                f"(key={self._matrix_key}, batch={batch_col}, fisher={apply_fisher})."
+            )
+        )
 
         try:
             run = self._harm_mod.run_harmonization(
@@ -744,11 +810,14 @@ class HarmonizePrepareDialog(QDialog):
                 categorical_cols=categorical,
                 continuous_cols=continuous,
                 selected_indices=selected_rows,
+                apply_fisher=apply_fisher,
                 output_path=output_path,
                 show_plots=False,
+                log_fn=self._append_terminal_line,
             )
         except Exception as exc:
             self._set_busy(False)
+            self._append_terminal_line(f"[HARMONIZE] Run failed: {exc}")
             self._set_status(f"Harmonization failed: {exc}")
             self.run_summary_label.setText("Run failed.")
             return
@@ -760,11 +829,14 @@ class HarmonizePrepareDialog(QDialog):
         self.run_summary_label.setText(
             f"Saved: {self._last_output_path}\n"
             f"N subjects: {summary.get('n_subjects')} | parcels: {summary.get('n_parcels')}\n"
+            f"Edges: {summary.get('n_edges')} | upper triangle only: {summary.get('upper_triangle_only')} | "
+            f"Fisher: {summary.get('apply_fisher')}\n"
             f"Batch: {summary.get('batch_col')} | counts: {summary.get('batch_counts')}\n"
             f"Confounds categorical: {', '.join(summary.get('categorical_cols') or []) or 'none'}\n"
             f"Confounds continuous: {', '.join(summary.get('continuous_cols') or []) or 'none'}\n"
             f"Mean original={summary.get('mean_original'):.4g}, harmonized={summary.get('mean_harmonized'):.4g}"
         )
+        self._append_terminal_line(f"[HARMONIZE] Completed: {self._last_output_path}")
 
         try:
             self._harm_mod.create_harmonization_plots(
@@ -776,6 +848,7 @@ class HarmonizePrepareDialog(QDialog):
             )
             self.result_canvas.draw_idle()
         except Exception as exc:
+            self._append_terminal_line(f"[HARMONIZE] Plotting failed: {exc}")
             self._set_status(f"Harmonization complete, but plotting failed: {exc}")
 
         self._set_busy(False)
@@ -889,6 +962,7 @@ class HarmonizePrepareDialog(QDialog):
                 "QTableWidget::item:selected { background: #2563eb; color: #ffffff; }"
             )
         self.setStyleSheet(style)
+        self._apply_terminal_style()
 
 
 __all__ = ["HarmonizePrepareDialog"]

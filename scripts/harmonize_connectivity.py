@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -95,6 +95,15 @@ def _ensure_pandas() -> None:
 def _ensure_neurocombat() -> None:
     if neuroCombat is None:
         raise ImportError("neuroCombat is not available in this environment.")
+
+
+def _emit_log(log_fn: Optional[Callable[[str], None]], text: str) -> None:
+    if log_fn is None:
+        return
+    try:
+        log_fn(str(text))
+    except Exception:
+        pass
 
 
 def _resolve_column_name(df, requested: str) -> str:
@@ -302,6 +311,8 @@ def harmonize_matrix_stack(
     batch_col: str,
     categorical_cols: Optional[Sequence[str]] = None,
     continuous_cols: Optional[Sequence[str]] = None,
+    apply_fisher: bool = False,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Run neuroCombat on a subject-first matrix stack (N, P, P)."""
 
@@ -339,27 +350,63 @@ def harmonize_matrix_stack(
     if np.unique(batch_values).size < 2:
         raise ValueError(f"Batch column '{resolved_batch}' must contain at least two distinct values.")
 
-    dat = stack.reshape(n_subjects, n_nodes * n_nodes).T
+    iu = np.triu_indices(n_nodes, 1)
+    n_edges = int(iu[0].size)
+    if n_edges <= 0:
+        raise ValueError("At least two parcels are required to harmonize upper-triangle edges.")
+
+    input_matrices = np.asarray([mat[iu] for mat in stack], dtype=float)
+    if apply_fisher:
+        _emit_log(log_fn, "[HARMONIZE] Applying Fisher Z transform before neuroCombat.")
+        input_matrices = np.clip(input_matrices, -0.999999, 0.999999)
+        input_matrices = np.arctanh(input_matrices)
+
+    dat = input_matrices.T
+    _emit_log(
+        log_fn,
+        (
+            f"[HARMONIZE] Running neuroCombat on {n_subjects} subjects, "
+            f"{n_nodes} parcels, {n_edges} upper-triangle edges."
+        ),
+    )
     combat_result = neuroCombat(
         dat=dat,
         covars=covars_model,
         batch_col=resolved_batch,
         categorical_cols=resolved_cat,
         continuous_cols=resolved_cont,
+        eb=True,
+        parametric=True if apply_fisher else False,
+        mean_only=False,
     )
 
     harmonized_data = np.asarray(combat_result["data"], dtype=float)
-    harmonized_stack = harmonized_data.T.reshape(n_subjects, n_nodes, n_nodes)
-    harmonized_stack = np.nan_to_num(harmonized_stack, nan=0.0, posinf=0.0, neginf=0.0)
+    if harmonized_data.shape != dat.shape:
+        if harmonized_data.T.shape == dat.shape:
+            harmonized_data = harmonized_data.T
+        else:
+            raise ValueError(
+                f"Unexpected harmonized shape {harmonized_data.shape}; expected {dat.shape}."
+            )
 
-    # Keep matrices symmetric after harmonization.
-    harmonized_stack = 0.5 * (harmonized_stack + np.transpose(harmonized_stack, (0, 2, 1)))
+    if apply_fisher:
+        # Match the legacy MetSiM pipeline behavior exactly.
+        harmonized_data = np.tanh(harmonized_data)
+
+    harmonized_data = np.nan_to_num(harmonized_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+    harmonized_stack = np.zeros_like(stack, dtype=float)
+    for idx in range(n_subjects):
+        mat = np.zeros((n_nodes, n_nodes), dtype=float)
+        mat[iu] = harmonized_data[:, idx]
+        harmonized_stack[idx] = mat + mat.T
     diag_idx = np.arange(n_nodes)
     harmonized_stack[:, diag_idx, diag_idx] = stack[:, diag_idx, diag_idx]
 
     summary = {
         "n_subjects": int(n_subjects),
         "n_parcels": int(n_nodes),
+        "n_edges": int(n_edges),
         "batch_col": resolved_batch,
         "batch_counts": {
             str(level): int(count)
@@ -367,6 +414,8 @@ def harmonize_matrix_stack(
         },
         "categorical_cols": list(resolved_cat),
         "continuous_cols": list(resolved_cont),
+        "apply_fisher": bool(apply_fisher),
+        "upper_triangle_only": True,
         "mean_original": float(np.nanmean(stack)),
         "mean_harmonized": float(np.nanmean(harmonized_stack)),
         "std_original": float(np.nanstd(stack)),
@@ -391,6 +440,7 @@ def build_default_output_path(
     batch_col: str,
     categorical_cols: Optional[Sequence[str]] = None,
     continuous_cols: Optional[Sequence[str]] = None,
+    apply_fisher: bool = False,
     output_dir: Optional[Path | str] = None,
 ) -> Path:
     src = Path(source_path)
@@ -398,9 +448,10 @@ def build_default_output_path(
     out_dir = out_dir.expanduser()
     nuisances = list(categorical_cols or []) + list(continuous_cols or [])
     nuisance_tag = "none" if not nuisances else "-".join(_slugify(col) for col in nuisances)
+    fisher_tag = "fisher" if apply_fisher else "nofisher"
     name = (
         f"{_slugify(src.stem)}_{_slugify(matrix_key)}_batch-{_slugify(batch_col)}"
-        f"_cov-{nuisance_tag}_harmonized_connmat.npz"
+        f"_cov-{nuisance_tag}_{fisher_tag}_harmonized_connmat.npz"
     )
     return out_dir / name
 
@@ -439,6 +490,10 @@ def build_harmonized_payload(prepared: Dict[str, Any], harmonized_result: Dict[s
         "harmonize_categorical_cols": np.asarray(harmonized_result.get("categorical_cols", []), dtype=object),
         "harmonize_continuous_cols": np.asarray(harmonized_result.get("continuous_cols", []), dtype=object),
         "harmonize_selected_indices": np.asarray(prepared.get("selected_indices", []), dtype=int),
+        "harmonize_apply_fisher": np.asarray(bool(harmonized_result.get("summary", {}).get("apply_fisher", False))),
+        "harmonize_upper_triangle_only": np.asarray(
+            bool(harmonized_result.get("summary", {}).get("upper_triangle_only", True))
+        ),
     }
 
     metabolites = prepared.get("metabolites")
@@ -603,17 +658,30 @@ def run_harmonization(
     categorical_cols: Optional[Sequence[str]] = None,
     continuous_cols: Optional[Sequence[str]] = None,
     selected_indices: Optional[Sequence[int]] = None,
+    apply_fisher: bool = False,
     output_path: Optional[Path | str] = None,
     show_plots: bool = False,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """High-level API used by the GUI and CLI."""
 
+    _emit_log(
+        log_fn,
+        f"[HARMONIZE] Loading {Path(source_path).expanduser()} (key={matrix_key}).",
+    )
     prepared = load_matrix_stack_from_npz(
         source_path=source_path,
         matrix_key=matrix_key,
         selected_indices=selected_indices,
     )
     original_stack = np.asarray(prepared["matrix_stack"], dtype=float)
+    _emit_log(
+        log_fn,
+        (
+            f"[HARMONIZE] Prepared stack with {original_stack.shape[0]} subjects "
+            f"and {original_stack.shape[1]} parcels."
+        ),
+    )
 
     result = harmonize_matrix_stack(
         matrix_stack=original_stack,
@@ -621,6 +689,8 @@ def run_harmonization(
         batch_col=batch_col,
         categorical_cols=categorical_cols,
         continuous_cols=continuous_cols,
+        apply_fisher=apply_fisher,
+        log_fn=log_fn,
     )
 
     if output_path is None:
@@ -630,10 +700,12 @@ def run_harmonization(
             batch_col=result["batch_col"],
             categorical_cols=result["categorical_cols"],
             continuous_cols=result["continuous_cols"],
+            apply_fisher=apply_fisher,
         )
 
     payload = build_harmonized_payload(prepared, result)
     output_saved = save_harmonized_payload(output_path, payload)
+    _emit_log(log_fn, f"[HARMONIZE] Saved NPZ: {output_saved}")
 
     fig = None
     if show_plots:
@@ -694,6 +766,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Optional output NPZ path (default: source folder + generated name).",
     )
     parser.add_argument(
+        "--fisher",
+        action="store_true",
+        help="Apply Fisher Z transform before neuroCombat and invert it after harmonization.",
+    )
+    parser.add_argument(
         "--no-show",
         action="store_true",
         help="Disable result plotting window.",
@@ -718,8 +795,10 @@ def main() -> int:
         categorical_cols=categorical,
         continuous_cols=continuous,
         selected_indices=selected_indices,
+        apply_fisher=bool(args.fisher),
         output_path=output_path,
         show_plots=(not bool(args.no_show)),
+        log_fn=print,
     )
 
     print(f"[HARMONIZE] Saved NPZ: {run['output_path']}")

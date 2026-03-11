@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import atexit
+import faulthandler
 import json
 import math
 import os
@@ -6,6 +8,8 @@ import re
 import shutil
 import sys
 import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -16,19 +20,22 @@ except ImportError:
     pd = None
 
 try:
-    from PyQt6.QtCore import Qt, QSize
+    from PyQt6.QtCore import Qt, QSize, qInstallMessageHandler
     from PyQt6.QtWidgets import (
         QApplication,
         QAbstractItemView,
         QDialog,
+        QFrame,
         QGridLayout,
         QFileDialog,
         QCheckBox,
         QGroupBox,
+        QHeaderView,
         QHBoxLayout,
         QLabel,
         QLineEdit,
         QMessageBox,
+        QPlainTextEdit,
         QComboBox,
         QListWidget,
         QListWidgetItem,
@@ -37,27 +44,33 @@ try:
         QPushButton,
         QSplashScreen,
         QSplitter,
+        QStackedWidget,
         QSpinBox,
+        QTableWidget,
+        QTableWidgetItem,
         QVBoxLayout,
         QWidget,
     )
     from PyQt6.QtGui import QAction, QIcon, QFontMetrics, QPixmap, QColor
     QT_LIB = 6
 except ImportError:
-    from PyQt5.QtCore import Qt, QSize
+    from PyQt5.QtCore import Qt, QSize, qInstallMessageHandler
     from PyQt5.QtWidgets import (
         QAction,
         QApplication,
         QAbstractItemView,
         QDialog,
+        QFrame,
         QGridLayout,
         QFileDialog,
         QCheckBox,
         QGroupBox,
+        QHeaderView,
         QHBoxLayout,
         QLabel,
         QLineEdit,
         QMessageBox,
+        QPlainTextEdit,
         QComboBox,
         QListWidget,
         QListWidgetItem,
@@ -66,12 +79,103 @@ except ImportError:
         QPushButton,
         QSplashScreen,
         QSplitter,
+        QStackedWidget,
         QSpinBox,
+        QTableWidget,
+        QTableWidgetItem,
         QVBoxLayout,
         QWidget,
     )
     from PyQt5.QtGui import QIcon, QFontMetrics, QPixmap, QColor
     QT_LIB = 5
+
+_DIAGNOSTIC_LOG_HANDLE = None
+_QT_MESSAGE_HANDLER = None
+
+
+def _diagnostic_log_path() -> Path:
+    raw = str(os.getenv("MRSI_VIEWER_DIAGNOSTICS_LOG", "")).strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path("/tmp/mrsi_viewer_diagnostics.log")
+
+
+def _write_diagnostic_line(text: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] {text}"
+    try:
+        sys.__stderr__.write(line + "\n")
+        sys.__stderr__.flush()
+    except Exception:
+        pass
+    global _DIAGNOSTIC_LOG_HANDLE
+    if _DIAGNOSTIC_LOG_HANDLE is not None:
+        try:
+            _DIAGNOSTIC_LOG_HANDLE.write(line + "\n")
+            _DIAGNOSTIC_LOG_HANDLE.flush()
+        except Exception:
+            pass
+
+
+def _install_runtime_diagnostics() -> Path:
+    global _DIAGNOSTIC_LOG_HANDLE, _QT_MESSAGE_HANDLER
+
+    log_path = _diagnostic_log_path()
+    os.environ.setdefault("MRSI_VIEWER_DIAGNOSTICS_LOG", str(log_path))
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        _DIAGNOSTIC_LOG_HANDLE = open(log_path, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        _DIAGNOSTIC_LOG_HANDLE = None
+
+    _write_diagnostic_line(
+        f"=== Launch pid={os.getpid()} argv={sys.argv!r} qt_lib={QT_LIB} python={sys.version.split()[0]} ==="
+    )
+
+    try:
+        faulthandler.enable(file=_DIAGNOSTIC_LOG_HANDLE or sys.__stderr__, all_threads=True)
+        _write_diagnostic_line("faulthandler enabled")
+    except Exception as exc:
+        _write_diagnostic_line(f"failed to enable faulthandler: {exc}")
+
+    default_excepthook = sys.excepthook
+
+    def _diagnostic_excepthook(exc_type, exc_value, exc_tb):
+        _write_diagnostic_line(
+            "Unhandled Python exception:\n" + "".join(traceback.format_exception(exc_type, exc_value, exc_tb)).rstrip()
+        )
+        try:
+            default_excepthook(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _diagnostic_excepthook
+
+    try:
+        def _qt_message_handler(msg_type, context, message):
+            file_name = getattr(context, "file", "") if context is not None else ""
+            line_no = getattr(context, "line", 0) if context is not None else 0
+            function_name = getattr(context, "function", "") if context is not None else ""
+            mode_name = getattr(msg_type, "name", str(msg_type))
+            _write_diagnostic_line(
+                f"[QT {mode_name}] {message} ({file_name}:{line_no} {function_name})"
+            )
+
+        _QT_MESSAGE_HANDLER = _qt_message_handler
+        qInstallMessageHandler(_QT_MESSAGE_HANDLER)
+        _write_diagnostic_line("Qt message handler installed")
+    except Exception as exc:
+        _write_diagnostic_line(f"failed to install Qt message handler: {exc}")
+
+    def _on_exit():
+        _write_diagnostic_line("Process exiting")
+
+    atexit.register(_on_exit)
+    _write_diagnostic_line(f"diagnostic log path: {log_path}")
+    return log_path
 
 try:
     if QT_LIB == 6:
@@ -239,6 +343,35 @@ def _connectivity_atlas_tag(path: Path) -> str:
     return "unknown"
 
 
+def _connectivity_modalities_from_path(path: Path):
+    found = []
+    seen = set()
+    texts = (Path(path).name.lower(), str(path).lower())
+    for text in texts:
+        for match in re.findall(r"connectivity[_-]([a-z0-9]+)", text):
+            modality = str(match).strip().lower()
+            if not modality or modality in seen:
+                continue
+            seen.add(modality)
+            found.append(modality)
+    if found:
+        return found
+
+    lowered = str(path).lower().replace("\\", "/")
+    for modality in ("mrsi", "func", "dwi"):
+        if f"/{modality}/" in lowered and modality not in seen:
+            seen.add(modality)
+            found.append(modality)
+    return found
+
+
+def _infer_modality_from_path(path: Path) -> str:
+    modalities = _connectivity_modalities_from_path(path)
+    if modalities:
+        return modalities[0]
+    return "connectivity"
+
+
 def _dialog_accepted_code():
     accepted = getattr(QDialog, "Accepted", None)
     if accepted is not None:
@@ -255,6 +388,18 @@ def _is_enabled_flag():
 
 def _is_user_checkable_flag():
     return getattr(Qt, "ItemIsUserCheckable", getattr(Qt.ItemFlag, "ItemIsUserCheckable"))
+
+
+def _is_selectable_flag():
+    return getattr(Qt, "ItemIsSelectable", getattr(Qt.ItemFlag, "ItemIsSelectable"))
+
+
+def _is_editable_flag():
+    return getattr(Qt, "ItemIsEditable", getattr(Qt.ItemFlag, "ItemIsEditable"))
+
+
+def _align_right_flag():
+    return getattr(Qt, "AlignRight", getattr(Qt.AlignmentFlag, "AlignRight"))
 
 
 def _load_app_icon() -> QIcon:
@@ -494,6 +639,55 @@ def _parse_participant_id(value: str):
     return None, text
 
 
+def _normalize_subject_token(value: str) -> str:
+    token = str(value).strip()
+    if token.lower().startswith("sub-"):
+        token = token[4:]
+    return token
+
+
+def _normalize_session_token(value: str) -> str:
+    token = str(value).strip()
+    if token.lower().startswith("ses-"):
+        token = token[4:]
+    upper = token.upper()
+    if upper.startswith("T") and len(upper) > 1:
+        return f"V{upper[1:]}"
+    if token.isdigit():
+        return f"V{token}"
+    return token
+
+
+def _display_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return value.decode("latin-1", errors="ignore")
+    try:
+        if isinstance(value, np.generic):
+            return str(value.item())
+    except Exception:
+        pass
+    return str(value)
+
+
+def _column_is_numeric(values):
+    has_value = False
+    for value in values:
+        text = _display_text(value).strip()
+        if text == "":
+            continue
+        has_value = True
+        try:
+            float(text)
+        except Exception:
+            return False
+    return has_value
+
+
 def _get_valid_keys(path: Path):
     keys = []
     try:
@@ -640,12 +834,18 @@ class PreferencesDialog(QDialog):
         gradient_cmap: str,
         matlab_cmd: str,
         matlab_nbs_path: str,
+        results_dir: str,
+        bids_dir: str,
+        atlas_dir: str,
         colormap_names,
+        dialog_title: str = "Preferences",
+        require_results_dir: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Preferences")
-        self.resize(720, 340)
+        self._require_results_dir = bool(require_results_dir)
+        self.setWindowTitle(dialog_title)
+        self.resize(860, 520)
         self._colormap_names = list(colormap_names or [])
         self._build_ui(
             theme_name=theme_name,
@@ -653,6 +853,9 @@ class PreferencesDialog(QDialog):
             gradient_cmap=gradient_cmap,
             matlab_cmd=matlab_cmd,
             matlab_nbs_path=matlab_nbs_path,
+            results_dir=results_dir,
+            bids_dir=bids_dir,
+            atlas_dir=atlas_dir,
         )
 
     def _build_ui(
@@ -663,8 +866,16 @@ class PreferencesDialog(QDialog):
         gradient_cmap: str,
         matlab_cmd: str,
         matlab_nbs_path: str,
+        results_dir: str,
+        bids_dir: str,
+        atlas_dir: str,
     ) -> None:
         layout = QVBoxLayout(self)
+        info_label = QLabel(
+            "Configure application defaults. Results folder is required and will be used as the default output root."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
         form = QGridLayout()
         form.setHorizontalSpacing(10)
         form.setVerticalSpacing(10)
@@ -715,6 +926,33 @@ class PreferencesDialog(QDialog):
         nbs_browse_button.clicked.connect(self._browse_nbs_path)
         form.addWidget(nbs_browse_button, row, 3)
 
+        row += 1
+        form.addWidget(QLabel("Results folder"), row, 0)
+        self.results_dir_edit = QLineEdit(str(results_dir or ""))
+        self.results_dir_edit.setPlaceholderText("Required output folder")
+        form.addWidget(self.results_dir_edit, row, 1, 1, 2)
+        results_browse_button = QPushButton("Browse")
+        results_browse_button.clicked.connect(self._browse_results_dir)
+        form.addWidget(results_browse_button, row, 3)
+
+        row += 1
+        form.addWidget(QLabel("BIDS folder"), row, 0)
+        self.bids_dir_edit = QLineEdit(str(bids_dir or ""))
+        self.bids_dir_edit.setPlaceholderText("Optional default folder when opening matrices")
+        form.addWidget(self.bids_dir_edit, row, 1, 1, 2)
+        bids_browse_button = QPushButton("Browse")
+        bids_browse_button.clicked.connect(self._browse_bids_dir)
+        form.addWidget(bids_browse_button, row, 3)
+
+        row += 1
+        form.addWidget(QLabel("Atlas folder"), row, 0)
+        self.atlas_dir_edit = QLineEdit(str(atlas_dir or ""))
+        self.atlas_dir_edit.setPlaceholderText("Optional default folder for parcellation / atlas files")
+        form.addWidget(self.atlas_dir_edit, row, 1, 1, 2)
+        atlas_browse_button = QPushButton("Browse")
+        atlas_browse_button.clicked.connect(self._browse_atlas_dir)
+        form.addWidget(atlas_browse_button, row, 3)
+
         layout.addLayout(form)
         layout.addStretch(1)
 
@@ -727,6 +965,11 @@ class PreferencesDialog(QDialog):
         self.save_button.clicked.connect(self.accept)
         button_row.addWidget(self.save_button)
         layout.addLayout(button_row)
+
+    @staticmethod
+    def _browse_directory(parent, title: str, current: str) -> str:
+        start_dir = str(Path(current).expanduser()) if current else str(Path.home())
+        return QFileDialog.getExistingDirectory(parent, title, start_dir)
 
     def _browse_matlab_cmd(self) -> None:
         current = self.matlab_cmd_edit.text().strip()
@@ -751,6 +994,48 @@ class PreferencesDialog(QDialog):
         if selected:
             self.nbs_path_edit.setText(str(Path(selected).resolve()))
 
+    def _browse_results_dir(self) -> None:
+        selected = self._browse_directory(
+            self,
+            "Select results folder",
+            self.results_dir_edit.text().strip(),
+        )
+        if selected:
+            self.results_dir_edit.setText(str(Path(selected).resolve()))
+
+    def _browse_bids_dir(self) -> None:
+        selected = self._browse_directory(
+            self,
+            "Select BIDS folder",
+            self.bids_dir_edit.text().strip(),
+        )
+        if selected:
+            self.bids_dir_edit.setText(str(Path(selected).resolve()))
+
+    def _browse_atlas_dir(self) -> None:
+        selected = self._browse_directory(
+            self,
+            "Select atlas folder",
+            self.atlas_dir_edit.text().strip(),
+        )
+        if selected:
+            self.atlas_dir_edit.setText(str(Path(selected).resolve()))
+
+    def accept(self) -> None:
+        results_dir = self.results_dir_edit.text().strip()
+        if self._require_results_dir and not results_dir:
+            QMessageBox.warning(self, "Results Folder Required", "Select a results folder before continuing.")
+            return
+        if results_dir:
+            try:
+                results_path = Path(results_dir).expanduser()
+                results_path.mkdir(parents=True, exist_ok=True)
+                self.results_dir_edit.setText(str(results_path.resolve()))
+            except Exception as exc:
+                QMessageBox.warning(self, "Invalid Results Folder", f"Failed to create results folder:\n{exc}")
+                return
+        super().accept()
+
     def values(self):
         return {
             "theme": self.theme_combo.currentText().strip(),
@@ -758,6 +1043,9 @@ class PreferencesDialog(QDialog):
             "gradient_colormap": self.gradients_cmap_combo.currentText().strip(),
             "matlab_cmd": self.matlab_cmd_edit.text().strip(),
             "matlab_nbs_path": self.nbs_path_edit.text().strip(),
+            "results_dir": self.results_dir_edit.text().strip(),
+            "bids_dir": self.bids_dir_edit.text().strip(),
+            "atlas_dir": self.atlas_dir_edit.text().strip(),
         }
 
 
@@ -768,26 +1056,104 @@ class BatchMatrixImportDialog(QDialog):
         ("mrsi", "connectivity_mrsi"),
         ("func", "connectivity_func"),
     )
+    _STEP_TITLES = ("Select Matrices", "Selection", "Setup", "Multimodal", "Run")
+    _HARMONIZE_TYPE_OPTIONS = ("categorical", "continuous")
 
-    def __init__(self, folder_path: Path, candidate_paths, stack_callback=None, parent=None) -> None:
+    def __init__(self, folder_path: Path, candidate_paths, export_callback=None, parent=None) -> None:
         super().__init__(parent)
         self._folder_path = Path(folder_path)
         self._candidate_paths = [Path(path) for path in candidate_paths]
-        self._stack_callback = stack_callback
+        self._export_callback = export_callback
         self._atlas_options = self._detected_atlas_options()
         self._requested_action = "add"
+        self._selection_widget = None
+        self._stack_prepare_widget = None
+        self._current_step = 0
+        self._multimodal_excluded_pairs = set()
+        self._multimodal_table_refreshing = False
+        self._multimodal_duplicate_entries = []
+        self._workflow_log_expanded = False
         self.setWindowTitle("Add Batch")
-        self.resize(860, 560)
+        self.resize(1200, 800)
         self._build_ui()
         self._populate_files()
         self._apply_filters()
+        self.set_theme(getattr(parent, "_theme_name", "Dark"))
+        self._go_to_step(0)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        self.workflow_splitter = QSplitter(Qt.Vertical)
+
+        content_widget = QWidget()
+        content_row = QHBoxLayout(content_widget)
+        content_row.setContentsMargins(0, 0, 0, 0)
+
+        stepper_frame = QFrame()
+        stepper_layout = QVBoxLayout(stepper_frame)
+        stepper_layout.setContentsMargins(6, 6, 6, 6)
+        stepper_layout.setSpacing(8)
+        stepper_title = QLabel("Workflow")
+        stepper_layout.addWidget(stepper_title)
+        self._step_buttons = []
+        for idx, title in enumerate(self._STEP_TITLES):
+            button = QPushButton(f"{idx + 1}. {title}")
+            button.setObjectName("workflowStepButton")
+            button.setCheckable(True)
+            button.setMinimumHeight(36)
+            button.clicked.connect(lambda _checked=False, i=idx: self._go_to_step(i))
+            stepper_layout.addWidget(button)
+            self._step_buttons.append(button)
+        for button in self._step_buttons[1:]:
+            button.setEnabled(False)
+        stepper_layout.addStretch(1)
+        content_row.addWidget(stepper_frame, 0)
+
+        self.step_stack = QStackedWidget()
+        content_row.addWidget(self.step_stack, 1)
+        self.workflow_splitter.addWidget(content_widget)
+
+        terminal_group = QGroupBox("Integrated Terminal")
+        terminal_layout = QVBoxLayout(terminal_group)
+        self.workflow_terminal = QPlainTextEdit()
+        self.workflow_terminal.setReadOnly(True)
+        self.workflow_terminal.setPlaceholderText("Stack progress will appear here.")
+        self.workflow_terminal.setMinimumHeight(150)
+        if QT_LIB == 6:
+            self.workflow_terminal.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        else:
+            self.workflow_terminal.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.workflow_terminal.setStyleSheet(
+            "QPlainTextEdit {"
+            " background-color: #000000;"
+            " color: #b8f7c6;"
+            " border: 1px solid #404040;"
+            " border-radius: 4px;"
+            " selection-background-color: #2d6cdf;"
+            " font-family: 'DejaVu Sans Mono', 'Courier New', monospace;"
+            " font-size: 10.5pt;"
+            "}"
+        )
+        terminal_layout.addWidget(self.workflow_terminal, 1)
+        self.workflow_splitter.addWidget(terminal_group)
+        self.workflow_splitter.setStretchFactor(0, 4)
+        self.workflow_splitter.setStretchFactor(1, 1)
+        self.workflow_splitter.setSizes([620, 180])
+        layout.addWidget(self.workflow_splitter, 1)
+
+        self.workflow_log_toggle_button = QPushButton("Show log ▾")
+        self.workflow_log_toggle_button.clicked.connect(self._toggle_workflow_log_drawer)
+        self.workflow_log_toggle_button.setMaximumWidth(140)
+        layout.addWidget(self.workflow_log_toggle_button, 0, _align_right_flag())
+        self.workflow_log_drawer = terminal_group
+        self._set_workflow_log_drawer_expanded(False)
+
+        selection_page = QWidget()
+        selection_layout = QVBoxLayout(selection_page)
 
         self.folder_label = QLabel(f"Folder: {self._folder_path}")
         self.folder_label.setWordWrap(True)
-        layout.addWidget(self.folder_label)
+        selection_layout.addWidget(self.folder_label)
 
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Filter"))
@@ -804,14 +1170,6 @@ class BatchMatrixImportDialog(QDialog):
         self.modality_combo.currentIndexChanged.connect(self._apply_filters)
         filter_row.addWidget(self.modality_combo)
 
-        filter_row.addWidget(QLabel("Atlas"))
-        self.atlas_combo = QComboBox()
-        self.atlas_combo.addItem("All", "")
-        for atlas in self._atlas_options:
-            self.atlas_combo.addItem(atlas, atlas)
-        self.atlas_combo.currentIndexChanged.connect(self._apply_filters)
-        filter_row.addWidget(self.atlas_combo)
-
         self.filter_button = QPushButton("Filter")
         self.filter_button.clicked.connect(self._apply_filters)
         filter_row.addWidget(self.filter_button)
@@ -819,11 +1177,11 @@ class BatchMatrixImportDialog(QDialog):
         self.reset_button = QPushButton("Reset")
         self.reset_button.clicked.connect(self._reset_filters)
         filter_row.addWidget(self.reset_button)
-        layout.addLayout(filter_row)
+        selection_layout.addLayout(filter_row)
 
         self.summary_label = QLabel("")
         self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
+        selection_layout.addWidget(self.summary_label)
 
         self.file_list = QListWidget()
         if QT_LIB == 6:
@@ -831,7 +1189,7 @@ class BatchMatrixImportDialog(QDialog):
         else:
             self.file_list.setSelectionMode(QAbstractItemView.NoSelection)
         self.file_list.itemChanged.connect(self._on_item_changed)
-        layout.addWidget(self.file_list, 1)
+        selection_layout.addWidget(self.file_list, 1)
 
         select_row = QHBoxLayout()
         self.select_visible_button = QPushButton("Select Visible")
@@ -841,7 +1199,7 @@ class BatchMatrixImportDialog(QDialog):
         self.clear_visible_button.clicked.connect(lambda: self._set_visible_checked(False))
         select_row.addWidget(self.clear_visible_button)
         select_row.addStretch(1)
-        layout.addLayout(select_row)
+        selection_layout.addLayout(select_row)
 
         actions = QHBoxLayout()
         actions.addStretch(1)
@@ -854,7 +1212,101 @@ class BatchMatrixImportDialog(QDialog):
         self.add_selected_button = QPushButton("Add Selected")
         self.add_selected_button.clicked.connect(self._accept_if_selection)
         actions.addWidget(self.add_selected_button)
-        layout.addLayout(actions)
+        selection_layout.addLayout(actions)
+
+        self.selection_page = QWidget()
+        self.selection_tab_layout = QVBoxLayout(self.selection_page)
+        self.selection_placeholder = QLabel(
+            "Step 2 appears here after you select matrices in Step 1 and click 'Stack'."
+        )
+        self.selection_placeholder.setWordWrap(True)
+        self.selection_tab_layout.addWidget(self.selection_placeholder)
+        self.selection_tab_layout.addStretch(1)
+
+        self.setup_page = QWidget()
+        self.setup_tab_layout = QVBoxLayout(self.setup_page)
+        self.setup_placeholder = QLabel(
+            "Step 3 appears here after you open the Selection step."
+        )
+        self.setup_placeholder.setWordWrap(True)
+        self.setup_tab_layout.addWidget(self.setup_placeholder)
+        self.setup_tab_layout.addStretch(1)
+
+        multimodal_page = QWidget()
+        multimodal_layout = QVBoxLayout(multimodal_page)
+        self.multimodal_enable_check = QCheckBox("Enable multimodal stack")
+        self.multimodal_enable_check.toggled.connect(self._update_multimodal_controls)
+        multimodal_layout.addWidget(self.multimodal_enable_check)
+        self.multimodal_align_check = QCheckBox("Align cross-modality matrices")
+        self.multimodal_align_check.setChecked(False)
+        multimodal_layout.addWidget(self.multimodal_align_check)
+        reference_row = QHBoxLayout()
+        reference_row.addWidget(QLabel("Reference modality"))
+        self.reference_modality_combo = QComboBox()
+        self.reference_modality_combo.currentIndexChanged.connect(self._refresh_multimodal_table)
+        self.reference_modality_combo.currentIndexChanged.connect(self._refresh_run_table)
+        reference_row.addWidget(self.reference_modality_combo, 1)
+        multimodal_layout.addLayout(reference_row)
+        self.multimodal_summary_label = QLabel("")
+        self.multimodal_summary_label.setWordWrap(True)
+        multimodal_layout.addWidget(self.multimodal_summary_label)
+        self.multimodal_table = QTableWidget()
+        self.multimodal_table.setAlternatingRowColors(True)
+        self.multimodal_table.itemChanged.connect(self._on_multimodal_table_item_changed)
+        if QT_LIB == 6:
+            self.multimodal_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.multimodal_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        else:
+            self.multimodal_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.multimodal_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        multimodal_layout.addWidget(self.multimodal_table, 1)
+        self.multimodal_optional_label = QLabel(
+            "Optional step. Continue to Run without configuring multimodal stacking."
+        )
+        self.multimodal_optional_label.setWordWrap(True)
+        multimodal_layout.addWidget(self.multimodal_optional_label)
+
+        run_page = QWidget()
+        run_layout = QVBoxLayout(run_page)
+        self.run_info_label = QLabel(
+            "Final step. Review the subject/session pairs that will be stacked, then run processing."
+        )
+        self.run_info_label.setWordWrap(True)
+        run_layout.addWidget(self.run_info_label)
+        self.run_summary_label = QLabel(
+            "The stack preview will appear here after Selection and Setup are ready."
+        )
+        self.run_summary_label.setWordWrap(True)
+        run_layout.addWidget(self.run_summary_label)
+        self.run_table = QTableWidget()
+        self.run_table.setAlternatingRowColors(True)
+        if QT_LIB == 6:
+            self.run_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.run_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        else:
+            self.run_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.run_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        run_layout.addWidget(self.run_table, 1)
+        run_actions = QHBoxLayout()
+        run_actions.addStretch(1)
+        self.run_import_button = QPushButton("Import to workspace")
+        self.run_import_button.setEnabled(False)
+        self.run_import_button.clicked.connect(self._trigger_workflow_import)
+        run_actions.addWidget(self.run_import_button)
+        self.run_close_button = QPushButton("Close")
+        self.run_close_button.clicked.connect(self._request_close)
+        run_actions.addWidget(self.run_close_button)
+        self.run_process_button = QPushButton("Process")
+        self.run_process_button.setEnabled(False)
+        self.run_process_button.clicked.connect(self._trigger_workflow_process)
+        run_actions.addWidget(self.run_process_button)
+        run_layout.addLayout(run_actions)
+
+        self.step_stack.addWidget(selection_page)
+        self.step_stack.addWidget(self.selection_page)
+        self.step_stack.addWidget(self.setup_page)
+        self.step_stack.addWidget(multimodal_page)
+        self.step_stack.addWidget(run_page)
 
     def _populate_files(self) -> None:
         self.file_list.blockSignals(True)
@@ -888,9 +1340,6 @@ class BatchMatrixImportDialog(QDialog):
         modality_token = str(self.modality_combo.currentData() or "").strip().lower()
         if modality_token and modality_token not in name:
             return False
-        atlas_token = str(self.atlas_combo.currentData() or "").strip()
-        if atlas_token and _connectivity_atlas_tag(path) != atlas_token:
-            return False
         for token in self._filter_tokens():
             if token not in name:
                 return False
@@ -906,6 +1355,11 @@ class BatchMatrixImportDialog(QDialog):
 
     def _on_item_changed(self, _item) -> None:
         self._apply_filters()
+        if self._selection_widget is not None:
+            self._selection_widget.set_selected_paths(self.selected_paths())
+        if self._stack_prepare_widget is not None:
+            self._stack_prepare_widget.set_selected_paths(self.selected_paths())
+            self._refresh_optional_steps()
 
     def _apply_filters(self) -> None:
         visible_count = 0
@@ -928,7 +1382,6 @@ class BatchMatrixImportDialog(QDialog):
     def _reset_filters(self) -> None:
         self.filter_value_edit.clear()
         self.modality_combo.setCurrentIndex(0)
-        self.atlas_combo.setCurrentIndex(0)
         self._apply_filters()
 
     def _set_visible_checked(self, checked: bool) -> None:
@@ -956,6 +1409,730 @@ class BatchMatrixImportDialog(QDialog):
     def requested_action(self) -> str:
         return str(self._requested_action or "add")
 
+    def _stack_processing(self) -> bool:
+        if self._stack_prepare_widget is None:
+            return False
+        if hasattr(self._stack_prepare_widget, "is_processing"):
+            try:
+                return bool(self._stack_prepare_widget.is_processing())
+            except Exception:
+                return False
+        return False
+
+    def _teardown_embedded_workflow_widgets(self) -> None:
+        if self._stack_prepare_widget is not None:
+            _write_diagnostic_line("Tearing down embedded stack_prepare_widget")
+            if hasattr(self._stack_prepare_widget, "prepare_for_close"):
+                try:
+                    self._stack_prepare_widget.prepare_for_close()
+                except Exception:
+                    pass
+            try:
+                self._stack_prepare_widget.hide()
+            except Exception:
+                pass
+            self._stack_prepare_widget = None
+        if self._selection_widget is not None:
+            _write_diagnostic_line("Tearing down embedded selection_widget")
+            if hasattr(self._selection_widget, "prepare_for_close"):
+                try:
+                    self._selection_widget.prepare_for_close()
+                except Exception:
+                    pass
+            try:
+                self._selection_widget.hide()
+            except Exception:
+                pass
+            self._selection_widget = None
+
+    def _request_close(self) -> None:
+        if self._stack_processing():
+            QMessageBox.information(
+                self,
+                "Processing Active",
+                "Wait for the stack process to finish before closing this window.",
+            )
+            return
+        self.reject()
+
+    def reject(self) -> None:
+        if self._stack_processing():
+            QMessageBox.information(
+                self,
+                "Processing Active",
+                "Wait for the stack process to finish before closing this window.",
+            )
+            return
+        self._teardown_embedded_workflow_widgets()
+        super().reject()
+
+    def accept(self) -> None:
+        self._teardown_embedded_workflow_widgets()
+        super().accept()
+
+    def _append_workflow_terminal(self, text) -> None:
+        if not hasattr(self, "workflow_terminal") or self.workflow_terminal is None:
+            return
+        cleaned = str(text or "").rstrip("\n")
+        if not cleaned:
+            return
+        self.workflow_terminal.appendPlainText(cleaned)
+        scroll = self.workflow_terminal.verticalScrollBar()
+        if scroll is not None:
+            scroll.setValue(scroll.maximum())
+
+    def _set_workflow_log_drawer_expanded(self, expanded: bool) -> None:
+        self._workflow_log_expanded = bool(expanded)
+        if hasattr(self, "workflow_log_drawer") and self.workflow_log_drawer is not None:
+            self.workflow_log_drawer.setVisible(self._workflow_log_expanded)
+        if hasattr(self, "workflow_log_toggle_button") and self.workflow_log_toggle_button is not None:
+            self.workflow_log_toggle_button.setText(
+                "Hide log ▴" if self._workflow_log_expanded else "Show log ▾"
+            )
+        if self._workflow_log_expanded and hasattr(self, "workflow_splitter"):
+            self.workflow_splitter.setSizes([620, 180])
+
+    def _toggle_workflow_log_drawer(self) -> None:
+        self._set_workflow_log_drawer_expanded(not self._workflow_log_expanded)
+
+    def _go_to_step(self, step_index: int) -> None:
+        step = max(0, min(int(step_index), len(self._STEP_TITLES) - 1))
+        if step > 0 and not self._step_buttons[step].isEnabled():
+            step = 0
+        self._current_step = step
+        self.step_stack.setCurrentIndex(step)
+        for idx, button in enumerate(self._step_buttons):
+            is_current = idx == step
+            button.setChecked(is_current)
+            prefix = "▶ " if is_current else ""
+            button.setText(f"{prefix}{idx + 1}. {self._STEP_TITLES[idx]}")
+        self._sync_workflow_process_button()
+
+    def _group_from_path(self, path: Path) -> str:
+        parts = list(Path(path).parts)
+        if "derivatives" in parts:
+            idx = parts.index("derivatives")
+            if idx > 0:
+                return str(parts[idx - 1])
+        return str(self._folder_path.name)
+
+    def _path_subject_session(self, path: Path):
+        text = Path(path).name
+        sub_match = re.search(r"sub-([^_]+)", text)
+        ses_match = re.search(r"ses-([^_]+)", text)
+        sub = _normalize_subject_token(sub_match.group(1) if sub_match else "")
+        ses = _normalize_session_token(ses_match.group(1) if ses_match else "")
+        return self._group_from_path(path), sub, ses
+
+    def _path_subject_session_pair(self, path: Path):
+        _group, sub, ses = self._path_subject_session(path)
+        return sub, ses
+
+    def _covar_row_subject_session(self, covar_row, default_group: str):
+        covars_df = self._filtered_covars_df()
+        if covars_df is None:
+            return default_group, "", ""
+        col_map = {str(col).lower(): col for col in covars_df.columns}
+        group_col = col_map.get("group")
+        sub_col = (
+            col_map.get("participant_id")
+            or col_map.get("subject_id")
+            or col_map.get("subject")
+            or col_map.get("sub")
+            or col_map.get("id")
+        )
+        ses_col = col_map.get("session_id") or col_map.get("session") or col_map.get("ses")
+        participant_value = covar_row[sub_col] if sub_col is not None else ""
+        session_value = covar_row[ses_col] if ses_col is not None else ""
+        covar_group = str(covar_row[group_col]).strip() if group_col is not None else ""
+        parsed_group, parsed_sub = _parse_participant_id(str(participant_value))
+        group = covar_group or parsed_group or default_group
+        sub = _normalize_subject_token(str(parsed_sub or participant_value).strip())
+        ses = _normalize_session_token(str(session_value).strip())
+        return group, sub, ses
+
+    def _allowed_pair_keys_from_covars(self):
+        covars_df = self._filtered_covars_df()
+        if covars_df is None:
+            return None
+        if len(covars_df) == 0:
+            return set()
+        default_group = self._group_from_path(Path(self.selected_paths()[0])) if self.selected_paths() else ""
+        keys = set()
+        for _, covar_row in covars_df.iterrows():
+            _group, sub, ses = self._covar_row_subject_session(covar_row, default_group)
+            keys.add((sub, ses))
+        return keys
+
+    def _pair_matches_path(self, path: Path, sub: str, ses: str) -> bool:
+        pair = self._path_subject_session_pair(path)
+        return pair == (_normalize_subject_token(sub), _normalize_session_token(ses))
+
+    def _paths_for_subject_session(self, paths, sub: str, ses: str):
+        return [Path(path) for path in paths if self._pair_matches_path(Path(path), sub, ses)]
+
+    def _modality_counts_for_paths(self, paths, modalities):
+        counts = {modality: 0 for modality in modalities}
+        for path in paths:
+            modality = _infer_modality_from_path(Path(path))
+            if modality in counts:
+                counts[modality] += 1
+        return counts
+
+    def _modality_paths_for_paths(self, paths, modalities):
+        matches = {modality: [] for modality in modalities}
+        for path in paths:
+            resolved = str(Path(path))
+            modality = _infer_modality_from_path(Path(path))
+            if modality in matches:
+                matches[modality].append(resolved)
+        return matches
+
+    def effective_selected_paths(self):
+        selected = [Path(path) for path in self.selected_paths()]
+        allowed_pairs = self._allowed_pair_keys_from_covars()
+        out = []
+        for path in selected:
+            pair_key = self._path_subject_session_pair(path)
+            if allowed_pairs is not None and pair_key not in allowed_pairs:
+                continue
+            if pair_key in self._multimodal_excluded_pairs:
+                continue
+            out.append(str(path))
+        return out
+
+    def _filtered_covars_df(self):
+        if self._selection_widget is not None and hasattr(self._selection_widget, "selected_covars_df"):
+            try:
+                return self._selection_widget.selected_covars_df()
+            except Exception:
+                return None
+        if self._stack_prepare_widget is None:
+            return None
+        if not hasattr(self._stack_prepare_widget, "selected_covars_df"):
+            return None
+        try:
+            return self._stack_prepare_widget.selected_covars_df()
+        except Exception:
+            return None
+
+    def _selection_suffix(self):
+        if self._selection_widget is not None and hasattr(self._selection_widget, "current_selection_suffix"):
+            try:
+                return self._selection_widget.current_selection_suffix()
+            except Exception:
+                return ("all", "all")
+        return ("all", "all")
+
+    def _harmonization_columns(self):
+        if self._selection_widget is not None and hasattr(self._selection_widget, "covars_columns"):
+            try:
+                return [str(col) for col in self._selection_widget.covars_columns()]
+            except Exception:
+                return []
+        covars_df = self._filtered_covars_df()
+        if covars_df is None:
+            return []
+        return [str(col) for col in covars_df.columns]
+
+    def _harm_default_batch_col(self) -> str:
+        if self._selection_widget is not None and hasattr(self._selection_widget, "default_batch_col"):
+            try:
+                return str(self._selection_widget.default_batch_col() or "")
+            except Exception:
+                return ""
+        columns = self._harmonization_columns()
+        preferred = {"scanner", "site", "batch"}
+        for name in columns:
+            if name.strip().lower() in preferred:
+                return name
+        return columns[0] if columns else ""
+
+    def _harm_covariate_type(self, covar_name: str) -> str:
+        if self._selection_widget is not None and hasattr(self._selection_widget, "covariate_type"):
+            try:
+                return str(self._selection_widget.covariate_type(covar_name) or "categorical")
+            except Exception:
+                return "categorical"
+        covars_df = self._filtered_covars_df()
+        if covars_df is None or covar_name not in covars_df.columns:
+            return "categorical"
+        values = covars_df[covar_name].tolist()
+        return "continuous" if _column_is_numeric(values) else "categorical"
+
+    def _harm_is_id_like(self, covar_name: str) -> bool:
+        if self._selection_widget is not None and hasattr(self._selection_widget, "is_id_like"):
+            try:
+                return bool(self._selection_widget.is_id_like(covar_name))
+            except Exception:
+                return False
+        return str(covar_name).strip().lower() in {
+            "participant_id",
+            "subject_id",
+            "session_id",
+            "id",
+            "sub",
+            "ses",
+        }
+
+    def _selected_modalities(self):
+        if self._stack_prepare_widget is not None and hasattr(self._stack_prepare_widget, "detected_modalities"):
+            try:
+                modalities = list(self._stack_prepare_widget.detected_modalities())
+            except Exception:
+                modalities = []
+        else:
+            modalities = []
+        if not modalities:
+            modalities = sorted({_infer_modality_from_path(Path(path)) for path in self.selected_paths() if str(path).strip()})
+        return [item for item in modalities if item]
+
+    def _ordered_modalities(self):
+        modalities = self._selected_modalities()
+        reference = self.reference_modality_combo.currentText().strip()
+        if reference and reference in modalities:
+            return [reference] + [item for item in modalities if item != reference]
+        return modalities
+
+    def _multimodal_process_config(self):
+        if not self.multimodal_enable_check.isChecked():
+            return None
+        effective_paths = [Path(path) for path in self.effective_selected_paths()]
+        ordered_modalities = []
+        for modality in self._ordered_modalities():
+            if any(_infer_modality_from_path(path) == modality for path in effective_paths):
+                ordered_modalities.append(modality)
+        if len(ordered_modalities) <= 1:
+            return None
+        return {
+            "enabled": True,
+            "ordered_modalities": ordered_modalities,
+            "align_cross_modality": bool(self.multimodal_align_check.isChecked()),
+        }
+
+    def _build_pair_table_rows(self, paths, modalities=None, include_empty_covar_rows=False):
+        selected_paths = [Path(path) for path in (paths or []) if str(path).strip()]
+        ordered_modalities = [str(item).strip() for item in (modalities or self._ordered_modalities()) if str(item).strip()]
+        if not ordered_modalities:
+            ordered_modalities = sorted(
+                {
+                    _infer_modality_from_path(path)
+                    for path in selected_paths
+                    if str(_infer_modality_from_path(path)).strip()
+                }
+            )
+
+        rows = []
+        extra_columns = []
+        covars_df = self._filtered_covars_df()
+        if covars_df is not None and len(covars_df) > 0:
+            covar_columns = [str(col) for col in covars_df.columns]
+            col_map = {str(col).lower(): col for col in covars_df.columns}
+            group_col = col_map.get("group")
+            sub_col = (
+                col_map.get("participant_id")
+                or col_map.get("subject_id")
+                or col_map.get("subject")
+                or col_map.get("sub")
+                or col_map.get("id")
+            )
+            ses_col = col_map.get("session_id") or col_map.get("session") or col_map.get("ses")
+            hidden_cols = {group_col, sub_col, ses_col}
+            extra_columns = [col for col in covar_columns if col not in hidden_cols and col is not None]
+            default_group = self._group_from_path(selected_paths[0]) if selected_paths else ""
+            for _, covar_row in covars_df.iterrows():
+                group, sub, ses = self._covar_row_subject_session(covar_row, default_group)
+                key = (sub, ses)
+                matched_paths = self._paths_for_subject_session(selected_paths, sub, ses)
+                if not matched_paths and not include_empty_covar_rows:
+                    continue
+                counts = self._modality_counts_for_paths(matched_paths, ordered_modalities)
+                matched_by_modality = self._modality_paths_for_paths(matched_paths, ordered_modalities)
+                row = {
+                    "group": group,
+                    "sub": sub,
+                    "ses": ses,
+                    "_key": key,
+                    "_counts": counts,
+                    "_paths_by_modality": matched_by_modality,
+                    "_match_count": len(matched_paths),
+                }
+                for modality in ordered_modalities:
+                    row[modality] = counts.get(modality, 0)
+                for column in extra_columns:
+                    row[column] = str(covar_row[column])
+                rows.append(row)
+        else:
+            pair_rows = {}
+            for path in selected_paths:
+                group, sub, ses = self._path_subject_session(path)
+                key = (sub, ses)
+                if key not in pair_rows:
+                    pair_rows[key] = {
+                        "group": group,
+                        "sub": sub,
+                        "ses": ses,
+                        "_key": key,
+                    }
+            for key in sorted(pair_rows.keys()):
+                row = dict(pair_rows[key])
+                matched_paths = self._paths_for_subject_session(selected_paths, row["sub"], row["ses"])
+                counts = self._modality_counts_for_paths(matched_paths, ordered_modalities)
+                matched_by_modality = self._modality_paths_for_paths(matched_paths, ordered_modalities)
+                row["_counts"] = counts
+                row["_paths_by_modality"] = matched_by_modality
+                row["_match_count"] = len(matched_paths)
+                for modality in ordered_modalities:
+                    row[modality] = counts.get(modality, 0)
+                rows.append(row)
+        return rows, ordered_modalities, extra_columns
+
+    def _populate_pair_table(self, table, rows, modalities, extra_columns, include_exclude_column=False):
+        table.blockSignals(True)
+        table.clear()
+        headers = ["group", "sub", "ses"] + list(modalities) + list(extra_columns)
+        if include_exclude_column:
+            headers = ["Exclude"] + headers
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+
+        duplicate_entries = []
+        editable_flag = getattr(Qt, "ItemIsEditable", getattr(Qt.ItemFlag, "ItemIsEditable"))
+        align_center = getattr(Qt, "AlignCenter", getattr(Qt.AlignmentFlag, "AlignCenter"))
+        data_offset = 0
+        if include_exclude_column:
+            data_offset = 1
+
+        for row_idx, row_data in enumerate(rows):
+            pair_key = row_data.get("_key")
+            if include_exclude_column:
+                exclude_item = QTableWidgetItem("")
+                exclude_item.setData(USER_ROLE, pair_key)
+                exclude_item.setFlags((exclude_item.flags() | _is_user_checkable_flag()) & ~editable_flag)
+                exclude_item.setCheckState(
+                    Qt.Checked if pair_key in self._multimodal_excluded_pairs else Qt.Unchecked
+                )
+                table.setItem(row_idx, 0, exclude_item)
+
+            for col_idx, header in enumerate(headers[data_offset:], start=data_offset):
+                if header in modalities:
+                    count = int(row_data.get(header, 0) or 0)
+                    modality_paths = list(row_data.get("_paths_by_modality", {}).get(header, []))
+                    if count <= 0:
+                        item = QTableWidgetItem("✗")
+                        item.setToolTip("Missing")
+                        item.setForeground(QColor("#dc2626"))
+                    elif count == 1:
+                        item = QTableWidgetItem("✓")
+                        item.setToolTip(modality_paths[0] if modality_paths else "Present")
+                        item.setForeground(QColor("#16a34a"))
+                    else:
+                        item = QTableWidgetItem(f"o {count}")
+                        item.setToolTip(
+                            "\n".join(modality_paths)
+                            if modality_paths
+                            else f"{count} matching NPZ files detected"
+                        )
+                        item.setForeground(QColor("#ca8a04"))
+                        duplicate_entries.append(
+                            {
+                                "pair": pair_key,
+                                "modality": header,
+                                "count": count,
+                            }
+                        )
+                    item.setTextAlignment(int(align_center))
+                else:
+                    item = QTableWidgetItem(str(row_data.get(header, "")))
+                item.setFlags(item.flags() & ~editable_flag)
+                table.setItem(row_idx, col_idx, item)
+
+        header = table.horizontalHeader()
+        fixed_headers = {"group", "sub", "ses", *modalities}
+        if include_exclude_column:
+            fixed_headers.add("Exclude")
+        if QT_LIB == 6:
+            for col_idx, header_name in enumerate(headers):
+                mode = (
+                    QHeaderView.ResizeMode.Stretch
+                    if header_name not in fixed_headers
+                    else QHeaderView.ResizeMode.ResizeToContents
+                )
+                header.setSectionResizeMode(col_idx, mode)
+        else:
+            for col_idx, header_name in enumerate(headers):
+                mode = QHeaderView.Stretch if header_name not in fixed_headers else QHeaderView.ResizeToContents
+                header.setSectionResizeMode(col_idx, mode)
+        table.blockSignals(False)
+        return duplicate_entries
+
+    def _refresh_run_table(self):
+        if not hasattr(self, "run_table") or self.run_table is None:
+            return
+
+        ready = self._stack_prepare_widget is not None and self._selection_widget is not None
+        if not ready:
+            self.run_table.clear()
+            self.run_table.setRowCount(0)
+            self.run_table.setColumnCount(0)
+            self.run_summary_label.setText(
+                "The stack preview will appear here after Selection and Setup are ready."
+            )
+            return
+
+        effective_paths = [Path(path) for path in self.effective_selected_paths()]
+        rows, modalities, extra_columns = self._build_pair_table_rows(
+            effective_paths,
+            modalities=self._ordered_modalities(),
+            include_empty_covar_rows=False,
+        )
+        duplicate_entries = self._populate_pair_table(
+            self.run_table,
+            rows,
+            modalities,
+            extra_columns,
+            include_exclude_column=False,
+        )
+        duplicate_pair_count = len({tuple(entry["pair"]) for entry in duplicate_entries})
+        validation_error = self.multimodal_validation_error()
+        if not effective_paths:
+            self.run_summary_label.setText(
+                "No NPZ files remain after the current covariate and multimodal filters."
+            )
+            return
+        if validation_error:
+            self.run_summary_label.setText(
+                f"{len(rows)} subject/session pairs will be stacked from {len(effective_paths)} NPZ file(s). "
+                f"Processing is blocked: {validation_error}"
+            )
+            return
+        if duplicate_pair_count:
+            self.run_summary_label.setText(
+                f"{len(rows)} subject/session pairs will be stacked from {len(effective_paths)} NPZ file(s). "
+                f"Duplicate NPZ files remain for {duplicate_pair_count} sub/ses pair(s)."
+            )
+            return
+        self.run_summary_label.setText(
+            f"{len(rows)} subject/session pairs will be stacked from {len(effective_paths)} NPZ file(s)."
+        )
+
+    def _update_multimodal_controls(self):
+        modalities = self._selected_modalities()
+        has_multiple = len(modalities) > 1
+        enabled = has_multiple and self.multimodal_enable_check.isChecked()
+        self.reference_modality_combo.setEnabled(enabled)
+        self.multimodal_align_check.setEnabled(enabled)
+        self.multimodal_table.setVisible(enabled)
+        if not has_multiple:
+            self.multimodal_enable_check.setChecked(False)
+            self.multimodal_enable_check.setEnabled(False)
+            self.multimodal_align_check.setChecked(False)
+            self.multimodal_align_check.setEnabled(False)
+            self.multimodal_summary_label.setText(
+                "Multimodal stacking becomes available when more than one modality is detected in the selected NPZ files."
+            )
+        else:
+            self.multimodal_enable_check.setEnabled(True)
+            self.multimodal_summary_label.setText(
+                "Optional step. Enable multimodal stacking to review subject/session coverage across modalities."
+            )
+        self.reference_modality_combo.setVisible(has_multiple)
+        self._refresh_multimodal_table()
+        if self._stack_prepare_widget is not None and hasattr(self._stack_prepare_widget, "refresh_process_state"):
+            self._stack_prepare_widget.refresh_process_state()
+        self._refresh_run_table()
+
+    def _refresh_optional_steps(self):
+        modalities = self._selected_modalities()
+        current_reference = self.reference_modality_combo.currentText().strip()
+        self.reference_modality_combo.blockSignals(True)
+        self.reference_modality_combo.clear()
+        self.reference_modality_combo.addItems(modalities)
+        if current_reference and current_reference in modalities:
+            self.reference_modality_combo.setCurrentText(current_reference)
+        self.reference_modality_combo.blockSignals(False)
+        ready = self._stack_prepare_widget is not None and self._selection_widget is not None
+        for idx in (1, 2, 3, 4):
+            self._step_buttons[idx].setEnabled(ready)
+        self._update_multimodal_controls()
+        self._refresh_run_table()
+        self._sync_workflow_process_button()
+
+    def _refresh_multimodal_table(self):
+        self._multimodal_table_refreshing = True
+        self._multimodal_duplicate_entries = []
+        if not self.multimodal_enable_check.isChecked():
+            self.multimodal_table.setRowCount(0)
+            self.multimodal_table.setColumnCount(0)
+            self._multimodal_table_refreshing = False
+            return
+
+        selected_paths = [Path(path) for path in self.selected_paths()]
+        modalities = self._ordered_modalities()
+        if len(modalities) <= 1:
+            self.multimodal_table.setRowCount(0)
+            self.multimodal_table.setColumnCount(0)
+            self._multimodal_table_refreshing = False
+            return
+
+        rows, modalities, extra_columns = self._build_pair_table_rows(
+            selected_paths,
+            modalities=modalities,
+            include_empty_covar_rows=True,
+        )
+        self._multimodal_duplicate_entries = self._populate_pair_table(
+            self.multimodal_table,
+            rows,
+            modalities,
+            extra_columns,
+            include_exclude_column=True,
+        )
+        excluded_count = len([row for row in rows if row.get("_key") in self._multimodal_excluded_pairs])
+        duplicate_pair_count = len({tuple(entry["pair"]) for entry in self._multimodal_duplicate_entries})
+        if duplicate_pair_count:
+            self.multimodal_summary_label.setText(
+                "Optional step. "
+                f"{len(rows)} subject/session pairs shown. Excluded: {excluded_count}. "
+                f"Warning: duplicate NPZ files detected for {duplicate_pair_count} sub/ses pair(s). "
+                "Processing is blocked until duplicates are removed or excluded."
+            )
+        else:
+            self.multimodal_summary_label.setText(
+                f"Optional step. {len(rows)} subject/session pairs shown. Excluded: {excluded_count}."
+            )
+        self._multimodal_table_refreshing = False
+
+    def _on_multimodal_table_item_changed(self, item):
+        if item is None or self._multimodal_table_refreshing or item.column() != 0:
+            return
+        pair_key = item.data(USER_ROLE)
+        if not pair_key:
+            return
+        if item.checkState() == Qt.Checked:
+            self._multimodal_excluded_pairs.add(tuple(pair_key))
+        else:
+            self._multimodal_excluded_pairs.discard(tuple(pair_key))
+        self._refresh_multimodal_table()
+        self._refresh_run_table()
+        if self._stack_prepare_widget is not None and hasattr(self._stack_prepare_widget, "refresh_process_state"):
+            self._stack_prepare_widget.refresh_process_state()
+
+    def multimodal_validation_error(self):
+        if not self.multimodal_enable_check.isChecked():
+            return ""
+        duplicate_pair_count = len({tuple(entry["pair"]) for entry in self._multimodal_duplicate_entries})
+        if duplicate_pair_count:
+            return (
+                f"Multiple NPZ files were found for {duplicate_pair_count} sub/ses pair(s) in the Multimodal step. "
+                "Remove or exclude the duplicates before processing."
+            )
+        return ""
+
+    def _sync_workflow_process_button(self):
+        can_process = False
+        can_import = False
+        processing = self._stack_processing()
+        if self._stack_prepare_widget is not None:
+            if hasattr(self._stack_prepare_widget, "can_process"):
+                try:
+                    can_process = bool(self._stack_prepare_widget.can_process())
+                except Exception:
+                    can_process = False
+            elif hasattr(self._stack_prepare_widget, "process_button"):
+                try:
+                    can_process = bool(self._stack_prepare_widget.process_button.isEnabled())
+                except Exception:
+                    can_process = False
+            if hasattr(self._stack_prepare_widget, "can_import_last_output"):
+                try:
+                    can_import = bool(self._stack_prepare_widget.can_import_last_output())
+                except Exception:
+                    can_import = False
+            elif hasattr(self._stack_prepare_widget, "import_button"):
+                try:
+                    can_import = bool(self._stack_prepare_widget.import_button.isEnabled())
+                except Exception:
+                    can_import = False
+        if hasattr(self, "run_import_button") and self.run_import_button is not None:
+            self.run_import_button.setEnabled(can_import)
+        if hasattr(self, "run_process_button") and self.run_process_button is not None:
+            self.run_process_button.setEnabled(can_process)
+        if hasattr(self, "run_close_button") and self.run_close_button is not None:
+            self.run_close_button.setEnabled(not processing)
+
+    def _trigger_workflow_process(self):
+        if self._stack_prepare_widget is None:
+            return
+        if hasattr(self._stack_prepare_widget, "trigger_process"):
+            self._stack_prepare_widget.trigger_process()
+        else:
+            self._stack_prepare_widget._process()
+        self._sync_workflow_process_button()
+
+    def _trigger_workflow_import(self):
+        if self._stack_prepare_widget is None:
+            return
+        if hasattr(self._stack_prepare_widget, "trigger_import_last_output"):
+            self._stack_prepare_widget.trigger_import_last_output()
+        else:
+            self._stack_prepare_widget._import_last_output()
+        self._sync_workflow_process_button()
+
+    def set_theme(self, theme_name: str) -> None:
+        theme = str(theme_name or "Dark").strip().title()
+        if theme not in {"Light", "Dark", "Teya", "Donald"}:
+            theme = "Dark"
+        if theme == "Dark":
+            style = (
+                "QWidget { background: #1f2430; color: #e5e7eb; font-size: 11pt; } "
+                "QPushButton, QComboBox, QLineEdit, QListWidget, QTableWidget { "
+                "background: #2a3140; color: #e5e7eb; border: 1px solid #556070; border-radius: 5px; } "
+                "QPushButton { min-height: 30px; padding: 4px 10px; } "
+                "QPushButton:hover { background: #344054; } "
+                "QPushButton#workflowStepButton { text-align: left; padding-left: 10px; } "
+                "QPushButton#workflowStepButton:checked { background: #2563eb; border: 2px solid #60a5fa; color: #ffffff; font-weight: 600; } "
+                "QLineEdit, QComboBox { min-height: 30px; padding: 2px 4px; } "
+                "QListWidget::item:selected, QTableWidget::item:selected { background: #3b82f6; color: #ffffff; }"
+            )
+        elif theme == "Teya":
+            style = (
+                "QWidget { background: #ffd0e5; color: #0b7f7a; font-size: 11pt; } "
+                "QPushButton, QComboBox, QLineEdit, QListWidget, QTableWidget { "
+                "background: #ffe6f1; color: #0b7f7a; border: 1px solid #1db8b2; border-radius: 5px; } "
+                "QPushButton { min-height: 30px; padding: 4px 10px; } "
+                "QPushButton:hover { background: #ffd9ea; } "
+                "QPushButton#workflowStepButton { text-align: left; padding-left: 10px; } "
+                "QPushButton#workflowStepButton:checked { background: #2ecfc9; border: 2px solid #0b7f7a; color: #073f3c; font-weight: 700; } "
+                "QLineEdit, QComboBox { min-height: 30px; padding: 2px 4px; } "
+                "QListWidget::item:selected, QTableWidget::item:selected { background: #2ecfc9; color: #073f3c; }"
+            )
+        elif theme == "Donald":
+            style = (
+                "QWidget { background: #d97706; color: #ffffff; font-size: 11pt; } "
+                "QPushButton, QComboBox, QLineEdit, QListWidget, QTableWidget { "
+                "background: #c96a04; color: #ffffff; border: 1px solid #f3a451; border-radius: 5px; } "
+                "QPushButton { min-height: 30px; padding: 4px 10px; } "
+                "QPushButton:hover { background: #c76b06; } "
+                "QPushButton#workflowStepButton { text-align: left; padding-left: 10px; } "
+                "QPushButton#workflowStepButton:checked { background: #b85f00; border: 2px solid #ffd19e; color: #ffffff; font-weight: 700; } "
+                "QLineEdit, QComboBox { min-height: 30px; padding: 2px 4px; } "
+                "QListWidget::item:selected, QTableWidget::item:selected { background: #2563eb; color: #ffffff; }"
+            )
+        else:
+            style = (
+                "QWidget { background: #f4f6f9; color: #1f2937; font-size: 11pt; } "
+                "QPushButton, QComboBox, QLineEdit, QListWidget, QTableWidget { "
+                "background: #ffffff; color: #1f2937; border: 1px solid #c9d0da; border-radius: 5px; } "
+                "QPushButton { min-height: 30px; padding: 4px 10px; } "
+                "QPushButton:hover { background: #edf2f7; } "
+                "QPushButton#workflowStepButton { text-align: left; padding-left: 10px; } "
+                "QPushButton#workflowStepButton:checked { background: #2563eb; border: 2px solid #1d4ed8; color: #ffffff; font-weight: 600; } "
+                "QLineEdit, QComboBox { min-height: 30px; padding: 2px 4px; } "
+                "QListWidget::item:selected, QTableWidget::item:selected { background: #2563eb; color: #ffffff; }"
+            )
+        self.setStyleSheet(style)
+
     def _accept_if_selection(self) -> None:
         if not self.selected_paths():
             QMessageBox.information(self, "No Files Selected", "Select at least one matrix to add.")
@@ -975,14 +2152,82 @@ class BatchMatrixImportDialog(QDialog):
                 "Mixed Atlases",
                 "Stack requires a single atlas selection.\n\n"
                 f"Detected atlases: {', '.join(selected_atlases)}\n\n"
-                "Use the Atlas filter to select one atlas before stacking.",
+                "Use the text filter or a narrower modality selection before stacking.",
             )
             return
-        if self._stack_callback is None:
-            QMessageBox.warning(self, "Stack Unavailable", "No stack callback is configured.")
-            return
-        self._requested_action = "stack"
-        self.accept()
+        try:
+            from window.stack_prepare import CovarsSelectionWidget, StackPrepareDialog
+        except Exception:
+            try:
+                from mrsi_viewer.window.stack_prepare import CovarsSelectionWidget, StackPrepareDialog
+            except Exception as exc:
+                QMessageBox.warning(self, "Stack Unavailable", f"Failed to open stack step: {exc}")
+                return
+
+        if self._selection_widget is None:
+            self._selection_widget = CovarsSelectionWidget(
+                selected_paths=selected,
+                parent=self.selection_page,
+            )
+            _write_diagnostic_line("Created embedded selection_widget with parent=selection_page")
+            try:
+                self._selection_widget.destroyed.connect(
+                    lambda *_args: _write_diagnostic_line("embedded selection_widget destroyed")
+                )
+            except Exception:
+                pass
+            self._selection_widget.configuration_changed.connect(self._refresh_optional_steps)
+            self.selection_tab_layout.removeWidget(self.selection_placeholder)
+            self.selection_placeholder.hide()
+            self.selection_tab_layout.addWidget(self._selection_widget, 1)
+        else:
+            self._selection_widget.set_selected_paths(selected)
+
+        if self._stack_prepare_widget is None:
+            if hasattr(self, "workflow_terminal") and self.workflow_terminal is not None:
+                self.workflow_terminal.clear()
+            self._stack_prepare_widget = StackPrepareDialog(
+                selected_paths=selected,
+                theme_name=getattr(self.parent(), "_theme_name", "Dark"),
+                export_callback=self._export_callback,
+                close_callback=lambda: self._go_to_step(1),
+                selected_paths_provider=self.effective_selected_paths,
+                validation_error_provider=self.multimodal_validation_error,
+                covars_df_provider=self._filtered_covars_df,
+                selection_suffix_provider=self._selection_suffix,
+                multimodal_config_provider=self._multimodal_process_config,
+                include_covars_widget=False,
+                show_embedded_terminal=False,
+                show_import_button=False,
+                show_process_button=False,
+                default_results_dir=getattr(self.parent(), "_results_dir_default", ""),
+                default_bids_dir=getattr(self.parent(), "_bids_dir_default", ""),
+                default_atlas_dir=getattr(self.parent(), "_atlas_dir_default", ""),
+                parent=self.setup_page,
+            )
+            _write_diagnostic_line("Created embedded stack_prepare_widget with parent=setup_page")
+            try:
+                self._stack_prepare_widget.destroyed.connect(
+                    lambda *_args: _write_diagnostic_line("embedded stack_prepare_widget destroyed")
+                )
+            except Exception:
+                pass
+            if hasattr(self._stack_prepare_widget, "configuration_changed"):
+                self._stack_prepare_widget.configuration_changed.connect(self._refresh_optional_steps)
+            if hasattr(self._stack_prepare_widget, "process_state_changed"):
+                self._stack_prepare_widget.process_state_changed.connect(self._sync_workflow_process_button)
+            if hasattr(self._stack_prepare_widget, "log_message_emitted"):
+                self._stack_prepare_widget.log_message_emitted.connect(self._append_workflow_terminal)
+            self.setup_tab_layout.removeWidget(self.setup_placeholder)
+            self.setup_placeholder.hide()
+            self.setup_tab_layout.addWidget(self._stack_prepare_widget, 1)
+        else:
+            self._stack_prepare_widget.set_selected_paths(selected)
+            self._stack_prepare_widget.show()
+        if hasattr(self._stack_prepare_widget, "refresh_process_state"):
+            self._stack_prepare_widget.refresh_process_state()
+        self._refresh_optional_steps()
+        self._go_to_step(1)
 
 class ConnectomeViewer(QMainWindow):
     _global_font_adjusted = False
@@ -994,6 +2239,9 @@ class ConnectomeViewer(QMainWindow):
         self._derived_counter = 0
         self.titles = {}
         self._covars_cache = {}
+        self._valid_keys_cache = {}
+        self._parcel_metadata_cache = {}
+        self._group_values_cache = {}
         self._current_matrix = None
         self._current_parcel_labels = None
         self._current_parcel_names = None
@@ -1023,6 +2271,9 @@ class ConnectomeViewer(QMainWindow):
         self._default_gradient_colormap = self._preferences["gradient_colormap"]
         self._matlab_cmd_default = self._preferences["matlab_cmd"]
         self._matlab_nbs_path_default = self._preferences["matlab_nbs_path"]
+        self._results_dir_default = self._preferences["results_dir"]
+        self._bids_dir_default = self._preferences["bids_dir"]
+        self._atlas_dir_default = self._preferences["atlas_dir"]
         self._zoom_level = int(self._preferences.get("zoom_level", 0))
         self._base_app_font_point_size = None
         app = QApplication.instance()
@@ -1078,6 +2329,9 @@ class ConnectomeViewer(QMainWindow):
             "gradient_colormap": DEFAULT_GRADIENT_COLORMAP,
             "matlab_cmd": DEFAULT_MATLAB_CMD,
             "matlab_nbs_path": DEFAULT_MATLAB_NBS_PATH,
+            "results_dir": "",
+            "bids_dir": _first_env_value("BIDSDATAPATH"),
+            "atlas_dir": "",
             "zoom_level": 0,
         }
 
@@ -1150,6 +2404,9 @@ class ConnectomeViewer(QMainWindow):
         matlab_nbs_path = self._normalize_directory_path(matlab_nbs_path)
         default_nbs_path = self._normalize_directory_path(DEFAULT_MATLAB_NBS_PATH)
         prefs["matlab_nbs_path"] = matlab_nbs_path or default_nbs_path or ""
+        prefs["results_dir"] = self._normalize_directory_path(str(prefs.get("results_dir", "") or "").strip())
+        prefs["bids_dir"] = self._normalize_directory_path(str(prefs.get("bids_dir", "") or "").strip())
+        prefs["atlas_dir"] = self._normalize_directory_path(str(prefs.get("atlas_dir", "") or "").strip())
         try:
             zoom_level = int(prefs.get("zoom_level", 0))
         except Exception:
@@ -1206,6 +2463,9 @@ class ConnectomeViewer(QMainWindow):
             "gradient_colormap": self._default_gradient_colormap,
             "matlab_cmd": self._matlab_cmd_default,
             "matlab_nbs_path": self._matlab_nbs_path_default,
+            "results_dir": self._results_dir_default,
+            "bids_dir": self._bids_dir_default,
+            "atlas_dir": self._atlas_dir_default,
             "zoom_level": int(self._zoom_level),
         }
         try:
@@ -1299,7 +2559,7 @@ class ConnectomeViewer(QMainWindow):
     def _zoom_reset(self) -> None:
         self._apply_zoom_level(0, show_status=True)
 
-    def _open_preferences_dialog(self) -> None:
+    def _open_preferences_dialog(self, _checked=False, *, initial_setup: bool = False) -> bool:
         names = self._available_colormap_names()
         dialog = PreferencesDialog(
             theme_name=self._theme_name,
@@ -1307,11 +2567,16 @@ class ConnectomeViewer(QMainWindow):
             gradient_cmap=self._default_gradient_colormap,
             matlab_cmd=self._matlab_cmd_default,
             matlab_nbs_path=self._matlab_nbs_path_default,
+            results_dir=self._results_dir_default,
+            bids_dir=self._bids_dir_default,
+            atlas_dir=self._atlas_dir_default,
             colormap_names=names,
+            dialog_title="Initial Configuration" if initial_setup else "Preferences",
+            require_results_dir=True,
             parent=self,
         )
         if dialog.exec() != _dialog_accepted_code():
-            return
+            return False
         new_values = dialog.values()
         new_values["zoom_level"] = self._zoom_level
         prefs = self._sanitize_preferences(new_values)
@@ -1320,6 +2585,9 @@ class ConnectomeViewer(QMainWindow):
         self._default_gradient_colormap = prefs["gradient_colormap"]
         self._matlab_cmd_default = prefs["matlab_cmd"]
         self._matlab_nbs_path_default = prefs["matlab_nbs_path"]
+        self._results_dir_default = prefs["results_dir"]
+        self._bids_dir_default = prefs["bids_dir"]
+        self._atlas_dir_default = prefs["atlas_dir"]
         self._preferences = prefs
 
         if getattr(self, "_nbs_dialog", None) is not None:
@@ -1338,6 +2606,7 @@ class ConnectomeViewer(QMainWindow):
 
         if self._save_preferences():
             self.statusBar().showMessage(f"Preferences saved to {CONFIG_PATH}.")
+        return True
 
     def _build_ui(self) -> None:
         screen = QApplication.primaryScreen()
@@ -1727,6 +2996,8 @@ class ConnectomeViewer(QMainWindow):
                 "QPushButton:hover { background: #374256; }"
                 "QPushButton:pressed { background: #2b3444; }"
                 "QPushButton:disabled { color: #8e98a8; background: #252c38; border-color: #464f5e; }"
+                "QPushButton#workflowStepButton { text-align: left; padding-left: 10px; }"
+                "QPushButton#workflowStepButton:checked { background: #2563eb; border: 2px solid #60a5fa; color: #ffffff; font-weight: 600; }"
                 "QListWidget::item:selected, QTableWidget::item:selected { background: #3b82f6; color: #ffffff; }"
                 "QComboBox QAbstractItemView { background: #2a3140; color: #e5e7eb; selection-background-color: #3b82f6; }"
                 "QStatusBar { background: #242a35; color: #e5e7eb; border-top: 1px solid #3d4556; }"
@@ -1745,6 +3016,8 @@ class ConnectomeViewer(QMainWindow):
                 "QPushButton:hover { background: #ffb1d5; }"
                 "QPushButton:pressed { background: #ffa3cd; }"
                 "QPushButton:disabled { color: #68a9a6; background: #ffd9ea; border-color: #87cfcb; }"
+                "QPushButton#workflowStepButton { text-align: left; padding-left: 10px; }"
+                "QPushButton#workflowStepButton:checked { background: #2ecfc9; border: 2px solid #0b7f7a; color: #073f3c; font-weight: 700; }"
                 "QListWidget::item:selected, QTableWidget::item:selected { background: #2ecfc9; color: #073f3c; }"
                 "QComboBox QAbstractItemView { background: #ffe6f1; color: #0b7f7a; selection-background-color: #2ecfc9; }"
                 "QStatusBar { background: #ffbddb; color: #0b7f7a; border-top: 1px solid #1db8b2; }"
@@ -1763,6 +3036,8 @@ class ConnectomeViewer(QMainWindow):
                 "QPushButton:hover { background: #c76b06; }"
                 "QPushButton:pressed { background: #a85400; }"
                 "QPushButton:disabled { color: #ffe3be; background: #d58933; border-color: #f0b97c; }"
+                "QPushButton#workflowStepButton { text-align: left; padding-left: 10px; }"
+                "QPushButton#workflowStepButton:checked { background: #b85f00; border: 2px solid #ffd19e; color: #ffffff; font-weight: 700; }"
                 "QListWidget::item:selected, QTableWidget::item:selected { background: #2563eb; color: #ffffff; }"
                 "QComboBox QAbstractItemView { background: #c96a04; color: #ffffff; selection-background-color: #2563eb; }"
                 "QStatusBar { background: #b85f00; color: #ffffff; border-top: 1px solid #f3a451; }"
@@ -1780,6 +3055,8 @@ class ConnectomeViewer(QMainWindow):
             "QPushButton:hover { background: #edf2f7; }"
             "QPushButton:pressed { background: #e6ebf2; }"
             "QPushButton:disabled { color: #9099a5; background: #edf1f5; border-color: #d2d9e2; }"
+            "QPushButton#workflowStepButton { text-align: left; padding-left: 10px; }"
+            "QPushButton#workflowStepButton:checked { background: #2563eb; border: 2px solid #1d4ed8; color: #ffffff; font-weight: 600; }"
             "QListWidget::item:selected, QTableWidget::item:selected { background: #2563eb; color: #ffffff; }"
             "QComboBox QAbstractItemView { background: #ffffff; color: #111827; selection-background-color: #2563eb; }"
             "QStatusBar { background: #e8edf3; color: #1f2937; border-top: 1px solid #cfd7e2; }"
@@ -2016,13 +3293,36 @@ class ConnectomeViewer(QMainWindow):
             return None
         return Path(source_path)
 
-    def _default_dialog_dir(self) -> Path:
+    def ensure_initial_configuration(self) -> bool:
+        if str(self._results_dir_default or "").strip():
+            return True
+        return self._open_preferences_dialog(initial_setup=True)
+
+    def _default_open_dir(self) -> Path:
+        bids_dir = str(self._bids_dir_default or "").strip()
+        if bids_dir:
+            return Path(bids_dir).expanduser()
         source_path = self._current_source_path()
         if source_path is not None:
             return source_path.parent
         return Path.cwd()
 
+    def _default_results_dir(self) -> Path:
+        results_dir = str(self._results_dir_default or "").strip()
+        if results_dir:
+            return Path(results_dir).expanduser()
+        source_path = self._current_source_path()
+        if source_path is not None:
+            return source_path.parent
+        return Path.cwd()
+
+    def _default_dialog_dir(self) -> Path:
+        return self._default_open_dir()
+
     def _default_parcellation_dir(self) -> Path:
+        atlas_dir = str(self._atlas_dir_default or "").strip()
+        if atlas_dir:
+            return Path(atlas_dir).expanduser()
         if DEFAULT_PARCELLATION_DIR.exists():
             return DEFAULT_PARCELLATION_DIR
         return ROOTDIR
@@ -2212,6 +3512,9 @@ class ConnectomeViewer(QMainWindow):
             matrix_key=source["key"],
             matlab_cmd_default=self._matlab_cmd_default,
             matlab_nbs_path_default=self._matlab_nbs_path_default,
+            output_dir_default=self._results_dir_default,
+            atlas_dir_default=self._atlas_dir_default,
+            bids_dir_default=self._bids_dir_default,
             theme_name=self._theme_name,
             parent=self,
         )
@@ -2313,6 +3616,7 @@ class ConnectomeViewer(QMainWindow):
             covars_info=covars_info,
             source_path=source_path,
             matrix_key=source["key"],
+            output_dir_default=self._results_dir_default,
             theme_name=self._theme_name,
             export_callback=self._import_harmonized_result,
             parent=self,
@@ -2332,6 +3636,7 @@ class ConnectomeViewer(QMainWindow):
             self.statusBar().showMessage(f"Harmonized file not found: {output_path}")
             return False
 
+        self._invalidate_path_caches(output_path)
         self._add_files([str(output_path)])
         target_id = self._file_entry_id(output_path)
         selected = False
@@ -2363,6 +3668,7 @@ class ConnectomeViewer(QMainWindow):
             self.statusBar().showMessage(f"Stacked file not found: {output_path}")
             return False
 
+        self._invalidate_path_caches(output_path)
         self._add_files([str(output_path)])
         target_id = self._file_entry_id(output_path)
         for row in range(self.file_list.count()):
@@ -2395,6 +3701,9 @@ class ConnectomeViewer(QMainWindow):
             selected_paths=paths,
             theme_name=self._theme_name,
             export_callback=self._import_stacked_result,
+            default_results_dir=self._results_dir_default,
+            default_bids_dir=self._bids_dir_default,
+            default_atlas_dir=self._atlas_dir_default,
             parent=self,
         )
         self._stack_prepare_dialog.show()
@@ -2455,7 +3764,7 @@ class ConnectomeViewer(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select .npz files",
-            "",
+            str(self._default_open_dir()),
             "NumPy archives (*.npz);;All files (*)",
         )
         self._add_files(paths)
@@ -2500,19 +3809,16 @@ class ConnectomeViewer(QMainWindow):
         dialog = BatchMatrixImportDialog(
             folder_path,
             candidate_paths,
-            stack_callback=self._open_stack_prepare_dialog,
+            export_callback=self._import_stacked_result,
             parent=self,
         )
         self._batch_import_dialog = dialog
-        if self.styleSheet():
-            dialog.setStyleSheet(self.styleSheet())
+        if hasattr(dialog, "set_theme"):
+            dialog.set_theme(self._theme_name)
         if dialog.exec() != _dialog_accepted_code():
             return []
 
         selected_paths = dialog.selected_paths()
-        if dialog.requested_action() == "stack":
-            self._open_stack_prepare_dialog(selected_paths)
-            return []
         added_paths = self._add_files(selected_paths)
         if not added_paths:
             self.statusBar().showMessage("No new batch files were added.")
@@ -2526,7 +3832,7 @@ class ConnectomeViewer(QMainWindow):
         selected_dir = QFileDialog.getExistingDirectory(
             self,
             "Select folder with connectivity matrices",
-            str(self._default_dialog_dir()),
+            str(self._default_open_dir()),
         )
         if not selected_dir:
             return
@@ -2542,6 +3848,7 @@ class ConnectomeViewer(QMainWindow):
             path = Path(raw_path)
             if path.suffix.lower() != ".npz" or not path.exists():
                 continue
+            self._invalidate_path_caches(path)
             entry_id = self._file_entry_id(path)
             if entry_id in self._entries:
                 continue
@@ -2587,14 +3894,61 @@ class ConnectomeViewer(QMainWindow):
     def _clear_files(self) -> None:
         self._entries.clear()
         self.titles.clear()
+        self._covars_cache.clear()
+        self._valid_keys_cache.clear()
+        self._parcel_metadata_cache.clear()
+        self._group_values_cache.clear()
         self.file_list.clear()
         self._clear_plot()
         self._update_nbs_prepare_button()
         self.statusBar().showMessage("File list cleared.")
 
+    def _get_valid_keys_cached(self, path: Path):
+        path = Path(path)
+        cached = self._valid_keys_cache.get(path)
+        if cached is None:
+            cached = list(_get_valid_keys(path))
+            self._valid_keys_cache[path] = cached
+        return list(cached)
+
+    def _invalidate_path_caches(self, path: Path) -> None:
+        path = Path(path)
+        self._covars_cache.pop(path, None)
+        self._valid_keys_cache.pop(path, None)
+        self._parcel_metadata_cache.pop(path, None)
+        self._group_values_cache.pop(path, None)
+
+    def _load_parcel_metadata_cached(self, path: Path):
+        path = Path(path)
+        if path not in self._parcel_metadata_cache:
+            self._parcel_metadata_cache[path] = _load_parcel_metadata(path)
+        return self._parcel_metadata_cache[path]
+
+    def _load_group_value_cached(self, path: Path, index: int):
+        path = Path(path)
+        if path not in self._group_values_cache:
+            try:
+                with np.load(path, allow_pickle=True) as npz:
+                    group_data = npz["group"] if "group" in npz else None
+            except Exception:
+                group_data = None
+            self._group_values_cache[path] = group_data
+
+        group_data = self._group_values_cache.get(path)
+        if group_data is None:
+            return None
+        if np.isscalar(group_data):
+            return str(group_data)
+        group_arr = np.asarray(group_data)
+        if group_arr.ndim == 0:
+            return str(group_arr.item())
+        if index < 0 or index >= len(group_arr):
+            return None
+        return str(group_arr[index])
+
     def _refresh_key_options(self, entry) -> None:
         self.key_combo.blockSignals(True)
-        valid_keys = _get_valid_keys(entry["path"])
+        valid_keys = self._get_valid_keys_cached(entry["path"])
         self.key_combo.clear()
         self.key_combo.addItems(valid_keys)
         selected_key = entry.get("selected_key")
@@ -2651,7 +4005,7 @@ class ConnectomeViewer(QMainWindow):
             return base_label
         participant_value = str(participant[sample_index])
         session_value = str(session[sample_index])
-        group_value = _load_group_value(source_path, sample_index)
+        group_value = self._load_group_value_cached(source_path, sample_index)
         group, sub = _parse_participant_id(participant_value)
         if group_value:
             group = group_value
@@ -3066,7 +4420,7 @@ class ConnectomeViewer(QMainWindow):
         key = entry.get("selected_key")
         if key:
             return key
-        valid_keys = _get_valid_keys(entry["path"])
+        valid_keys = self._get_valid_keys_cached(entry["path"])
         if not valid_keys:
             return None
         entry["selected_key"] = valid_keys[0]
@@ -3138,7 +4492,7 @@ class ConnectomeViewer(QMainWindow):
 
             if labels is None or names is None:
                 try:
-                    extra_labels, extra_names = _load_parcel_metadata(source_path)
+                    extra_labels, extra_names = self._load_parcel_metadata_cached(source_path)
                     if labels is None and extra_labels is not None:
                         labels = np.asarray(extra_labels)
                     if names is None and extra_names is not None:
@@ -3189,7 +4543,7 @@ class ConnectomeViewer(QMainWindow):
         source_stem = source_path.stem if source_path is not None else self._safe_name_fragment(entry.get("label", "matrix"))
         key_part = self._safe_name_fragment(selected_key or "matrix")
         default_name = f"{self._safe_name_fragment(source_stem)}_{key_part}_matrix_pop_avg.npz"
-        start_dir = self._default_dialog_dir()
+        start_dir = self._default_results_dir()
 
         save_path, _selected_filter = QFileDialog.getSaveFileName(
             self,
@@ -3219,7 +4573,7 @@ class ConnectomeViewer(QMainWindow):
         save_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export connectome grid",
-            "",
+            str(self._default_results_dir() / "connectome_grid.pdf"),
             "PDF (*.pdf);;SVG (*.svg);;PNG (*.png)",
         )
         if not save_path:
@@ -3387,7 +4741,7 @@ class ConnectomeViewer(QMainWindow):
 
         labels, names = (None, None)
         if source_path:
-            labels, names = _load_parcel_metadata(source_path)
+            labels, names = self._load_parcel_metadata_cached(source_path)
         labels_list = _to_string_list(labels)
         names_list = _to_string_list(names)
         if labels_list and len(labels_list) != matrix.shape[0]:
@@ -3616,7 +4970,7 @@ class ConnectomeViewer(QMainWindow):
             self.statusBar().showMessage("Gradients require a square matrix.")
             return
 
-        source_dir = self._default_dialog_dir()
+        source_dir = self._default_results_dir()
         if self._active_parcellation_data is None:
             if not self._select_parcellation_template():
                 self.statusBar().showMessage("Gradient compute canceled (no template selected).")
@@ -3638,7 +4992,7 @@ class ConnectomeViewer(QMainWindow):
         if source_path is None or not source_path.exists():
             self.statusBar().showMessage("Projection requires a source .npz with parcel labels.")
             return
-        parcel_labels, _ = _load_parcel_metadata(source_path)
+        parcel_labels, _ = self._load_parcel_metadata_cached(source_path)
         label_indices = _coerce_label_indices(parcel_labels, conn_matrix.shape[0])
         if label_indices is None:
             self.statusBar().showMessage(
@@ -3749,7 +5103,7 @@ class ConnectomeViewer(QMainWindow):
             self.statusBar().showMessage(f"nibabel not available: {exc}")
             return
 
-        base_dir = Path(self._last_gradients.get("source_dir", str(self._default_dialog_dir())))
+        base_dir = Path(self._last_gradients.get("source_dir", str(self._default_results_dir())))
         default_name = self._last_gradients.get("output_name", "diffusion_components.nii.gz")
         save_path, selected_filter = QFileDialog.getSaveFileName(
             self,
@@ -3925,7 +5279,13 @@ class ConnectomeViewer(QMainWindow):
 
 
 def main() -> int:
+    diag_path = _install_runtime_diagnostics()
     app = QApplication(sys.argv)
+    _write_diagnostic_line("QApplication created")
+    try:
+        app.aboutToQuit.connect(lambda: _write_diagnostic_line("QApplication.aboutToQuit emitted"))
+    except Exception:
+        pass
     if sys.platform.startswith("linux"):
         app.setApplicationName("donald")
         if hasattr(app, "setDesktopFileName"):
@@ -3972,13 +5332,30 @@ def main() -> int:
             time.sleep(0.02)
 
     window = ConnectomeViewer()
+    _write_diagnostic_line(f"ConnectomeViewer constructed: {window!r}")
+    try:
+        window.destroyed.connect(lambda *_args: _write_diagnostic_line("ConnectomeViewer destroyed"))
+    except Exception:
+        pass
+    if not str(window._results_dir_default or "").strip() and splash is not None:
+        splash.close()
+        splash = None
+    if not window.ensure_initial_configuration():
+        _write_diagnostic_line("Initial configuration canceled")
+        if splash is not None:
+            splash.close()
+        window.close()
+        return 0
     if splash is not None:
         splash.showMessage("Starting Donald...", splash_align, QColor("white"))
         app.processEvents()
     window.showMaximized()
+    _write_diagnostic_line(f"Viewer shown; diagnostics logging to {diag_path}")
     if splash is not None:
         splash.finish(window)
-    return app.exec()
+    exit_code = app.exec()
+    _write_diagnostic_line(f"QApplication exited with code {exit_code}")
+    return exit_code
 
 
 if __name__ == "__main__":

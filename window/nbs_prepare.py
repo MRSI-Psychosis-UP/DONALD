@@ -215,6 +215,9 @@ class NBSPrepareDialog(QDialog):
         matrix_key,
         matlab_cmd_default="",
         matlab_nbs_path_default="",
+        output_dir_default="",
+        atlas_dir_default="",
+        bids_dir_default="",
         theme_name="Dark",
         parent=None,
     ):
@@ -223,6 +226,9 @@ class NBSPrepareDialog(QDialog):
         self._matrix_key = str(matrix_key)
         self._matlab_cmd_default = str(matlab_cmd_default or "").strip()
         self._matlab_nbs_path_default = str(matlab_nbs_path_default or "").strip()
+        self._output_dir_default = str(output_dir_default or "").strip()
+        self._atlas_dir_default = str(atlas_dir_default or "").strip()
+        self._bids_dir_default = str(bids_dir_default or "").strip()
         self._theme_name = "Dark"
         self._source_group = None
         self._source_modality = None
@@ -566,7 +572,7 @@ class NBSPrepareDialog(QDialog):
         output_grid.addWidget(self.parcellation_browse_button, 0, 3)
 
         output_grid.addWidget(QLabel("Output folder"), 1, 0)
-        self.output_dir_edit = QLineEdit("")
+        self.output_dir_edit = QLineEdit(self._output_dir_default or str(self._source_path.parent))
         output_grid.addWidget(self.output_dir_edit, 1, 1, 1, 2)
         self.output_dir_button = QPushButton("Browse")
         self.output_dir_button.clicked.connect(self._browse_output_dir)
@@ -716,7 +722,7 @@ class NBSPrepareDialog(QDialog):
         self._update_run_summary()
 
     def _browse_output_dir(self):
-        start_dir = self.output_dir_edit.text().strip() or str(self._source_path.parent)
+        start_dir = self.output_dir_edit.text().strip() or self._output_dir_default or str(self._source_path.parent)
         selected = QFileDialog.getExistingDirectory(self, "Select output folder", start_dir)
         if selected:
             self.output_dir_edit.setText(selected)
@@ -849,7 +855,9 @@ class NBSPrepareDialog(QDialog):
             self._source_modality = None
 
     def _browse_parcellation_path(self):
-        start_dir = str(self._source_path.parent) if self._source_path is not None else str(Path.cwd())
+        start_dir = self._atlas_dir_default or (
+            str(self._source_path.parent) if self._source_path is not None else str(Path.cwd())
+        )
         selected, _ = QFileDialog.getOpenFileName(
             self,
             "Select parcellation NIfTI",
@@ -1499,12 +1507,19 @@ class NBSPrepareDialog(QDialog):
         viewer_root = str(Path(__file__).resolve().parents[1])
         devanalyse = env.value("DEVANALYSEPATH", "")
         if not devanalyse:
-            env.insert("DEVANALYSEPATH", viewer_root)
-            print(f"[NBS] DEVANALYSEPATH not set; using {viewer_root}", flush=True)
-            self._append_terminal_line(f"[NBS] DEVANALYSEPATH not set; using {viewer_root}")
+            preferred_root = ""
+            if self._output_dir_default:
+                try:
+                    preferred_root = str(Path(self._output_dir_default).expanduser().resolve().parent)
+                except Exception:
+                    preferred_root = str(Path(self._output_dir_default).expanduser().parent)
+            devanalyse_root = preferred_root or viewer_root
+            env.insert("DEVANALYSEPATH", devanalyse_root)
+            print(f"[NBS] DEVANALYSEPATH not set; using {devanalyse_root}", flush=True)
+            self._append_terminal_line(f"[NBS] DEVANALYSEPATH not set; using {devanalyse_root}")
         bids_data = env.value("BIDSDATAPATH", "")
         if not bids_data or bids_data == ".":
-            fallback_bids = str(Path(viewer_root) / "data" / "BIDS")
+            fallback_bids = self._bids_dir_default or str(Path(viewer_root) / "data" / "BIDS")
             env.insert("BIDSDATAPATH", fallback_bids)
             print(f"[NBS] BIDSDATAPATH not set; using {fallback_bids}", flush=True)
             self._append_terminal_line(f"[NBS] BIDSDATAPATH not set; using {fallback_bids}")

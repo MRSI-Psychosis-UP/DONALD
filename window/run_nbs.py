@@ -572,6 +572,13 @@ def _run_matlab_persistent(
     expected_output: str | None = None,
 ) -> None:
     progress_re = re.compile(r"^\|\s*\d+\s*/\s*\d+\s*\|")
+    if expected_output:
+        try:
+            expected_path = Path(expected_output)
+            if expected_path.is_file():
+                expected_path.unlink()
+        except Exception as exc:
+            debug.warning(f"Could not remove previous MATLAB output {expected_output}: {exc}")
     log_path = _ensure_matlab_worker_running(matlab_cmd, script_dir, session_dir)
     session_root = Path(session_dir).expanduser().resolve()
     commands_dir = session_root / "commands"
@@ -642,11 +649,6 @@ def _run_matlab_persistent(
     ok = bool(response.get("ok", False))
     err_message = str(response.get("message", "")).strip()
     if not ok:
-        if expected_output and isfile(expected_output):
-            debug.warning(
-                f"MATLAB persistent job failed, but output exists at {expected_output}. Proceeding."
-            )
-            return
         if err_message:
             for line in err_message.splitlines()[-20:]:
                 debug.error(line)
@@ -659,6 +661,13 @@ def _run_matlab_persistent(
 
 def _run_matlab_batch(matlab_cmd: str, matlab_call: str, expected_output: str | None = None) -> None:
     progress_re = re.compile(r"^\|\s*\d+\s*/\s*\d+\s*\|")
+    if expected_output:
+        try:
+            expected_path = Path(expected_output)
+            if expected_path.is_file():
+                expected_path.unlink()
+        except Exception as exc:
+            debug.warning(f"Could not remove previous MATLAB output {expected_output}: {exc}")
     try:
         process = subprocess.Popen(
             [matlab_cmd, "-batch", matlab_call],
@@ -709,11 +718,6 @@ def _run_matlab_batch(matlab_cmd: str, matlab_call: str, expected_output: str | 
         sys.stdout.write("\n")
         sys.stdout.flush()
     if rc != 0:
-        if expected_output and isfile(expected_output):
-            debug.warning(
-                f"MATLAB exited with code {rc}, but output exists at {expected_output}. Proceeding."
-            )
-            return
         if output_lines:
             debug.error("MATLAB NBS failed. Last output lines:")
             for line in output_lines[-12:]:
