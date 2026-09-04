@@ -103,9 +103,12 @@ class GradientSurfaceDialog(QDialog):
     def _default_cmap(cmap_name):
         try:
             try:
-                from graphplot.colorbar import ColorBar
-            except Exception:
                 from mrsitoolbox.graphplot.colorbar import ColorBar
+            except ImportError as exc:
+                raise ImportError(
+                    "Gradient surface rendering requires the current mrsitoolbox pip package. "
+                    "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+                ) from exc
 
             colorbar = ColorBar()
             if cmap_name == "spectrum_fsl":

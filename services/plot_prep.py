@@ -38,12 +38,28 @@ def resolve_entry_plot(
     source_path = Path(source_path_raw) if source_path_raw else None
 
     if entry.get("kind") == "derived":
+        raw = np.asarray(entry.get("matrix"))
+        axis = None
+        stack_len = None
+        if raw.ndim == 3:
+            axis = stack_axis(raw.shape)
+            if axis is None:
+                matrix = average_to_square(raw)
+            else:
+                stack_len = int(raw.shape[axis])
+                sample_index = entry.get("sample_index", -1)
+                if sample_index is None or sample_index < 0 or sample_index >= stack_len:
+                    matrix = average_to_square(raw)
+                else:
+                    matrix = select_stack_slice(raw, axis, sample_index)
+        else:
+            matrix = raw
         return PlotEntryResolution(
-            matrix=np.asarray(entry.get("matrix")),
+            matrix=np.asarray(matrix),
             key=entry.get("selected_key"),
             source_path=source_path,
-            stack_axis=None,
-            stack_len=None,
+            stack_axis=axis,
+            stack_len=stack_len,
         )
 
     key = ensure_entry_key(entry)

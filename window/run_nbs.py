@@ -18,26 +18,19 @@ from scipy.io import loadmat
 
 _SCRIPT_PATH = Path(__file__).resolve()
 _VIEWER_ROOT = _SCRIPT_PATH.parents[1]
-_LOCAL_MRSI_ROOT = _VIEWER_ROOT.parent / "mrsitoolbox"
-if _LOCAL_MRSI_ROOT.exists():
-    _local_path = str(_LOCAL_MRSI_ROOT)
-    if _local_path not in sys.path:
-        sys.path.insert(0, _local_path)
 
 try:
-    from tools.datautils import DataUtils
-    from tools.debug import Debug
-    from tools.participants import ParticipantSelector
-    from connectomics.nettools import NetTools
-    from connectomics.nbs import NBS
-    from graphplot.brain3d import Brain3D
-except Exception:
     from mrsitoolbox.tools.datautils import DataUtils
     from mrsitoolbox.tools.debug import Debug
     from mrsitoolbox.tools.participants import ParticipantSelector
     from mrsitoolbox.connectomics.nettools import NetTools
     from mrsitoolbox.connectomics.nbs import NBS
     from mrsitoolbox.graphplot.brain3d import Brain3D
+except ImportError as exc:
+    raise ImportError(
+        "Donald NBS requires the current mrsitoolbox pip package. "
+        "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+    ) from exc
 from rich.table import Table
 
 
@@ -728,10 +721,7 @@ def _run_matlab_batch(matlab_cmd: str, matlab_call: str, expected_output: str | 
 
 def _resolve_matlab_helper_dir() -> str:
     script_dir = Path(__file__).resolve().parent
-    candidates = [
-        script_dir,
-        script_dir.parents[1] / "mrsitoolbox" / "experiments" / "MetSiM_analysis",
-    ]
+    candidates = [script_dir]
     for candidate in candidates:
         if (candidate / "nbs_run_cli.m").is_file():
             return str(candidate)

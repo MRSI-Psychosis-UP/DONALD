@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,17 +14,14 @@ from scipy.io import loadmat
 
 SCRIPT_PATH = Path(__file__).resolve()
 VIEWER_ROOT = SCRIPT_PATH.parents[1]
-PROJECT_ROOT = VIEWER_ROOT.parent
-MRSI_TOOLBOX_ROOT = PROJECT_ROOT / "mrsitoolbox"
-for candidate in (VIEWER_ROOT, MRSI_TOOLBOX_ROOT):
-    text = str(candidate)
-    if text not in sys.path and candidate.exists():
-        sys.path.insert(0, text)
 
 try:
-    from connectomics.nbs import NBS  # noqa: E402
-except Exception:
     from mrsitoolbox.connectomics.nbs import NBS  # noqa: E402
+except ImportError as exc:
+    raise ImportError(
+        "validate_nbs_parity.py requires the current mrsitoolbox pip package. "
+        "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+    ) from exc
 
 
 def _mat_get(obj, field, default=None):

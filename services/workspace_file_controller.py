@@ -282,25 +282,35 @@ class WorkspaceFileController:
         added_paths = []
         added_any = False
         loaded_precomputed_bundle = None
+        skipped_messages = []
         for raw_path in paths:
             if not raw_path:
                 continue
             path = Path(raw_path)
-            if path.suffix.lower() != ".npz" or not path.exists():
+            if path.suffix.lower() != ".npz":
+                skipped_messages.append(f"{path.name or path}: not an .npz file")
+                continue
+            try:
+                path_is_file = path.is_file()
+            except OSError as exc:
+                skipped_messages.append(f"{path.name or path}: cannot access file ({exc})")
+                continue
+            if not path_is_file:
+                skipped_messages.append(f"{path.name or path}: file not found")
                 continue
             self._invalidate_path_caches(path)
             try:
                 precomputed_bundle = self._load_precomputed_gradient_bundle(path)
             except Exception as exc:
-                self.statusBar().showMessage(
-                    f"Failed to load precomputed gradients from {path.name}: {exc}"
-                )
+                skipped_messages.append(f"{path.name}: failed to load gradients ({exc})")
                 continue
             if precomputed_bundle is not None:
                 loaded_precomputed_bundle = precomputed_bundle
+                added_paths.append(path)
                 continue
             entry_id = self._file_entry_id(path)
             if entry_id in self._entries:
+                added_paths.append(path)
                 continue
             _entry_id, entry = self._workspace.add_file_entry(path, label=path.name)
             self._add_workspace_list_item(entry, tooltip=path, select=False)
@@ -313,8 +323,12 @@ class WorkspaceFileController:
         if loaded_precomputed_bundle is not None:
             self._activate_precomputed_gradient_bundle(loaded_precomputed_bundle)
 
-        if not added_any and loaded_precomputed_bundle is None:
-            self.statusBar().showMessage("No valid .npz files added.")
+        if not added_paths and loaded_precomputed_bundle is None:
+            if skipped_messages:
+                self.statusBar().showMessage("; ".join(skipped_messages[-2:]))
+            else:
+                self.statusBar().showMessage("No valid .npz files added.")
+        self._update_gradients_button()
         self._sync_combine_dialog_state()
         return added_paths
 
@@ -324,12 +338,15 @@ class WorkspaceFileController:
             return
         entry_id = item.data(USER_ROLE)
         self._workspace.remove_entry(entry_id)
+        if getattr(self, "_gradient_classification_ref_entry_id", None) == entry_id:
+            self._gradient_classification_ref_entry_id = None
         row = self.file_list.row(item)
         self.file_list.takeItem(row)
         if self.file_list.count() == 0:
             self._clear_plot()
         else:
             self._update_nbs_prepare_button()
+            self._update_gradients_button()
         self._sync_combine_dialog_state()
 
     def _clear_files(self) -> None:
@@ -338,6 +355,7 @@ class WorkspaceFileController:
         self._gradient_precomputed_bundle = None
         self._gradient_precomputed_selected_row = None
         self._gradient_use_precomputed_bundle = False
+        self._gradient_classification_ref_entry_id = None
         self.file_list.clear()
         self._clear_plot()
         self._update_nbs_prepare_button()

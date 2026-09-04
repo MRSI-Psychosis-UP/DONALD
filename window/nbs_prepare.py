@@ -2,6 +2,7 @@
 """NBS preparation dialog for covariate role selection and row filtering."""
 
 import csv
+import importlib.util
 import json
 import os
 import re
@@ -256,6 +257,7 @@ class NBSPrepareDialog(QDialog):
         bids_dir_default="",
         workspace_reference_options=None,
         theme_name="Dark",
+        gradient_rgb_payload_callback=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -295,6 +297,9 @@ class NBSPrepareDialog(QDialog):
         self._results_output_dir_auto_value = ""
         self._last_results_output_dir = None
         self._workspace_reference_options = self._normalize_workspace_reference_options(workspace_reference_options)
+        self._gradient_rgb_payload_callback = (
+            gradient_rgb_payload_callback if callable(gradient_rgb_payload_callback) else None
+        )
         self._reference_workspace_combo_syncing = False
         self._reference_matrix_key_options = []
         self._reference_matrix_key_combo_syncing = False
@@ -993,11 +998,7 @@ class NBSPrepareDialog(QDialog):
         return page
 
     def _results_script_path(self):
-        wrapper = Path(__file__).resolve().parents[1] / "scripts" / "plot_nbs_control_structural_context.py"
-        if wrapper.exists():
-            return wrapper
-        fallback = Path(__file__).resolve().parents[2] / "mrsitoolbox" / "experiments" / "nbs_metsim_rc_overlap" / "plot_nbs_control_structural_context.py"
-        return fallback
+        return Path(__file__).resolve().parents[1] / "scripts" / "plot_nbs_control_structural_context.py"
 
     def _results_is_running(self):
         return (
@@ -1896,20 +1897,15 @@ class NBSPrepareDialog(QDialog):
             self._append_terminal_line(f"[NBS] BIDSDATAPATH not set; using {fallback_bids}")
         pythonpath_current = env.value("PYTHONPATH", "")
         pythonpath_parts = [p for p in pythonpath_current.split(os.pathsep) if p]
-        repo_root = str(Path(viewer_root).parent)
-        mrsitoolbox_root = str(Path(viewer_root).parent / "mrsitoolbox")
-        for candidate in (viewer_root, repo_root, mrsitoolbox_root):
+        for candidate in (viewer_root,):
             if candidate and candidate not in pythonpath_parts and Path(candidate).exists():
                 pythonpath_parts.insert(0, candidate)
         if pythonpath_parts:
             env.insert("PYTHONPATH", os.pathsep.join(pythonpath_parts))
         return env
 
-    def _covariate_balance_root(self):
-        return Path(__file__).resolve().parents[2] / "mrsitoolbox"
-
-    def _covariate_balance_script_path(self):
-        return self._covariate_balance_root() / "scripts" / "covariate_balance_love_plot.py"
+    def _covariate_balance_module(self):
+        return "mrsitoolbox.scripts.covariate_balance_love_plot"
 
     def _covariate_balance_output_dir(self, regressor_name):
         base_dir_text = self.output_dir_edit.text().strip() if hasattr(self, "output_dir_edit") else ""
@@ -1981,9 +1977,16 @@ class NBSPrepareDialog(QDialog):
             self._set_status("Covariate balance diagnostics are already running.")
             return
 
-        script_path = self._covariate_balance_script_path()
-        if not script_path.exists():
-            self._set_status(f"Covariate balance script not found: {script_path}")
+        module_name = self._covariate_balance_module()
+        try:
+            module_spec = importlib.util.find_spec(module_name)
+        except (ImportError, AttributeError, ValueError):
+            module_spec = None
+        if module_spec is None:
+            self._set_status(
+                "Covariate balance diagnostics require a newer mrsitoolbox pip package. "
+                "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+            )
             return
         try:
             input_path, output_dir, regressor_name, nuisance_terms = self._build_covariate_balance_input()
@@ -1993,7 +1996,8 @@ class NBSPrepareDialog(QDialog):
 
         python_exe = sys.executable or "python3"
         command = [
-            str(script_path),
+            "-m",
+            module_name,
             "--input",
             str(input_path),
             "--regressor",
@@ -2010,7 +2014,7 @@ class NBSPrepareDialog(QDialog):
         self._covariate_balance_process.readyReadStandardOutput.connect(self._on_covariate_balance_output)
         self._covariate_balance_process.readyReadStandardError.connect(self._on_covariate_balance_output)
         self._covariate_balance_process.finished.connect(self._on_covariate_balance_finished)
-        self._covariate_balance_process.setWorkingDirectory(str(self._covariate_balance_root()))
+        self._covariate_balance_process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
         self._covariate_balance_process.setProcessEnvironment(self._build_process_environment())
         self._append_terminal_line(f"[NBS-COVARS] Launch command: {shlex.join([python_exe] + command)}")
         self._set_status("Launching covariate balance diagnostics...")
@@ -2451,6 +2455,46 @@ class NBSPrepareDialog(QDialog):
             self._append_terminal_line(f"[NBS-EXPORT] Failed to delete {matlab_dir}: {exc}")
             return f"Could not delete {matlab_dir.name}: {exc}"
 
+    def _active_gradient_rgb_payload(self):
+        payload = None
+        if self._gradient_rgb_payload_callback is not None:
+            try:
+                payload = self._gradient_rgb_payload_callback()
+            except Exception as exc:
+                self._append_terminal_line(f"[NBS-EXPORT] Gradient RGB payload unavailable: {exc}")
+                payload = None
+        if payload is None:
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "_current_gradient_rgb_payload"):
+                try:
+                    payload = parent._current_gradient_rgb_payload()
+                except Exception:
+                    payload = None
+        if not isinstance(payload, dict) or not bool(payload.get("enabled", False)):
+            return None
+        model = payload.get("model")
+        if not isinstance(model, dict):
+            return None
+        return dict(payload)
+
+    def _write_gradient_rgb_payload_file(self, result_path):
+        payload = self._active_gradient_rgb_payload()
+        if not payload:
+            return None
+        try:
+            result = Path(str(result_path)).expanduser()
+            payload_path = result.parent / f"{result.stem}_gradient_rgb_payload.json"
+            payload["nbs_result_path"] = str(result)
+            with open(payload_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            self._append_terminal_line(
+                f"[NBS-EXPORT] Using active triangular RGB Gradient model: {payload_path}"
+            )
+            return str(payload_path)
+        except Exception as exc:
+            self._append_terminal_line(f"[NBS-EXPORT] Failed to write Gradient RGB payload: {exc}")
+            return None
+
     def _export_results(self):
         if self._process_is_running() or self._results_is_running():
             self._set_status("Wait for active processing to finish before exporting.")
@@ -2469,6 +2513,9 @@ class NBSPrepareDialog(QDialog):
 
         python_exe = sys.executable or "python3"
         command = [str(script_path), "--result", result_path]
+        gradient_payload_path = self._write_gradient_rgb_payload_file(result_path)
+        if gradient_payload_path:
+            command += ["--gradient-rgb-payload", gradient_payload_path]
         if not self.display_results_check.isChecked():
             command.append("--no-show")
         if self.display_collapse_check.isChecked():

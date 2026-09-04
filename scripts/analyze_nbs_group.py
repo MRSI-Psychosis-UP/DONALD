@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import argparse, os
+import argparse, json, os
 from os.path import isfile, join
 import numpy as np
 import pandas as pd
@@ -14,14 +14,20 @@ import matplotlib.colors as mcolors
 import matplotlib.patches as m_patches
 import matplotlib.path as m_path
 
-from tools.debug import Debug
-from tools.datautils import DataUtils
-from connectomics.nettools import NetTools
+try:
+    from mrsitoolbox.tools.debug import Debug
+    from mrsitoolbox.tools.datautils import DataUtils
+    from mrsitoolbox.connectomics.nettools import NetTools
+    from mrsitoolbox.graphplot.circular import plot_connectivity_circle
+    from mrsitoolbox.graphplot.colorbar import ColorBar
+except ImportError as exc:
+    raise ImportError(
+        "analyze_nbs_group.py requires the current mrsitoolbox pip package. "
+        "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+    ) from exc
 import matplotlib.pyplot as plt
 from rich.table import Table
 from rich.console import Console
-from graphplot.circular import plot_connectivity_circle
-from graphplot.colorbar import ColorBar
 from scipy.interpolate import make_interp_spline
 from scipy.stats import zscore
 from matplotlib.lines import Line2D
@@ -167,7 +173,7 @@ def compute_cluster_metab_deltas(
     ref_group: float,
     n_clusters: int,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Cluster cmp MS-mode values and compute metabolic profile deltas per node."""
+    """Cluster compare-group Gradient values and compute metabolic profile deltas per node."""
     cmp_values = np.asarray(cmp_values, dtype=float)
     ref_values = np.asarray(ref_values, dtype=float)
     if cmp_values.size == 0 or significant_indices.size == 0:
@@ -197,6 +203,262 @@ def compute_cluster_metab_deltas(
         ref_profile = np.nanmean(ref_subset, axis=reduce_axes)
         deltas[mask] = ref_profile - cmp_profile
     return deltas, cluster_labels
+
+
+def _load_gradient_rgb_payload(path_value):
+    if path_value is None or str(path_value).strip() == "":
+        return None
+    path = os.path.expanduser(str(path_value))
+    if not os.path.isfile(path):
+        debug.warning(f"Gradient RGB payload not found: {path}")
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        debug.warning(f"Failed to read Gradient RGB payload {path}: {exc}")
+        return None
+    if not isinstance(payload, dict) or not bool(payload.get("enabled", False)):
+        return None
+    model = payload.get("model")
+    if not isinstance(model, dict):
+        debug.warning("Gradient RGB payload is missing its fitted model.")
+        return None
+    if "vertices" not in model or "anchor_points" not in model:
+        debug.warning("Gradient RGB payload model is missing vertices/anchor points.")
+        return None
+    payload["payload_path"] = path
+    return payload
+
+
+def _lookup_token(value):
+    token = str(value).strip().lower()
+    if not token:
+        return ""
+    token = re.sub(r"\s+", " ", token)
+    return token
+
+
+def _add_lookup_token(lookup, value, index):
+    token = _lookup_token(value)
+    if token:
+        lookup.setdefault(token, int(index))
+        lookup.setdefault(re.sub(r"_(\d+)$", "", token), int(index))
+    try:
+        numeric = int(float(str(value).strip()))
+        lookup.setdefault(str(numeric), int(index))
+    except Exception:
+        pass
+
+
+def _payload_reference_coords(payload, parcel_labels, parcel_names):
+    x_values = np.asarray(payload.get("rgb_x_values", []), dtype=float).reshape(-1)
+    y_values = np.asarray(payload.get("rgb_y_values", []), dtype=float).reshape(-1)
+    if x_values.size == 0 or x_values.shape != y_values.shape:
+        return None, 0
+
+    lookup = {}
+    point_ids = list(payload.get("point_ids", []))
+    point_labels = list(payload.get("point_labels", []))
+    for idx in range(x_values.size):
+        if idx < len(point_ids):
+            _add_lookup_token(lookup, point_ids[idx], idx)
+        if idx < len(point_labels):
+            _add_lookup_token(lookup, point_labels[idx], idx)
+
+    parcel_labels = np.asarray(parcel_labels).reshape(-1)
+    parcel_names = np.asarray(parcel_names, dtype=object).reshape(-1)
+    coords = np.full((parcel_labels.size, 2), np.nan, dtype=float)
+    matched = 0
+    for out_idx, label in enumerate(parcel_labels.tolist()):
+        candidates = [label]
+        if out_idx < parcel_names.size:
+            candidates.append(parcel_names[out_idx])
+        source_idx = None
+        for candidate in candidates:
+            token = _lookup_token(candidate)
+            source_idx = lookup.get(token)
+            if source_idx is None:
+                source_idx = lookup.get(re.sub(r"_(\d+)$", "", token))
+            if source_idx is not None:
+                break
+        if source_idx is None:
+            continue
+        coords[out_idx, 0] = x_values[int(source_idx)]
+        coords[out_idx, 1] = y_values[int(source_idx)]
+        matched += 1
+    return coords, matched
+
+
+def _align_coords_to_reference(coords, reference_coords):
+    coords = np.asarray(coords, dtype=float)
+    reference_coords = np.asarray(reference_coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 2 or reference_coords.shape != coords.shape:
+        return coords, 0
+    finite_mask = np.all(np.isfinite(coords), axis=1) & np.all(np.isfinite(reference_coords), axis=1)
+    if np.count_nonzero(finite_mask) < 3:
+        return coords, int(np.count_nonzero(finite_mask))
+
+    source = coords[finite_mask]
+    target = reference_coords[finite_mask]
+    source_mean = np.nanmean(source, axis=0, keepdims=True)
+    target_mean = np.nanmean(target, axis=0, keepdims=True)
+    source_centered = source - source_mean
+    target_centered = target - target_mean
+    denom = float(np.sum(np.square(source_centered)))
+    if not np.isfinite(denom) or denom <= 1e-12:
+        return coords, int(np.count_nonzero(finite_mask))
+    try:
+        u_mat, singular_values, vt_mat = np.linalg.svd(source_centered.T @ target_centered)
+    except Exception:
+        return coords, int(np.count_nonzero(finite_mask))
+    rotation = u_mat @ vt_mat
+    scale = float(np.sum(singular_values) / denom)
+    aligned = (coords - source_mean) @ rotation * scale + target_mean
+    return np.asarray(aligned, dtype=float), int(np.count_nonzero(finite_mask))
+
+
+def _normalized_rgb_order(model, fallback="RBG"):
+    raw = str(dict(model or {}).get("order", fallback) or fallback).strip().upper()
+    order = []
+    for channel in raw:
+        if channel in {"R", "G", "B"} and channel not in order:
+            order.append(channel)
+    for channel in str(fallback or "RBG").strip().upper():
+        if channel in {"R", "G", "B"} and channel not in order:
+            order.append(channel)
+    for channel in ("R", "G", "B"):
+        if channel not in order:
+            order.append(channel)
+    return order[:3]
+
+
+def _triangle_rgb_weights_from_model(x_values, y_values, model):
+    x_valid = np.asarray(x_values, dtype=float).reshape(-1)
+    y_valid = np.asarray(y_values, dtype=float).reshape(-1)
+    weights_full = np.zeros((x_valid.shape[0], 3), dtype=float)
+    finite_mask = np.isfinite(x_valid) & np.isfinite(y_valid)
+    if not np.any(finite_mask):
+        return weights_full
+    vertices = np.asarray(model.get("vertices"), dtype=float)
+    if vertices.shape != (3, 2):
+        return weights_full
+    v0, v1, v2 = vertices
+    denom = (v1[1] - v2[1]) * (v0[0] - v2[0]) + (v2[0] - v1[0]) * (v0[1] - v2[1])
+    if np.isclose(denom, 0.0):
+        return weights_full
+    points = np.column_stack((x_valid[finite_mask], y_valid[finite_mask]))
+    w0 = (
+        (v1[1] - v2[1]) * (points[:, 0] - v2[0])
+        + (v2[0] - v1[0]) * (points[:, 1] - v2[1])
+    ) / denom
+    w1 = (
+        (v2[1] - v0[1]) * (points[:, 0] - v2[0])
+        + (v0[0] - v2[0]) * (points[:, 1] - v2[1])
+    ) / denom
+    w2 = 1.0 - w0 - w1
+    weights = np.column_stack((w0, w1, w2))
+    weights = np.clip(weights, 0.0, 1.0)
+    weight_sum = weights.sum(axis=1, keepdims=True)
+    weight_sum[weight_sum <= 0.0] = 1.0
+    weights_full[finite_mask] = weights / weight_sum
+    return weights_full
+
+
+def _square_rgb_weights_from_model(x_values, y_values, model):
+    x_valid = np.asarray(x_values, dtype=float).reshape(-1)
+    y_valid = np.asarray(y_values, dtype=float).reshape(-1)
+    weights_full = np.zeros((x_valid.shape[0], 3), dtype=float)
+    finite_mask = np.isfinite(x_valid) & np.isfinite(y_valid)
+    if not np.any(finite_mask):
+        return weights_full
+    anchors = np.asarray(model.get("anchor_points"), dtype=float)
+    if anchors.shape != (3, 2):
+        return weights_full
+    points = np.column_stack((x_valid[finite_mask], y_valid[finite_mask]))
+    distances = np.sqrt(np.sum(np.square(points[:, np.newaxis, :] - anchors[np.newaxis, :, :]), axis=2))
+    weights = 1.0 / np.maximum(distances, 1e-9)
+    close_mask = distances <= 1e-9
+    if np.any(close_mask):
+        for row_idx in np.flatnonzero(np.any(close_mask, axis=1)).tolist():
+            weights[row_idx, :] = close_mask[row_idx, :].astype(float)
+    weight_sum = weights.sum(axis=1, keepdims=True)
+    weight_sum[weight_sum <= 0.0] = 1.0
+    weights_full[finite_mask] = weights / weight_sum
+    return weights_full
+
+
+def _rgb_scalar_from_model(x_values, y_values, model, fallback_order="RBG"):
+    fit_mode = str(dict(model or {}).get("fit_mode", "triangle") or "triangle").strip().lower()
+    if fit_mode == "square":
+        weights = _square_rgb_weights_from_model(x_values, y_values, model)
+    else:
+        weights = _triangle_rgb_weights_from_model(x_values, y_values, model)
+    scalar_map = {"R": 0.0, "B": 0.5, "G": 1.0}
+    order = _normalized_rgb_order(model, fallback=fallback_order)
+    vertex_scalars = np.asarray(
+        [scalar_map.get(channel, float(idx)) for idx, channel in enumerate(order)],
+        dtype=float,
+    )
+    scalar_values = np.full(weights.shape[0], np.nan, dtype=float)
+    valid_mask = np.sum(weights, axis=1) > 0.0
+    if np.any(valid_mask):
+        scalar_values[valid_mask] = weights[valid_mask] @ vertex_scalars
+    return scalar_values
+
+
+def _gradient_pair_from_matrix(matrix):
+    matrix_arr = np.asarray(matrix, dtype=float)
+    gradient1 = nettools.dimreduce_matrix(
+        matrix_arr,
+        method="diffusion",
+        output_dim=1,
+        scale_factor=1.0,
+        norm=False,
+    )
+    gradient2 = nettools.dimreduce_matrix(
+        matrix_arr,
+        method="diffusion",
+        output_dim=2,
+        scale_factor=1.0,
+        norm=False,
+    )
+    return np.column_stack((np.asarray(gradient2, dtype=float), np.asarray(gradient1, dtype=float)))
+
+
+def _gradient_values_from_payload(matrix, payload, parcel_labels, parcel_names):
+    coords = _gradient_pair_from_matrix(matrix)
+    reference_coords, matched = _payload_reference_coords(payload, parcel_labels, parcel_names)
+    if reference_coords is not None and matched >= 3:
+        coords, aligned_count = _align_coords_to_reference(coords, reference_coords)
+        if aligned_count >= 3:
+            debug.info(f"Aligned group Gradient coordinates to triangular RGB payload ({aligned_count} nodes).")
+    else:
+        debug.warning("Gradient RGB payload did not match enough parcel labels; using unaligned group coordinates.")
+    model = dict(payload.get("model") or {})
+    fallback_order = str(payload.get("color_order", model.get("order", "RBG")) or "RBG")
+    return _rgb_scalar_from_model(coords[:, 0], coords[:, 1], model, fallback_order=fallback_order)
+
+
+def _gradient_values_from_matrix(matrix, color_order="RBG"):
+    try:
+        if hasattr(nettools, "metsim_triangle_scalar_values"):
+            return np.asarray(
+                nettools.metsim_triangle_scalar_values(
+                    matrix,
+                    color_order=color_order,
+                    x_component=2,
+                    y_component=1,
+                    scale_factor=1.0,
+                    return_details=False,
+                ),
+                dtype=float,
+            )
+    except Exception as exc:
+        debug.warning(f"Triangular RGB scalar helper failed; falling back to local model: {exc}")
+    coords = _gradient_pair_from_matrix(matrix)
+    model = nettools.triangular_rgb_model(coords[:, 0], coords[:, 1], color_order=color_order)
+    return _rgb_scalar_from_model(coords[:, 0], coords[:, 1], model, fallback_order=color_order)
 
 
 def _normalize_id(value: str) -> str:
@@ -253,9 +515,8 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument(
     "--result",
-    required=False,
+    required=True,
     help="Path to the component NPZ produced by nbs_groups.py.",
-    default="/home/flucchetti/Connectome/Dev/mrsitoolbox/results/controls_vs_patients/nbs/LPN-Project/connectome_plots/group/group-LPN-Project_parc-LFMIHIFIS_scale-3_diag-controls_perm-freedman_nperm-1024_th-3.75_reg-state_nuis-age-sex_lobes-all_comp-2_results.npz",
 )
 parser.add_argument(
     "--similarity-hubs-left",
@@ -273,7 +534,7 @@ parser.add_argument(
     "--nclusters",
     type=int,
     default=5,
-    help="Number of Gaussian clusters for MS-mode metabolic profiling.",
+    help="Number of Gaussian clusters for Gradient metabolic profiling.",
 )
 parser.add_argument(
     "--metabolite-delta-mode",
@@ -300,9 +561,16 @@ parser.add_argument(
     help="Run analysis for all subject-session pairs found in the NPZ subset.",
 )
 parser.add_argument(
+    "--align-compare-gradient",
+    action="store_true",
+    dest="align_compare_gradient",
+    help="Compatibility flag; Gradient alignment is handled by the RGB payload when available.",
+)
+parser.add_argument(
     "--align-compare-msmode",
     action="store_true",
-    help="Allow flipping the compare-group MS-mode to better align with controls.",
+    dest="align_compare_gradient",
+    help=argparse.SUPPRESS,
 )
 parser.add_argument(
     "--aggregate-deltas",
@@ -346,11 +614,24 @@ parser.add_argument(
     action="store_true",
     help="Collapse parcel names ending with _<int> into base parcels before plotting.",
 )
+parser.add_argument(
+    "--gradient-rgb-payload",
+    default=None,
+    help=(
+        "JSON payload exported by the active Gradient scatter triangular RGB view. "
+        "When present, NBS node values are scalarized from that fitted RGB model."
+    ),
+)
 
 args = parser.parse_args()
 base_plot_dir = os.path.split(args.result)[0]
 target_pairs = []
 show_figures = False
+gradient_rgb_payload = _load_gradient_rgb_payload(args.gradient_rgb_payload)
+if gradient_rgb_payload is not None:
+    fit_mode = str(gradient_rgb_payload.get("fit_mode", "triangle") or "triangle")
+    color_order = str(gradient_rgb_payload.get("color_order", "RBG") or "RBG")
+    debug.info(f"Using active Gradient RGB payload (fit={fit_mode}, order={color_order}).")
 
 if args.subject_id or args.session:
     if len(args.subject_id) != len(args.session):
@@ -644,6 +925,8 @@ if args.batch:
         ]
         if args.regressor:
             cmd.extend(["--regressor", args.regressor])
+        if args.gradient_rgb_payload:
+            cmd.extend(["--gradient-rgb-payload", args.gradient_rgb_payload])
         if args.aggregate_deltas:
             cmd.append("--aggregate-deltas")
         cmd.append("--no-show")
@@ -779,7 +1062,7 @@ for value in unique_groups:
         "sessions": stored_sessions[mask],
     }
     if group_splits[value]["mesim"].size == 0:
-        debug.warning(f"No subjects in group {value} for MS-mode/metab calculations; skipping this group.")
+        debug.warning(f"No subjects in group {value} for Gradient/metab calculations; skipping this group.")
     else:
         debug.info(
             f"Group {value}: MeSiM shape {group_splits[value]['mesim'].shape}, "
@@ -789,7 +1072,7 @@ if target_idx is not None and target_reg_value in group_splits:
     if target_reg_value == control_group_value:
         debug.info("Target pair belongs to control group; keeping control group averaged.")
     else:
-        # override compare group with only the target subject/session for MS-mode and metab profiles
+        # override compare group with only the target subject/session for Gradient and metab profiles
         group_mask = regressor_values == target_reg_value
         group_indices = np.where(group_mask)[0]
         if target_idx in group_indices:
@@ -806,7 +1089,7 @@ if target_idx is not None and target_reg_value in group_splits:
             )
 
 
-########################## MS-mode comparison between groups ##########################
+########################## Gradient comparison between groups ##########################
 if comp_mask is None:
     raise ValueError("Component mask missing from NPZ; cannot extract NBS nodes.")
 
@@ -815,45 +1098,47 @@ significant_nodes = np.where(mask_bool.sum(axis=0) > 0)[0]
 if significant_nodes.size == 0:
     debug.warning("No nodes associated with the NBS component; skipping edge plotting.")
 
-msmode_by_group: dict[float, np.ndarray] = {}
+gradient_by_group: dict[float, np.ndarray] = {}
+gradient_color_order = (
+    str(gradient_rgb_payload.get("color_order", "RBG") or "RBG")
+    if gradient_rgb_payload is not None
+    else "RBG"
+)
 for value in unique_groups:
     group_mesim = group_splits[value]["mesim"]
     if group_mesim.size == 0:
-        debug.warning(f"No subjects in group {value} for MS-mode calculation; skipping.")
+        debug.warning(f"No subjects in group {value} for Gradient calculation; skipping.")
         continue
     avg_mesim = np.nanmean(group_mesim, axis=0)
-    msmode = nettools.dimreduce_matrix(
-        avg_mesim,
-        method="diffusion",
-        output_dim=1 ,
-        perplexity=30,
-        scale_factor=-1.0,
-    )
-    msmode_by_group[value] = msmode
-    debug.warning("msmode",value,"----",msmode.min(),"-->",msmode.max())
-
-if len(msmode_by_group) >= 2:
-    group_order = [g for g in unique_groups if g in msmode_by_group]
-    aligned = nettools.align_gradients_procrustes(
-        [msmode_by_group[g] for g in group_order],
-        reference=msmode_by_group[group_order[0]],
-    )
-    for g, aligned_vec in zip(group_order, aligned):
-        msmode_by_group[g] = aligned_vec
-    debug.info("Aligned MS-mode gradients across groups using Procrustes.")
+    if gradient_rgb_payload is not None:
+        gradient_values = _gradient_values_from_payload(
+            avg_mesim,
+            gradient_rgb_payload,
+            parcel_labels,
+            parcel_names,
+        )
+    else:
+        gradient_values = _gradient_values_from_matrix(avg_mesim, color_order=gradient_color_order)
+    gradient_by_group[value] = np.asarray(gradient_values, dtype=float)
+    finite_gradient = gradient_by_group[value][np.isfinite(gradient_by_group[value])]
+    if finite_gradient.size:
+        debug.info(
+            f"Gradient {value}: {finite_gradient.min():.3f} --> {finite_gradient.max():.3f}"
+        )
+    else:
+        debug.warning(f"Gradient {value}: no finite values resolved.")
 
 
-
-if unique_groups.size >= 2 and len(msmode_by_group) >= 2 and significant_nodes.size > 0:
+if unique_groups.size >= 2 and len(gradient_by_group) >= 2 and significant_nodes.size > 0:
     ref = unique_groups[0]
     compare = unique_groups[1]
-    if ref not in msmode_by_group or compare not in msmode_by_group:
+    if ref not in gradient_by_group or compare not in gradient_by_group:
         ref_values_raw = np.array([])
         cmp_values_raw = np.array([])
-        debug.warning("One of the groups lacks MS-mode data; skipping MS-mode delta computation.")
+        debug.warning("One of the groups lacks Gradient data; skipping Gradient delta computation.")
     else:
-        ref_values_raw = msmode_by_group[ref][significant_nodes]
-        cmp_values_raw = msmode_by_group[compare][significant_nodes]
+        ref_values_raw = gradient_by_group[ref][significant_nodes]
+        cmp_values_raw = gradient_by_group[compare][significant_nodes]
 else:
     ref_values_raw = np.array([])
     cmp_values_raw = np.array([])
@@ -872,7 +1157,7 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
     cmp_values = np.array([_combine_signed(vals["cmp"]) for vals in merged_curves.values()])
     delta = cmp_values - ref_values
     debug.info(
-        f"Delta MS-mode ({compare} - {ref}) on {len(merged_labels)} merged nodes: "
+        f"Delta Gradient ({compare} - {ref}) on {len(merged_labels)} merged nodes: "
         f"min={delta.min():.3f}, max={delta.max():.3f}"
     )
     tick_labels = ["\n".join(lbl.split()) for lbl in merged_labels]
@@ -884,9 +1169,9 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
     )
     fig, ax = plt.subplots(figsize=(fig_width, 8))
     ax.plot(cmp_values, marker="o", linestyle="-", color="tab:red", label=compare_label)
-    ax.plot(ref_values, marker="o", linestyle="-", color="tab:green", label="controls")
+    ax.plot(ref_values, marker="s", linestyle="-", color="tab:green", label="controls")
     ax.axhline(0, color="black", linewidth=1)
-    ax.set_ylabel("MS-mode", fontsize=FONTSIZE)
+    ax.set_ylabel("Gradient", fontsize=FONTSIZE)
     ax.set_xlabel("NBS Nodes", fontsize=FONTSIZE)
     ax.legend(loc="best")
     ax.set_xticks(range(len(merged_labels)))
@@ -895,28 +1180,28 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
     ax.yaxis.set_major_locator(mticker.MaxNLocator(6))
     ax.grid(True, axis="y", alpha=0.3)
     plt.tight_layout()
-    table = Table(title=f"MS-mode Δ ({compare} - {ref})")
+    table = Table(title=f"Gradient Δ ({compare} - {ref})")
     table.add_column("Node Label")
-    table.add_column("Δ MS-mode", justify="right")
+    table.add_column("Δ Gradient", justify="right")
     for label, value in zip(merged_labels, delta):
         table.add_row(label, f"{value:.3f}")
     # console.print(table)
     if npz_path:
         base_name = os.path.splitext(os.path.basename(npz_path))[0]
-        data_path = os.path.join(plot_dir, f"{base_name}_msmode_values.tsv")
+        data_path = os.path.join(plot_dir, f"{base_name}_gradient_values.tsv")
         df_values = pd.DataFrame({
             "node_label": merged_labels,
-            f"MSmode_group_{compare}": cmp_values,
-            f"MSmode_group_{ref}": ref_values,
+            f"gradient_group_{compare}": cmp_values,
+            f"gradient_group_{ref}": ref_values,
             "delta": delta,
         })
         df_values.to_csv(data_path, sep="\t", index=False)
-        debug.success("Saved MS-mode table to", data_path)
+        debug.success("Saved Gradient table to", data_path)
     if npz_path:
         base_name = os.path.splitext(os.path.basename(npz_path))[0]
-        plot_path_linear = os.path.join(plot_dir, f"{base_name}_msmode_profile.pdf")
+        plot_path_linear = os.path.join(plot_dir, f"{base_name}_gradient_profile.pdf")
         plt.savefig(plot_path_linear, bbox_inches="tight", dpi=300)
-        debug.success("Saved MS-mode comparison plot to", plot_path_linear)
+        debug.success("Saved Gradient comparison plot to", plot_path_linear)
     show_figures = True
     try:
         delta_metab, cluster_ids = compute_cluster_metab_deltas(
@@ -955,24 +1240,24 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
         node_labels_full = parcel_names[significant_nodes]
         df_cluster.insert(0, "node_label", node_labels_full)
         delta_lookup = {label: val for label, val in zip(merged_labels, delta)}
-        df_cluster["delta_ms_mode"] = [
+        df_cluster["delta_gradient"] = [
             delta_lookup.get(re.sub(r"_(\d+)$", "", name), np.nan)
             for name in node_labels_full
         ]
         ref_lookup = {label: val for label, val in zip(merged_labels, ref_values)}
         cmp_lookup = {label: val for label, val in zip(merged_labels, cmp_values)}
-        df_cluster["ms_mode_ref"] = [
+        df_cluster["gradient_ref"] = [
             ref_lookup.get(re.sub(r"_(\d+)$", "", name), np.nan) for name in node_labels_full
         ]
-        df_cluster["ms_mode_cmp"] = [
+        df_cluster["gradient_cmp"] = [
             cmp_lookup.get(re.sub(r"_(\d+)$", "", name), np.nan) for name in node_labels_full
         ]
         table_clusters = Table(title=f"Metabolic Profile Δ per Node (n_clusters={args.nclusters})")
         table_clusters.add_column("Node Label")
         table_clusters.add_column("Cluster", justify="right")
-        table_clusters.add_column("Δ MS-mode", justify="right")
-        table_clusters.add_column("MS-mode (ref)", justify="right")
-        table_clusters.add_column("MS-mode (cmp)", justify="right")
+        table_clusters.add_column("Δ Gradient", justify="right")
+        table_clusters.add_column("Gradient (ref)", justify="right")
+        table_clusters.add_column("Gradient (cmp)", justify="right")
         for m in metabolite_names:
             table_clusters.add_column(f"Δ {m}{value_suffix}", justify="right")
 
@@ -991,9 +1276,9 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
             row_values = [
                 row["node_label"],
                 str(row["cluster_id"]),
-                _format_delta(row["delta_ms_mode"]),
-                f"{row['ms_mode_ref']:.4f}",
-                f"{row['ms_mode_cmp']:.4f}",
+                _format_delta(row["delta_gradient"]),
+                f"{row['gradient_ref']:.4f}",
+                f"{row['gradient_cmp']:.4f}",
             ] + [
                 _format_delta(
                     row[f"{column_prefix}{m}"], as_percent=is_percent_mode
@@ -1009,9 +1294,9 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
             debug.success("Saved metabolic profile deltas to", delta_path)
 else:
     if significant_nodes.size == 0:
-        debug.warning("No significant nodes; skipping MS-mode deltas.")
+        debug.warning("No significant nodes; skipping Gradient deltas.")
     else:
-        debug.warning("Less than two groups present; cannot compute MS-mode deltas.")
+        debug.warning("Less than two groups present; cannot compute Gradient deltas.")
 
 # Plot circular connectivity for the significant component (or empty edges)
 if t_mat is not None and comp_mask is not None:
@@ -1032,8 +1317,8 @@ if t_mat is not None and comp_mask is not None:
         vmax = 1.0
     order_group = unique_groups[0]
     plot_group = unique_groups[1] if unique_groups.size > 1 else unique_groups[0]
-    node_values_plot = msmode_by_group[plot_group]
-    node_values_order = msmode_by_group[order_group]
+    node_values_plot = gradient_by_group[plot_group]
+    node_values_order = gradient_by_group[order_group]
     if args.collapse_parcels:
         collapse_nodes = (
             significant_nodes if has_edges else np.arange(len(parcel_names))
@@ -1215,7 +1500,7 @@ if t_mat is not None and comp_mask is not None:
     sm_nodes = plt.cm.ScalarMappable(cmap=cmap_nodes, norm=norm_nodes)
     sm_nodes.set_array([])
     cb_nodes = fig_circle.colorbar(sm_nodes, ax=ax_circle, fraction=0.046, pad=0.16)
-    cb_nodes.set_label("MS Mode", fontsize=FONTSIZE, color=label_color)
+    cb_nodes.set_label("Gradient", fontsize=FONTSIZE, color=label_color)
     cb_nodes.ax.yaxis.set_tick_params(labelsize=FONTSIZE - 4, color=label_color)
     plt.setp(plt.getp(cb_nodes.ax.axes, "yticklabels"), color=label_color)
     if npz_path:

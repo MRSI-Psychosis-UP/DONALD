@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import contextlib
+import importlib.resources as importlib_resources
 import importlib.util
 import os
 import re
@@ -12,10 +13,6 @@ import traceback
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_MRSI_TOOLBOX_ROOT = _REPO_ROOT / "mrsitoolbox"
-for _path_entry in (str(_REPO_ROOT), str(_MRSI_TOOLBOX_ROOT)):
-    if _path_entry not in sys.path:
-        sys.path.insert(0, _path_entry)
 
 try:
     import pandas as pd
@@ -383,14 +380,15 @@ def _modalities_from_paths(paths):
 
 
 def _default_parcellation_dir() -> Path:
-    candidates = (
-        _REPO_ROOT / "mrsi_viewer" / "data" / "atlas",
-        _REPO_ROOT / "mrsitoolbox_demo" / "data" / "atlas",
-        _REPO_ROOT / "mrsitoolbox" / "data" / "atlas",
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+    viewer_atlas = _REPO_ROOT / "mrsi_viewer" / "data" / "atlas"
+    if viewer_atlas.exists():
+        return viewer_atlas
+    try:
+        toolbox_atlas = importlib_resources.files("mrsitoolbox").joinpath("data", "atlas")
+        if toolbox_atlas.is_dir():
+            return Path(str(toolbox_atlas))
+    except Exception:
+        pass
     return Path.home()
 
 

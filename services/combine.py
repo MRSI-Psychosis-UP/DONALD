@@ -29,11 +29,36 @@ class CombineCorrelationStats:
     intercept: float
 
 
+@dataclass
+class CombineResidualizationStats:
+    residual_matrix: np.ndarray
+    first_values: np.ndarray
+    second_values: np.ndarray
+    mode_text: str
+    slope: float
+    intercept: float
+
+
+@dataclass
+class CombineSpatialCorrectionStats:
+    residual_matrix: np.ndarray
+    distance_matrix: np.ndarray
+    parcel_coordinates: np.ndarray
+    parcel_labels: np.ndarray
+    first_values: np.ndarray
+    distance_values: np.ndarray
+    mode_text: str
+    slope: float
+    intercept: float
+
+
 def combine_operation_label(operation: str) -> str:
     mapping = {
         "add": "Addition",
         "subtract": "Subtraction",
         "intersect": "Intersect",
+        "correct": "Correction",
+        "spatial_correction": "Spatial Correction",
         "correlation": "Correlation",
         "elementwise_product": "Elementwise Product",
         "matmul": "Matrix Multiplication",
@@ -46,6 +71,8 @@ def combine_operation_symbol(operation: str) -> str:
         "add": "+",
         "subtract": "-",
         "intersect": "intersect",
+        "correct": "corrected_by",
+        "spatial_correction": "spatial_corrected",
         "correlation": "corr",
         "elementwise_product": "*",
         "matmul": "@",
@@ -175,7 +202,7 @@ def apply_matrix_operation(first_matrix, second_matrix, operation):
     first_matrix = np.asarray(first_matrix, dtype=float)
     second_matrix = np.asarray(second_matrix, dtype=float)
 
-    if operation_name in {"add", "subtract", "elementwise_product", "correlation", "intersect"}:
+    if operation_name in {"add", "subtract", "elementwise_product", "correlation", "intersect", "correct"}:
         if first_matrix.shape != second_matrix.shape:
             raise ValueError(
                 f"{combine_operation_label(operation)} requires matching shapes, "
@@ -188,6 +215,10 @@ def apply_matrix_operation(first_matrix, second_matrix, operation):
         return first_matrix - second_matrix
     if operation_name == "intersect":
         return np.array(first_matrix, copy=True)
+    if operation_name == "correct":
+        return residualize_matrix(first_matrix, second_matrix).residual_matrix
+    if operation_name == "spatial_correction":
+        raise ValueError("Spatial correction requires parcellation data; use spatially_residualize_matrix.")
     if operation_name == "elementwise_product":
         return first_matrix * second_matrix
     if operation_name == "matmul":
@@ -232,6 +263,130 @@ def correlation_vectors(first_matrix, second_matrix):
     if np.allclose(first_values, first_values[0]) or np.allclose(second_values, second_values[0]):
         raise ValueError("Correlation requires both matrices to have varying values.")
     return first_values, second_values, mode_text
+
+
+def residualize_matrix(first_matrix, second_matrix) -> CombineResidualizationStats:
+    first_matrix = np.asarray(first_matrix, dtype=float)
+    second_matrix = np.asarray(second_matrix, dtype=float)
+    if first_matrix.shape != second_matrix.shape:
+        raise ValueError(
+            f"Correction requires matching shapes, got {first_matrix.shape} and {second_matrix.shape}."
+        )
+
+    square_matrix = (
+        first_matrix.ndim == 2
+        and second_matrix.ndim == 2
+        and first_matrix.shape[0] == first_matrix.shape[1]
+        and second_matrix.shape[0] == second_matrix.shape[1]
+    )
+    if square_matrix:
+        fit_indices = np.triu_indices_from(first_matrix, k=1)
+        first_values = np.asarray(first_matrix[fit_indices], dtype=float)
+        second_values = np.asarray(second_matrix[fit_indices], dtype=float)
+        mode_text = "upper triangle excluding diagonal"
+    else:
+        first_values = np.asarray(first_matrix, dtype=float).reshape(-1)
+        second_values = np.asarray(second_matrix, dtype=float).reshape(-1)
+        mode_text = "flattened values"
+
+    finite_fit = np.isfinite(first_values) & np.isfinite(second_values)
+    first_fit = first_values[finite_fit]
+    second_fit = second_values[finite_fit]
+    if first_fit.size < 2:
+        raise ValueError("Correction needs at least two finite paired values.")
+    if np.allclose(second_fit, second_fit[0]):
+        raise ValueError("Correction requires Matrix B to have varying values.")
+
+    design = np.column_stack([np.ones(second_fit.size, dtype=float), second_fit])
+    intercept, slope = np.linalg.lstsq(design, first_fit, rcond=None)[0]
+    intercept = float(intercept)
+    slope = float(slope)
+
+    residual_matrix = np.full(first_matrix.shape, np.nan, dtype=float)
+    finite_all = np.isfinite(first_matrix) & np.isfinite(second_matrix)
+    residual_matrix[finite_all] = first_matrix[finite_all] - (
+        intercept + slope * second_matrix[finite_all]
+    )
+    if square_matrix:
+        np.fill_diagonal(residual_matrix, 0.0)
+
+    return CombineResidualizationStats(
+        residual_matrix=residual_matrix,
+        first_values=first_fit,
+        second_values=second_fit,
+        mode_text=mode_text,
+        slope=slope,
+        intercept=intercept,
+    )
+
+
+def parcellation_centroids(parcellation_data, parcel_labels, affine=None):
+    parcellation_data = np.asarray(parcellation_data)
+    if parcellation_data.ndim != 3:
+        raise ValueError("Parcellation data must be a 3D image.")
+
+    labels = np.asarray(parcel_labels).reshape(-1)
+    if labels.size == 0:
+        raise ValueError("No parcel labels are available for spatial correction.")
+    try:
+        labels = np.asarray([int(label) for label in labels.tolist()], dtype=int)
+    except Exception as exc:
+        raise ValueError("Parcel labels must be integer-valued for spatial correction.") from exc
+    if len(set(labels.tolist())) != labels.size:
+        raise ValueError("Parcel labels must be unique for spatial correction.")
+
+    affine_matrix = np.eye(4, dtype=float) if affine is None else np.asarray(affine, dtype=float)
+    if affine_matrix.shape != (4, 4):
+        raise ValueError("Parcellation affine must have shape (4, 4).")
+
+    coordinates = np.zeros((labels.size, 3), dtype=float)
+    for idx, label in enumerate(labels):
+        voxels = np.argwhere(parcellation_data == int(label))
+        if voxels.size == 0:
+            raise ValueError(f"Parcel label {int(label)} was not found in the parcellation image.")
+        voxel_center = np.mean(voxels.astype(float), axis=0)
+        world = affine_matrix @ np.array(
+            [voxel_center[0], voxel_center[1], voxel_center[2], 1.0],
+            dtype=float,
+        )
+        coordinates[idx, :] = world[:3]
+    return coordinates, labels
+
+
+def pairwise_distance_matrix(coordinates):
+    coordinates = np.asarray(coordinates, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 3:
+        raise ValueError("Parcel coordinates must have shape (n_parcels, 3).")
+    deltas = coordinates[:, np.newaxis, :] - coordinates[np.newaxis, :, :]
+    distances = np.sqrt(np.sum(deltas * deltas, axis=2))
+    np.fill_diagonal(distances, 0.0)
+    return distances
+
+
+def spatially_residualize_matrix(matrix, parcellation_data, parcel_labels, affine=None) -> CombineSpatialCorrectionStats:
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("Spatial correction requires a square matrix.")
+
+    coordinates, labels = parcellation_centroids(parcellation_data, parcel_labels, affine=affine)
+    if coordinates.shape[0] != matrix.shape[0]:
+        raise ValueError(
+            f"Spatial correction needs one parcel coordinate per matrix node, got "
+            f"{coordinates.shape[0]} coordinates for matrix shape {matrix.shape}."
+        )
+    distance_matrix = pairwise_distance_matrix(coordinates)
+    residual_stats = residualize_matrix(matrix, distance_matrix)
+    return CombineSpatialCorrectionStats(
+        residual_matrix=residual_stats.residual_matrix,
+        distance_matrix=distance_matrix,
+        parcel_coordinates=coordinates,
+        parcel_labels=labels,
+        first_values=residual_stats.first_values,
+        distance_values=residual_stats.second_values,
+        mode_text=residual_stats.mode_text,
+        slope=residual_stats.slope,
+        intercept=residual_stats.intercept,
+    )
 
 
 def compute_correlation_stats(first_values, second_values, mode_text: str) -> CombineCorrelationStats:
