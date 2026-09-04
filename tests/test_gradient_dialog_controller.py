@@ -207,6 +207,92 @@ class GradientDialogControllerTests(unittest.TestCase):
         self.assertIn('QCheckBox("Preload matching saved path")', ui_source)
         self.assertIn("self._refresh_action_state()", setter_source)
 
+    def test_project_paths_callback_receives_selected_path_only(self):
+        dialog = GradientScatterDialog.__new__(GradientScatterDialog)
+        captured = []
+        dialog._project_paths_callback = captured.append
+        dialog._project_paths_payload = {
+            "show_all_ordered_paths": True,
+            "optimal_full_path": [0, 1],
+            "group_paths": [
+                {
+                    "group": "lh",
+                    "all_full_paths": [[0, 1], [0, 2, 1]],
+                    "ctx_path_energies": [0.1, 0.9],
+                    "selected_ctx_path_index": 1,
+                    "selected_ctx_path": [0, 2, 1],
+                    "selected_ctx_path_energy": 0.9,
+                    "optimal_full_path": [0, 1],
+                    "ctx_optimal_path_energy": 0.1,
+                    "subc_optimal_path": [],
+                }
+            ],
+        }
+
+        dialog._on_project_paths_clicked()
+
+        self.assertEqual(len(captured), 1)
+        payload = captured[0]
+        self.assertFalse(payload["show_all_ordered_paths"])
+        self.assertEqual(payload["optimal_full_path"], [0, 2, 1])
+        self.assertEqual(payload["group_paths"][0]["selected_ctx_path"], [0, 2, 1])
+        self.assertEqual(payload["group_paths"][0]["optimal_full_path"], [0, 2, 1])
+        self.assertEqual(payload["group_paths"][0]["all_full_paths"], [[0, 2, 1]])
+        self.assertEqual(payload["group_paths"][0]["ctx_path_energies"], [0.9])
+        self.assertTrue(dialog._project_paths_payload["show_all_ordered_paths"])
+        self.assertEqual(
+            dialog._project_paths_payload["group_paths"][0]["all_full_paths"],
+            [[0, 1], [0, 2, 1]],
+        )
+
+    def test_path_combo_selection_disables_all_path_overlay(self):
+        class _ComboStub:
+            def currentData(self):
+                return 1
+
+        class _CheckStub:
+            def __init__(self):
+                self.checked = True
+
+            def blockSignals(self, _blocked):
+                return None
+
+            def setChecked(self, checked):
+                self.checked = bool(checked)
+
+        dialog = GradientScatterDialog.__new__(GradientScatterDialog)
+        group_payload = {
+            "group": "lh",
+            "all_full_paths": [[0, 1], [0, 2, 1]],
+            "ctx_path_energies": [0.1, 0.9],
+            "selected_ctx_path_index": 0,
+            "selected_ctx_path": [0, 1],
+            "selected_ctx_path_energy": 0.1,
+            "optimal_full_path": [0, 1],
+            "ctx_optimal_path_energy": 0.1,
+        }
+        dialog._project_paths_payload = {
+            "show_all_ordered_paths": True,
+            "group_paths": [group_payload],
+        }
+        dialog._selected_ctx_path_indices = {"lh": 0, "rh": 0, "all": 0}
+        dialog._show_all_ordered_paths = True
+        dialog.all_paths_check = _CheckStub()
+        dialog._path_selection_combo_for_group = lambda _group_name: _ComboStub()
+        dialog._group_payload_for_name = lambda _group_name: group_payload
+        dialog._sync_proximity_controls = lambda: None
+        render_calls = []
+        dialog._render = lambda **kwargs: render_calls.append(dict(kwargs))
+
+        dialog._on_ctx_path_selection_changed("lh")
+
+        self.assertFalse(dialog._show_all_ordered_paths)
+        self.assertFalse(dialog.all_paths_check.checked)
+        self.assertFalse(dialog._project_paths_payload["show_all_ordered_paths"])
+        self.assertEqual(group_payload["selected_ctx_path_index"], 1)
+        self.assertEqual(group_payload["selected_ctx_path"], [0, 2, 1])
+        self.assertEqual(render_calls, [{"preserve_view": True}])
+
     def test_sync_gradients_dialog_state_reuses_precomputed_dialog_rows(self):
         source = textwrap.dedent(inspect.getsource(GradientDialogController._sync_gradients_dialog_state))
         self.assertIn("dialog_covars_rows", source)

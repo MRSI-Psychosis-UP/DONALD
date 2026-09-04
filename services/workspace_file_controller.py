@@ -45,6 +45,9 @@ class WorkspaceFileController:
         '_open_files',
         '_batch_connectivity_paths',
         '_open_batch_import_dialog',
+        '_metabolic_profile_paths',
+        '_open_compute_connectivity_dialog',
+        '_open_connectivity_compute_folder',
         '_open_batch_folder',
         '_add_files',
         '_remove_selected',
@@ -218,10 +221,81 @@ class WorkspaceFileController:
             return candidates
         return sorted(candidates, key=lambda path: str(path.relative_to(folder_path)).lower())
 
+    def _metabolic_profile_paths(self, folder_path: Path):
+        """MRSIPrep metabolic-profile npz files under a dropped folder.
+
+        Kept separate from _batch_connectivity_paths because the two feed
+        different dialogs: profiles are an input to be computed from, matrices
+        are ready to import.
+        """
+        try:
+            from services.connectivity_compute import find_profile_files
+        except Exception:
+            from mrsi_viewer.services.connectivity_compute import find_profile_files
+        try:
+            return find_profile_files(Path(folder_path))
+        except Exception:
+            return []
+
+    def _open_connectivity_compute_folder(self) -> None:
+        """Folder chooser behind the Connectivity button and menu entry."""
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select folder with MRSIPrep metabolic profiles",
+            str(self._default_open_dir()),
+        )
+        if not selected_dir:
+            return
+        self._open_compute_connectivity_dialog(Path(selected_dir))
+
+    def _open_compute_connectivity_dialog(self, folder_path: Path, candidate_paths=None):
+        folder_path = Path(folder_path)
+        candidate_paths = list(candidate_paths or self._metabolic_profile_paths(folder_path))
+        if not candidate_paths:
+            # Reached directly from the Connectivity button, so say what was
+            # looked for rather than failing silently the way the drop-through
+            # path can afford to.
+            self.statusBar().showMessage(
+                f"No metabolic profiles found in {folder_path.name}."
+            )
+            QMessageBox.information(
+                self,
+                "No Metabolic Profiles",
+                (
+                    "No files matching *_desc-metabolicprofiles_mrsi.npz were found in:\n"
+                    f"{folder_path}\n\n"
+                    "Subfolders were scanned recursively. These are written by MRSIPrep "
+                    "alongside the connectivity matrices; a folder holding only matrices "
+                    "has nothing to compute from."
+                ),
+            )
+            return []
+        try:
+            from window.compute_connectivity import ComputeConnectivityDialog
+        except Exception:
+            from mrsi_viewer.window.compute_connectivity import ComputeConnectivityDialog
+
+        dialog = ComputeConnectivityDialog(folder_path, candidate_paths, parent=self)
+        if dialog.exec() != _dialog_accepted_code():
+            return []
+        written = dialog.output_paths()
+        if not written:
+            return []
+        added = self._add_files([str(path) for path in written])
+        self.statusBar().showMessage(
+            f"Computed {len(written)} connectivity matrices from {folder_path.name}; added {len(added)}."
+        )
+        return added
+
     def _open_batch_import_dialog(self, folder_path: Path):
         folder_path = Path(folder_path)
         candidate_paths = self._batch_connectivity_paths(folder_path)
         if not candidate_paths:
+            # No ready-made matrices, but the folder may hold the profiles they
+            # are computed from -- offer to compute rather than dead-ending.
+            profile_paths = self._metabolic_profile_paths(folder_path)
+            if profile_paths:
+                return self._open_compute_connectivity_dialog(folder_path, profile_paths)
             self.statusBar().showMessage(
                 f"No .npz files containing 'connectivity' found in {folder_path.name} or its subfolders."
             )

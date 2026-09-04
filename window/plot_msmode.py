@@ -175,9 +175,23 @@ class RostrocaudalStatsRunDialog(QDialog):
         self.overwrite_check = QCheckBox("Overwrite existing stats")
         self.overwrite_check.setChecked(True)
 
+        self.endpoint_neighbor_check = QCheckBox("Also run endpoint-neighbor nulls")
+        self.endpoint_neighbor_check.setChecked(True)
+
+        self.endpoint_neighbor_groups_edit = QLineEdit("lh,rh")
+        self.endpoint_neighbor_groups_edit.setToolTip("Groups passed to endpoint_neighbor_free_energy_nulls.py with --groups.")
+
+        self.endpoint_neighbor_n_proc_spin = QSpinBox()
+        self.endpoint_neighbor_n_proc_spin.setRange(1, max_workers)
+        self.endpoint_neighbor_n_proc_spin.setValue(min(32, max_workers))
+
+        self.endpoint_neighbor_shortest_only_check = QCheckBox("Shortest only")
+        self.endpoint_neighbor_shortest_only_check.setChecked(False)
+        self.endpoint_neighbor_shortest_only_check.setToolTip("Fastest endpoint-neighbor null mode; skips simple-path enumeration.")
+
         self.command_preview = QLineEdit()
         self.command_preview.setReadOnly(True)
-        self.command_preview.setToolTip("Command that will be launched from the mrsitoolbox folder.")
+        self.command_preview.setToolTip("Command(s) that will be launched from the mrsitoolbox folder.")
 
         run_button = QPushButton("Run")
         run_button.clicked.connect(self.accept)
@@ -209,6 +223,14 @@ class RostrocaudalStatsRunDialog(QDialog):
         form.addRow("Subject workers", self.n_proc_spin)
         form.addRow("Null workers", self.null_n_proc_spin)
         form.addRow("", self.overwrite_check)
+        form.addRow("", self.endpoint_neighbor_check)
+        endpoint_row = QHBoxLayout()
+        endpoint_row.addWidget(QLabel("Groups"))
+        endpoint_row.addWidget(self.endpoint_neighbor_groups_edit, 1)
+        endpoint_row.addWidget(QLabel("Workers"))
+        endpoint_row.addWidget(self.endpoint_neighbor_n_proc_spin, 0)
+        endpoint_row.addWidget(self.endpoint_neighbor_shortest_only_check, 0)
+        form.addRow("Endpoint nulls", endpoint_row)
         form.addRow("Command", self.command_preview)
 
         buttons = QHBoxLayout()
@@ -230,6 +252,10 @@ class RostrocaudalStatsRunDialog(QDialog):
         self.n_proc_spin.valueChanged.connect(lambda _value: self._update_command_preview())
         self.null_n_proc_spin.valueChanged.connect(lambda _value: self._update_command_preview())
         self.overwrite_check.toggled.connect(lambda _checked: self._update_command_preview())
+        self.endpoint_neighbor_check.toggled.connect(lambda _checked: self._update_command_preview())
+        self.endpoint_neighbor_groups_edit.textChanged.connect(lambda _text: self._update_command_preview())
+        self.endpoint_neighbor_n_proc_spin.valueChanged.connect(lambda _value: self._update_command_preview())
+        self.endpoint_neighbor_shortest_only_check.toggled.connect(lambda _checked: self._update_command_preview())
 
         self.setMinimumWidth(760)
         _theme, style = _dialog_theme_stylesheet(theme_name)
@@ -279,14 +305,39 @@ class RostrocaudalStatsRunDialog(QDialog):
         ]
         if self.overwrite_check.isChecked():
             argv.append("--overwrite")
+        if self.endpoint_neighbor_shortest_only_check.isChecked():
+            argv.append("--shortest-only")
         return argv
 
     def command_text(self):
-        return shlex.join(self.command_argv())
+        commands = [shlex.join(self.command_argv())]
+        if self.endpoint_neighbor_check.isChecked():
+            commands.append(shlex.join(self.endpoint_neighbor_command_argv()))
+        return " && ".join(commands)
+
+    def endpoint_neighbor_command_argv(self):
+        script_path = self._mrsitoolbox_root / "experiments" / "gradient_analysis" / "endpoint_neighbor_free_energy_nulls.py"
+        argv = [
+            "python3",
+            str(script_path),
+            "-i",
+            str(self._output_path),
+            "--groups",
+            self.endpoint_neighbor_groups_edit.text().strip() or "lh,rh",
+            "--nproc",
+            str(int(self.endpoint_neighbor_n_proc_spin.value())),
+        ]
+        if self.overwrite_check.isChecked():
+            argv.append("--overwrite")
+        return argv
 
     def values(self):
+        argvs = [self.command_argv()]
+        if self.endpoint_neighbor_check.isChecked():
+            argvs.append(self.endpoint_neighbor_command_argv())
         return {
             "argv": self.command_argv(),
+            "argvs": argvs,
             "cwd": self._mrsitoolbox_root,
         }
 
@@ -305,6 +356,9 @@ class RostrocaudalStatsRunDialog(QDialog):
         if not self._output_path.is_file():
             warn(f"Rostrocaudal null test not launched: saved path NPZ does not exist: {self._output_path}")
             return
+        if self.endpoint_neighbor_check.isChecked() and not self.endpoint_neighbor_groups_edit.text().strip():
+            warn("Endpoint-neighbor null test not launched: groups cannot be empty.")
+            return
         super().accept()
 
 
@@ -315,6 +369,7 @@ class RostrocaudalStatsProgressDialog(QDialog):
         self,
         *,
         argv,
+        argvs=None,
         cwd,
         subject_id,
         session_id,
@@ -322,13 +377,17 @@ class RostrocaudalStatsProgressDialog(QDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self._argv = list(argv or [])
+        self._commands = [list(command or []) for command in list(argvs or []) if command]
+        if not self._commands:
+            self._commands = [list(argv or [])]
+        self._argv = list(self._commands[0] if self._commands else [])
         self._cwd = Path(cwd).expanduser()
         self._subject_id = str(subject_id or "").strip()
         self._session_id = str(session_id or "").strip()
         self._process = None
         self._line_buffer = ""
         self._running = False
+        self._command_index = -1
         self._models = self._models_from_argv(self._argv)
         self._n_perm = self._n_perm_from_argv(self._argv)
         self._model_offsets = {model: idx * self._n_perm for idx, model in enumerate(self._models)}
@@ -395,9 +454,48 @@ class RostrocaudalStatsProgressDialog(QDialog):
         )
 
     def start(self):
-        if len(self._argv) < 1:
+        if not self._commands or len(self._commands[0]) < 1:
             self.status_label.setText("No command to run.")
             return
+        self._command_index = -1
+        self._start_next_command()
+
+    def _is_rostrocaudal_command(self, argv):
+        return any("test_rostrocaudal_gradient.py" in str(part) for part in list(argv or []))
+
+    def _prepare_progress_for_command(self):
+        if self._is_rostrocaudal_command(self._argv):
+            self._models = self._models_from_argv(self._argv)
+            self._n_perm = self._n_perm_from_argv(self._argv)
+            self._model_offsets = {model: idx * self._n_perm for idx, model in enumerate(self._models)}
+            self._total_progress = max(1, self._n_perm * max(1, len(self._models)))
+            self.progress_bar.setRange(0, self._total_progress)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("%p%")
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("Running")
+
+    def _start_next_command(self):
+        self._command_index += 1
+        if self._command_index >= len(self._commands):
+            self._running = False
+            if self.progress_bar.minimum() == 0 and self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(self.progress_bar.maximum())
+            self.progress_bar.setFormat("%p%")
+            self.status_label.setText(
+                f"Finished sub-{self._subject_id}_ses-{self._session_id}"
+            )
+            self.cancel_button.setText("Close")
+            return
+
+        self._argv = list(self._commands[self._command_index])
+        if len(self._argv) < 1:
+            self._start_next_command()
+            return
+        self._line_buffer = ""
+        self._prepare_progress_for_command()
         self._process = QProcess(self)
         self._process.setWorkingDirectory(str(self._cwd))
         self._process.setProcessChannelMode(self._merged_channel_mode())
@@ -405,7 +503,9 @@ class RostrocaudalStatsProgressDialog(QDialog):
         self._process.finished.connect(self._on_finished)
         self._process.errorOccurred.connect(self._on_error)
         self._running = True
-        self.status_label.setText(f"Running sub-{self._subject_id}_ses-{self._session_id}")
+        command_count = len(self._commands)
+        prefix = f" [{self._command_index + 1}/{command_count}]" if command_count > 1 else ""
+        self.status_label.setText(f"Running{prefix} sub-{self._subject_id}_ses-{self._session_id}")
         self._append_output("$ " + shlex.join(self._argv))
         self._process.start(str(self._argv[0]), [str(value) for value in self._argv[1:]])
 
@@ -479,22 +579,27 @@ class RostrocaudalStatsProgressDialog(QDialog):
         self._running = False
         exit_code = int(exit_code)
         if exit_code == 0:
+            self._process = None
+            if self._command_index + 1 < len(self._commands):
+                self._start_next_command()
+                return
+            if self.progress_bar.minimum() == 0 and self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(self.progress_bar.maximum())
-            self.status_label.setText(
-                f"Finished sub-{self._subject_id}_ses-{self._session_id}"
-            )
+            self.progress_bar.setFormat("%p%")
+            self.status_label.setText(f"Finished sub-{self._subject_id}_ses-{self._session_id}")
         else:
             self.status_label.setText(
-                f"Rostrocaudal null test exited with code {exit_code}"
+                f"Null test command exited with code {exit_code}"
             )
         self.cancel_button.setText("Close")
 
     def _on_error(self, error):
-        self.status_label.setText(f"Rostrocaudal null test process error: {error}")
+        self.status_label.setText(f"Null test process error: {error}")
 
     def _on_cancel_clicked(self):
         if self._running and self._process is not None:
-            self.status_label.setText("Stopping rostrocaudal null test...")
+            self.status_label.setText("Stopping null test...")
             self._process.terminate()
             return
         self.close()
@@ -2828,6 +2933,13 @@ class GradientScatterDialog(QDialog):
         if not isinstance(group_payload, dict):
             return
         self._apply_selected_ctx_path_to_group(group_payload, selected_index)
+        if self._show_all_ordered_paths:
+            self._show_all_ordered_paths = False
+            if hasattr(self, "all_paths_check"):
+                self.all_paths_check.blockSignals(True)
+                self.all_paths_check.setChecked(False)
+                self.all_paths_check.blockSignals(False)
+            self._project_paths_payload["show_all_ordered_paths"] = False
         self._sync_proximity_controls()
         self._render(preserve_view=True)
 
@@ -5871,17 +5983,107 @@ class GradientScatterDialog(QDialog):
     def _on_project_paths_clicked(self):
         if self._project_paths_callback is None or not isinstance(self._project_paths_payload, dict):
             return
+        payload = self._selected_only_project_paths_payload()
         has_projectable_path = False
-        for group_payload in list(self._project_paths_payload.get("group_paths", [])):
+        for group_payload in list(payload.get("group_paths", [])):
             if len(self._selected_ctx_path_nodes(group_payload)) >= 2:
                 has_projectable_path = True
                 break
             if len(list(group_payload.get("subc_optimal_path", []))) >= 2:
                 has_projectable_path = True
                 break
-        if not has_projectable_path and len(list(self._project_paths_payload.get("optimal_full_path", []))) < 2:
+        if not has_projectable_path and len(list(payload.get("optimal_full_path", []))) < 2:
             return
-        self._project_paths_callback(dict(self._project_paths_payload))
+        self._project_paths_callback(payload)
+
+    def _on_screenshot_paths_clicked(self):
+        if self._project_paths_callback is None or not isinstance(self._project_paths_payload, dict):
+            return
+        payload = self._selected_only_project_paths_payload()
+        payload["glassbrain_screenshot"] = True
+        self._project_paths_callback(payload)
+
+    def _selected_only_project_paths_payload(self):
+        payload = dict(self._project_paths_payload or {})
+        payload["show_all_ordered_paths"] = False
+        selected_paths = []
+        first_selected_ctx_path = None
+
+        def _finite_energy_or_nan(value):
+            try:
+                energy = float(value)
+            except Exception:
+                return float("nan")
+            return energy if np.isfinite(energy) else float("nan")
+
+        for group_payload in list(payload.get("group_paths", [])):
+            if not isinstance(group_payload, dict):
+                continue
+            group_copy = dict(group_payload)
+            selected_path = self._selected_ctx_path_nodes(group_copy)
+            subc_path = [int(node) for node in list(group_copy.get("subc_optimal_path", []))]
+            if len(selected_path) >= 2:
+                selected_path = [int(node) for node in selected_path]
+                selected_energy = self._selected_ctx_path_energy(group_copy)
+                group_copy["selected_ctx_path"] = list(selected_path)
+                group_copy["optimal_full_path"] = list(selected_path)
+                group_copy["all_full_paths"] = [list(selected_path)]
+                group_copy["ctx_path_energies"] = [_finite_energy_or_nan(selected_energy)]
+                group_copy["selected_ctx_path_energy"] = selected_energy
+                group_copy["full_path_count"] = 1
+                group_copy["ctx_path_count"] = 1
+                if first_selected_ctx_path is None:
+                    first_selected_ctx_path = list(selected_path)
+            if len(subc_path) >= 2:
+                subc_energy = group_copy.get("subc_optimal_path_energy")
+                group_copy["subc_paths"] = [list(subc_path)]
+                group_copy["subc_path_energies"] = [_finite_energy_or_nan(subc_energy)]
+                group_copy["subc_path_count"] = 1
+            else:
+                group_copy["subc_paths"] = []
+                group_copy["subc_path_energies"] = []
+                group_copy["subc_path_count"] = 0
+            if len(selected_path) >= 2 or len(subc_path) >= 2:
+                selected_paths.append(group_copy)
+        payload["group_paths"] = selected_paths
+        payload["optimal_full_path"] = (
+            list(first_selected_ctx_path)
+            if first_selected_ctx_path is not None
+            else list(payload.get("optimal_full_path", []))
+        )
+        return payload
+
+    @staticmethod
+    def _normalize_fibrenet_layout(value):
+        text = str(value or "diffusion").strip().lower()
+        if text in {"spiral", "path_spiral", "sequence", "sequence_spiral"}:
+            return "spiral"
+        return "diffusion"
+
+    def _selected_fibrenet_layout(self):
+        combo = getattr(self, "fibrenet_layout_combo", None)
+        if combo is not None:
+            try:
+                self._fibrenet_layout = self._normalize_fibrenet_layout(combo.currentData())
+            except Exception:
+                pass
+        self._fibrenet_layout = self._normalize_fibrenet_layout(
+            getattr(self, "_fibrenet_layout", "diffusion")
+        )
+        return self._fibrenet_layout
+
+    def _on_fibrenet_layout_changed(self, _index):
+        layout = self._selected_fibrenet_layout()
+        if isinstance(self._project_paths_payload, dict):
+            self._project_paths_payload["fibrenet_layout"] = layout
+
+    def _on_fibrenet_paths_clicked(self):
+        if self._project_paths_callback is None or not isinstance(self._project_paths_payload, dict):
+            return
+        payload = dict(self._project_paths_payload)
+        payload["fibrenet_projection"] = True
+        payload["fibrenet_layout"] = self._selected_fibrenet_layout()
+        self._project_paths_callback(payload)
 
     def _on_screenshot_paths_clicked(self):
         if self._project_paths_callback is None or not isinstance(self._project_paths_payload, dict):
@@ -6979,9 +7181,11 @@ class GradientScatterDialog(QDialog):
 
         values = dialog.values()
         argv = list(values.get("argv", []))
+        argvs = [list(command or []) for command in list(values.get("argvs", [])) if command]
         cwd = Path(values.get("cwd", _mrsitoolbox_root())).expanduser()
         progress_dialog = RostrocaudalStatsProgressDialog(
             argv=argv,
+            argvs=argvs,
             cwd=cwd,
             subject_id=subject_id,
             session_id=session_id,
@@ -6993,7 +7197,7 @@ class GradientScatterDialog(QDialog):
         progress_dialog.start()
 
         self.status_label.setText(
-            f"Started rostrocaudal null test for sub-{subject_id}_ses-{session_id}"
+            f"Started null tests for sub-{subject_id}_ses-{session_id}"
         )
 
     def _export_paths_payload(self):

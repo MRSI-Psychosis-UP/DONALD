@@ -43,6 +43,7 @@ try:
         QProgressBar,
         QPushButton,
         QSplashScreen,
+        QSizePolicy,
         QSplitter,
         QStackedWidget,
         QSpinBox,
@@ -78,6 +79,7 @@ except ImportError:
         QProgressBar,
         QPushButton,
         QSplashScreen,
+        QSizePolicy,
         QSplitter,
         QStackedWidget,
         QSpinBox,
@@ -1868,6 +1870,10 @@ class ConnectomeViewer(QMainWindow):
         self.nbs_prepare_action.triggered.connect(self._open_nbs_prepare_dialog)
         analysis_menu.addAction(self.nbs_prepare_action)
 
+        self.connectivity_compute_action = QAction("Compute Connectivity", self)
+        self.connectivity_compute_action.triggered.connect(self._open_connectivity_compute_folder)
+        analysis_menu.addAction(self.connectivity_compute_action)
+
         self.harmonize_prepare_action = QAction("Harmonize Prepare", self)
         self.harmonize_prepare_action.triggered.connect(self._open_harmonize_prepare_dialog)
         analysis_menu.addAction(self.harmonize_prepare_action)
@@ -2107,33 +2113,44 @@ class ConnectomeViewer(QMainWindow):
         self.view_participants_button.setEnabled(False)
         info_layout.addWidget(self.view_participants_button)
 
-        gradients_group = QGroupBox("Gradients")
-        gradients_layout = QVBoxLayout(gradients_group)
-        self.gradients_open_button = QPushButton("Gradients")
+        # Connectivity tile is added to the analysis grid below.
+        try:
+            from window.compute_connectivity import ConnectivityDropButton
+            from window.icon_tile import SquareIconTile
+        except Exception:
+            from mrsi_viewer.window.compute_connectivity import ConnectivityDropButton
+            from mrsi_viewer.window.icon_tile import SquareIconTile
+        self.connectivity_compute_button = ConnectivityDropButton("Connectivity")
+        self.connectivity_compute_button.clicked.connect(self._open_connectivity_compute_folder)
+        self.connectivity_compute_button.folder_dropped.connect(self._open_compute_connectivity_dialog)
+        # Deliberately always enabled: this computes matrices from profiles, so
+        # unlike the analysis buttons it does not need matrices loaded first.
+        self.connectivity_compute_button.setEnabled(True)
+        self._configure_right_panel_icon_button(self.connectivity_compute_button, "Connectivity")
+
+        # Gradients tile is added to the analysis grid below.
+        self.gradients_open_button = SquareIconTile("Gradients")
         self.gradients_open_button.clicked.connect(self._open_gradients_dialog)
         self.gradients_open_button.setEnabled(False)
-        gradients_layout.addWidget(self.gradients_open_button)
+        self._configure_right_panel_icon_button(self.gradients_open_button, "Gradients")
 
-        nbs_group = QGroupBox("NBS")
-        nbs_layout = QVBoxLayout(nbs_group)
-        self.nbs_prepare_button = QPushButton("Prepare")
+        # NBS tile is added to the analysis grid below.
+        self.nbs_prepare_button = SquareIconTile("Prepare")
         self.nbs_prepare_button.clicked.connect(self._open_nbs_prepare_dialog)
         self.nbs_prepare_button.setEnabled(False)
-        nbs_layout.addWidget(self.nbs_prepare_button)
+        self._configure_right_panel_icon_button(self.nbs_prepare_button, "NBS")
 
-        harmonize_group = QGroupBox("Harmonize")
-        harmonize_layout = QVBoxLayout(harmonize_group)
-        self.harmonize_prepare_button = QPushButton("Prepare")
+        # Harmonize tile is added to the analysis grid below.
+        self.harmonize_prepare_button = SquareIconTile("Prepare")
         self.harmonize_prepare_button.clicked.connect(self._open_harmonize_prepare_dialog)
         self.harmonize_prepare_button.setEnabled(False)
-        harmonize_layout.addWidget(self.harmonize_prepare_button)
+        self._configure_right_panel_icon_button(self.harmonize_prepare_button, "Harmonize")
 
-        combine_group = QGroupBox("Combine")
-        combine_layout = QVBoxLayout(combine_group)
-        self.combine_open_button = QPushButton("Combine")
+        # Combine tile is added to the analysis grid below.
+        self.combine_open_button = SquareIconTile("Combine")
         self.combine_open_button.clicked.connect(self._open_combine_dialog)
         self.combine_open_button.setEnabled(False)
-        combine_layout.addWidget(self.combine_open_button)
+        self._configure_right_panel_icon_button(self.combine_open_button, "Combine")
 
         self._reload_colormaps()
 
@@ -2142,10 +2159,8 @@ class ConnectomeViewer(QMainWindow):
             selector_group,
             info_group,
             export_group,
-            gradients_group,
-            nbs_group,
-            harmonize_group,
-            combine_group,
+            # The analysis tiles no longer live in group boxes; they are
+            # styled by the #rightPanelIconButton rule instead.
         ]
 
         controls_layout.addWidget(list_group)
@@ -2241,10 +2256,31 @@ class ConnectomeViewer(QMainWindow):
 
         right_panel = QWidget()
         right_panel_layout = QVBoxLayout(right_panel)
-        right_panel_layout.addWidget(gradients_group)
-        right_panel_layout.addWidget(nbs_group)
-        right_panel_layout.addWidget(harmonize_group)
-        right_panel_layout.addWidget(combine_group)
+        # One grid of square icon tiles instead of a column of full-width
+        # buttons in individual group boxes, following EEG-UP's compute
+        # toolbar. The per-function group titles went with it: they duplicated
+        # the tooltip and forced every tile to span the whole panel width,
+        # which is what made the icons read as small and stranded.
+        analysis_tiles = QWidget()
+        analysis_grid = QGridLayout(analysis_tiles)
+        analysis_grid.setContentsMargins(4, 4, 4, 4)
+        analysis_grid.setSpacing(6)
+        tiles = [
+            (self.connectivity_compute_button, "Connectivity"),
+            (self.gradients_open_button, "Gradients"),
+            (self.nbs_prepare_button, "NBS"),
+            (self.harmonize_prepare_button, "Harmonize"),
+            (self.combine_open_button, "Combine"),
+        ]
+        columns = 2
+        for index, (tile_button, tile_label) in enumerate(tiles):
+            # Already configured as a tile where each button is created; only
+            # the placement is decided here.
+            del tile_label
+            analysis_grid.addWidget(tile_button, index // columns, index % columns)
+        for column in range(columns):
+            analysis_grid.setColumnStretch(column, 1)
+        right_panel_layout.addWidget(analysis_tiles)
         right_panel_layout.addStretch(1)
         left_panel.setMinimumWidth(0)
         right_panel.setMinimumWidth(0)
@@ -2302,6 +2338,29 @@ class ConnectomeViewer(QMainWindow):
         if self._theme_name == "Donald":
             return "#ffffff"
         return "#1f2937"
+
+    def _right_panel_tile_stylesheet(self) -> str:
+        """Card look for the right-panel icon tiles.
+
+        Appended to whichever theme string is active rather than repeated in
+        all four, so a tile tweak is one edit instead of four.
+        """
+        if self._theme_name == "Dark":
+            bg, border, hover = "#2a3140", "#4b5668", "#60a5fa"
+        elif self._theme_name == "Teya":
+            bg, border, hover = "#ffffff", "#bfe9e7", "#0b7f7a"
+        elif self._theme_name == "Donald":
+            bg, border, hover = "#2d2a26", "#6b5c4a", "#ffd19e"
+        else:
+            bg, border, hover = "#ffffff", "#d8dee9", "#2563eb"
+        return (
+            "QPushButton#rightPanelIconButton {"
+            f"background: {bg}; border: 1px solid {border}; border-radius: 10px; padding: 6px;"
+            "}"
+            f"QPushButton#rightPanelIconButton:hover {{ border: 2px solid {hover}; }}"
+            f"QPushButton#rightPanelIconButton:pressed {{ background: {border}; }}"
+            "QPushButton#rightPanelIconButton:disabled { border-style: dashed; }"
+        )
 
     def _base_theme_stylesheet(self) -> str:
         if self._theme_name == "Dark":
@@ -2439,7 +2498,7 @@ class ConnectomeViewer(QMainWindow):
             self.theme_combo.setCurrentText(theme)
             self.theme_combo.blockSignals(False)
 
-        self.setStyleSheet(self._base_theme_stylesheet())
+        self.setStyleSheet(self._base_theme_stylesheet() + self._right_panel_tile_stylesheet())
         self._apply_groupbox_style()
         if hasattr(self, "plot_title_label"):
             if theme == "Dark":
@@ -2587,7 +2646,16 @@ class ConnectomeViewer(QMainWindow):
         return QIcon()
 
     def _apply_button_icons(self, compact_ui: bool = False, color: str = None) -> None:
+        try:
+            from window.icon_tile import SquareIconTile
+        except Exception:
+            from mrsi_viewer.window.icon_tile import SquareIconTile
         icon_size = QSize(16, 16) if compact_ui else QSize(18, 18)
+        right_panel_icon_size = (
+            QSize(self._TILE_ICON_SIZE_COMPACT, self._TILE_ICON_SIZE_COMPACT)
+            if compact_ui
+            else QSize(self._TILE_ICON_SIZE, self._TILE_ICON_SIZE)
+        )
         mapping = [
             (getattr(self, "add_button", None), "folder_plus.svg"),
             (getattr(self, "add_batch_button", None), "folder_plus.svg"),
@@ -2600,10 +2668,11 @@ class ConnectomeViewer(QMainWindow):
             (getattr(self, "write_matrix_button", None), "save_disk.svg"),
             (getattr(self, "move_up_button", None), "arrow_up.svg"),
             (getattr(self, "move_down_button", None), "arrow_down.svg"),
-            (getattr(self, "gradients_open_button", None), "cube_3d.svg"),
-            (getattr(self, "nbs_prepare_button", None), "wrench_prepare.svg"),
-            (getattr(self, "harmonize_prepare_button", None), "wrench_prepare.svg"),
-            (getattr(self, "combine_open_button", None), "play_circle_compute.svg"),
+            (getattr(self, "connectivity_compute_button", None), "connectivity.svg"),
+            (getattr(self, "gradients_open_button", None), "gradient.png"),
+            (getattr(self, "nbs_prepare_button", None), "nbs.svg"),
+            (getattr(self, "harmonize_prepare_button", None), "harmonize.svg"),
+            (getattr(self, "combine_open_button", None), "combine.svg"),
             (getattr(self, "selector_prepare_button", None), "filter_threshold.svg"),
             (getattr(self, "sample_add_button", None), "folder_plus.svg"),
         ]
@@ -2614,7 +2683,45 @@ class ConnectomeViewer(QMainWindow):
             if icon.isNull():
                 continue
             button.setIcon(icon)
-            button.setIconSize(icon_size)
+            if isinstance(button, SquareIconTile):
+                continue  # the tile rescales its own icon from its width
+            if button.objectName() == "rightPanelIconButton":
+                button.setIconSize(right_panel_icon_size)
+            else:
+                button.setIconSize(icon_size)
+
+    #: Square icon tiles, following EEG-UP's compute toolbar
+    #: (ui/pages/workflow_page.py). The icon carries the meaning, so the tile
+    #: is sized from the icon rather than from text metrics, and the label
+    #: survives only as a tooltip.
+    _TILE_ICON_SIZE = 72
+    _TILE_ICON_SIZE_COMPACT = 56
+    _TILE_MIN_SIZE = 104
+    _TILE_MIN_SIZE_COMPACT = 84
+
+    def _configure_right_panel_icon_button(self, button, label: str) -> None:
+        try:
+            from window.icon_tile import SquareIconTile
+        except Exception:
+            from mrsi_viewer.window.icon_tile import SquareIconTile
+        button.setText("")
+        button.setObjectName("rightPanelIconButton")
+        if not str(button.toolTip() or "").strip():
+            button.setToolTip(label)
+        button.setStatusTip(label)
+        try:
+            button.setAccessibleName(label)
+        except Exception:
+            pass
+        # Size is the tile's own business: SquareIconTile keeps itself square
+        # and derives its icon size from its width, so the tiles track the side
+        # panel as it is dragged. Only the floor is set from here.
+        side = self._TILE_MIN_SIZE_COMPACT if self._compact_ui else self._TILE_MIN_SIZE
+        if isinstance(button, SquareIconTile):
+            button.MIN_SIDE = side
+            button.setMinimumSize(QSize(side, side))
+        else:
+            button.setFixedSize(QSize(side, side))
 
     def _file_entry_id(self, path: Path) -> str:
         return self._workspace.file_entry_id(path)

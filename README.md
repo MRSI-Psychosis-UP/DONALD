@@ -10,6 +10,7 @@ Donald is a Qt GUI to load, inspect, aggregate, harmonize, and analyze connectom
 - [Installation](#installation)
 - [Environment Configuration](#environment-configuration)
 - [Quick Usage](#quick-usage)
+- [Gradient Free-Energy Paths](#gradient-free-energy-paths)
 - [Data Releases](#data-releases)
 - [Troubleshooting](#troubleshooting)
 - [Notes](#notes)
@@ -76,6 +77,17 @@ Installer writes `${REPO}/.env`:
    - `Harmonize > Prepare`
    - `NBS > Prepare`
 5. Use `Write to File` to export selected matrix.
+
+## Gradient Free-Energy Paths
+
+In the gradient scatter/path workspace, `Write free energy` exports the current saved endpoints, generated paths, path energies, and free energies to a `*_desc-free_energy_paths.npz` file.
+
+After writing that file, Donald can offer a follow-up dialog to run downstream null computations from the `mrsitoolbox` repository:
+
+- `test_rostrocaudal_gradient.py` for Moran/Burt rostrocaudal null statistics.
+- `endpoint_neighbor_free_energy_nulls.py` for endpoint-neighbor uncertainty nulls.
+
+The endpoint-neighbor null option is enabled by default in the dialog. It uses `lh,rh` and 32 workers when available. `Shortest only` is available as an opt-in fallback for subjects with pathological simple-path enumeration. The command preview shows the exact commands that will be launched.
 
 ## Data Releases
 Code repo does not track heavy `data/` payloads.
