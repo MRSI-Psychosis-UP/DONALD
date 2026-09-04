@@ -2,6 +2,7 @@
 """NBS preparation dialog for covariate role selection and row filtering."""
 
 import csv
+import importlib.util
 import json
 import os
 import re
@@ -148,6 +149,36 @@ def _slugify_fragment(value):
     return slug or "value"
 
 
+def _describe_contrast_tail(contrast_text: str) -> str:
+    """Summarize the tail a contrast string implies, for display only.
+
+    Mirrors run_nbs.py's own contrast -> tail convention (sign of the numeric
+    entries; 'b' means a two-tailed pos/neg pair with Bonferroni doubling) without
+    importing that CLI module into the GUI process.
+    """
+    text = (contrast_text or "").strip()
+    if not text:
+        return "n/a (contrast required)"
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    parts = [p for p in re.split(r"[,\s]+", text) if p]
+    if any(p.lower() == "b" for p in parts):
+        return "both (two-tailed, Bonferroni-doubled)"
+    try:
+        values = [float(p) for p in parts]
+    except ValueError:
+        return "unknown"
+    has_pos = any(v > 0 for v in values)
+    has_neg = any(v < 0 for v in values)
+    if has_pos and has_neg:
+        return "both (mixed-sign contrast)"
+    if has_pos:
+        return "right (one-tailed)"
+    if has_neg:
+        return "left (one-tailed)"
+    return "unknown"
+
+
 def _connectivity_file_metadata(path: Path) -> dict:
     base_name = Path(path).name
     results = {}
@@ -256,6 +287,7 @@ class NBSPrepareDialog(QDialog):
         bids_dir_default="",
         workspace_reference_options=None,
         theme_name="Dark",
+        gradient_rgb_payload_callback=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -295,6 +327,9 @@ class NBSPrepareDialog(QDialog):
         self._results_output_dir_auto_value = ""
         self._last_results_output_dir = None
         self._workspace_reference_options = self._normalize_workspace_reference_options(workspace_reference_options)
+        self._gradient_rgb_payload_callback = (
+            gradient_rgb_payload_callback if callable(gradient_rgb_payload_callback) else None
+        )
         self._reference_workspace_combo_syncing = False
         self._reference_matrix_key_options = []
         self._reference_matrix_key_combo_syncing = False
@@ -770,8 +805,17 @@ class NBSPrepareDialog(QDialog):
         custom_layout.addWidget(QLabel("Custom contrast"))
         self.contrast_edit = QLineEdit("")
         self.contrast_edit.setPlaceholderText("e.g. 0 0 1 1 1")
+        self.contrast_edit.setToolTip(
+            "Tail is determined by the sign of the regressor's entry, not a separate setting:\n"
+            "  ...1   -> right-tailed, one run, p-value uncorrected\n"
+            "  ...-1  -> left-tailed, one run, p-value uncorrected\n"
+            "  ...b   -> two-tailed: runs +1 and -1 and Bonferroni-doubles each p-value (capped at 1)\n"
+            "Run the right- and left-tailed contrasts separately if you want to apply your own "
+            "correction for multiple comparisons instead of the built-in two-tailed doubling."
+        )
         custom_layout.addWidget(self.contrast_edit, 1)
         layout.addWidget(custom_contrast_frame)
+        self.contrast_edit.textChanged.connect(self._update_run_summary)
         return page
 
     def _build_step_nbs_settings(self):
@@ -825,8 +869,8 @@ class NBSPrepareDialog(QDialog):
 
         core_grid.addWidget(QLabel("Engine"), 3, 0)
         self.engine_combo = QComboBox()
-        self.engine_combo.addItem("MATLAB (reference)", "matlab")
         self.engine_combo.addItem("Python (MATLAB-compatible)", "python")
+        self.engine_combo.addItem("MATLAB (reference, requires MATLAB)", "matlab")
         self.engine_combo.setCurrentIndex(0)
         self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         self.engine_combo.currentIndexChanged.connect(self._update_run_summary)
@@ -840,17 +884,38 @@ class NBSPrepareDialog(QDialog):
         self.component_size_combo.currentIndexChanged.connect(self._update_run_summary)
         core_grid.addWidget(self.component_size_combo, 3, 3)
 
+        core_grid.addWidget(QLabel("Seed"), 4, 0)
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 2_147_483_647)
+        self.seed_spin.setSpecialValueText("random")
+        self.seed_spin.setValue(0)
+        self.seed_spin.setToolTip(
+            "Seed for the permutation RNG (python engine). Leave at 'random' for a fresh "
+            "null distribution on every run; set a value to make permutations reproducible."
+        )
+        self.seed_spin.valueChanged.connect(self._update_run_summary)
+        core_grid.addWidget(self.seed_spin, 4, 1)
+
+        self.export_matlab_check = QCheckBox("Also export MATLAB NBS1.2 inputs")
+        self.export_matlab_check.setChecked(False)
+        self.export_matlab_check.setToolTip(
+            "Write matrices/, designMatrix.txt, COG.txt and nodeLabels.txt under matlab_nbs/ "
+            "so the same analysis can be reproduced or cross-checked in MATLAB NBS1.2. Not "
+            "needed to run the python engine."
+        )
+        core_grid.addWidget(self.export_matlab_check, 4, 2, 1, 2)
+
         self.matlab_persistent_check = QCheckBox(
             "Persistent MATLAB session (reuse workers between runs)"
         )
         self.matlab_persistent_check.setChecked(True)
-        core_grid.addWidget(self.matlab_persistent_check, 4, 0, 1, 4)
+        core_grid.addWidget(self.matlab_persistent_check, 5, 0, 1, 4)
 
         self.matlab_no_precompute_check = QCheckBox(
             "Skip MATLAB precompute (lower memory, often slower)"
         )
         self.matlab_no_precompute_check.setChecked(False)
-        core_grid.addWidget(self.matlab_no_precompute_check, 5, 0, 1, 4)
+        core_grid.addWidget(self.matlab_no_precompute_check, 6, 0, 1, 4)
         self._on_engine_changed()
 
         layout.addWidget(core_group)
@@ -993,11 +1058,7 @@ class NBSPrepareDialog(QDialog):
         return page
 
     def _results_script_path(self):
-        wrapper = Path(__file__).resolve().parents[1] / "scripts" / "plot_nbs_control_structural_context.py"
-        if wrapper.exists():
-            return wrapper
-        fallback = Path(__file__).resolve().parents[2] / "mrsitoolbox" / "experiments" / "nbs_metsim_rc_overlap" / "plot_nbs_control_structural_context.py"
-        return fallback
+        return Path(__file__).resolve().parents[1] / "scripts" / "plot_nbs_control_structural_context.py"
 
     def _results_is_running(self):
         return (
@@ -1168,6 +1229,14 @@ class NBSPrepareDialog(QDialog):
             self.matlab_persistent_check.setEnabled(is_matlab)
         if hasattr(self, "matlab_no_precompute_check"):
             self.matlab_no_precompute_check.setEnabled(is_matlab)
+        if hasattr(self, "export_matlab_check"):
+            if is_matlab:
+                # MATLAB engine always needs its own export; reflect that rather than
+                # letting the user uncheck something the run requires.
+                self.export_matlab_check.setChecked(True)
+            self.export_matlab_check.setEnabled(not is_matlab)
+        if hasattr(self, "seed_spin"):
+            self.seed_spin.setEnabled(not is_matlab)
 
     def _selected_regressor_type(self):
         mode = self.model_regressor_type_combo.currentText().strip().lower()
@@ -1215,14 +1284,24 @@ class NBSPrepareDialog(QDialog):
             if hasattr(self, "component_size_combo")
             else "Extent"
         )
+        tail_label = _describe_contrast_tail(
+            self.contrast_edit.text() if hasattr(self, "contrast_edit") else ""
+        )
+        seed_label = (
+            "random"
+            if not hasattr(self, "seed_spin") or self.seed_spin.value() == self.seed_spin.minimum()
+            else str(int(self.seed_spin.value()))
+        )
         self.run_summary_label.setText(
             f"Engine: {engine_label}\n"
             f"Regressor: {regressor}\n"
             f"Confounds: {confounds}\n"
             f"Test: {test_label}\n"
             f"Component size: {size_label}\n"
+            f"Tail (from contrast): {tail_label}\n"
             f"N included: {n_included}\n"
             f"Permutations: {nperm}\n"
+            f"Seed: {seed_label}\n"
             f"Threshold: {threshold}"
         )
 
@@ -1666,6 +1745,16 @@ class NBSPrepareDialog(QDialog):
             "modality": self.modality_combo.currentText().strip().lower(),
             "matlab_persistent": bool(self.matlab_persistent_check.isChecked()),
             "matlab_no_precompute": bool(self.matlab_no_precompute_check.isChecked()),
+            "seed": (
+                None
+                if not hasattr(self, "seed_spin") or self.seed_spin.value() == self.seed_spin.minimum()
+                else int(self.seed_spin.value())
+            ),
+            "export_matlab": (
+                bool(self.export_matlab_check.isChecked())
+                if hasattr(self, "export_matlab_check")
+                else False
+            ),
             "display_no_show": (not bool(self.display_results_check.isChecked())),
             "display_collapse_parcels": bool(self.display_collapse_check.isChecked()),
             "display_regressor_type": self._selected_export_regressor_type(),
@@ -1758,8 +1847,15 @@ class NBSPrepareDialog(QDialog):
             modality = selected_modality or modality_from_npz or "mrsi"
 
         reg_name = self._regressor_name() or "regressor"
+        # Path.stem only strips ".npz", so re-subsetting a source that is itself an
+        # already-built "..._nbs_input.npz" (e.g. re-importing a prior result's
+        # connectivity_path for verification) would otherwise double the suffix into
+        # "..._nbs_input_key-..._nbs_input.npz".
+        source_stem = self._source_path.stem
+        if source_stem.endswith("_nbs_input"):
+            source_stem = source_stem[: -len("_nbs_input")]
         subset_name = (
-            f"{self._source_path.stem}_key-{_slugify_fragment(self._matrix_key)}"
+            f"{source_stem}_key-{_slugify_fragment(self._matrix_key)}"
             f"_reg-{_slugify_fragment(reg_name)}_n-{indices.size}_nbs_input.npz"
         )
         subset_path = self._source_path.with_name(subset_name)
@@ -1824,6 +1920,10 @@ class NBSPrepareDialog(QDialog):
         ]
         if engine == "python":
             command += ["--python-impl", "matlab_compat"]
+            if hasattr(self, "seed_spin") and self.seed_spin.value() != self.seed_spin.minimum():
+                command += ["--seed", str(int(self.seed_spin.value()))]
+        if hasattr(self, "export_matlab_check") and self.export_matlab_check.isChecked():
+            command.append("--export-matlab")
         if nuisance_terms:
             command += ["--nuisance", ",".join(str(x) for x in nuisance_terms)]
 
@@ -1896,20 +1996,15 @@ class NBSPrepareDialog(QDialog):
             self._append_terminal_line(f"[NBS] BIDSDATAPATH not set; using {fallback_bids}")
         pythonpath_current = env.value("PYTHONPATH", "")
         pythonpath_parts = [p for p in pythonpath_current.split(os.pathsep) if p]
-        repo_root = str(Path(viewer_root).parent)
-        mrsitoolbox_root = str(Path(viewer_root).parent / "mrsitoolbox")
-        for candidate in (viewer_root, repo_root, mrsitoolbox_root):
+        for candidate in (viewer_root,):
             if candidate and candidate not in pythonpath_parts and Path(candidate).exists():
                 pythonpath_parts.insert(0, candidate)
         if pythonpath_parts:
             env.insert("PYTHONPATH", os.pathsep.join(pythonpath_parts))
         return env
 
-    def _covariate_balance_root(self):
-        return Path(__file__).resolve().parents[2] / "mrsitoolbox"
-
-    def _covariate_balance_script_path(self):
-        return self._covariate_balance_root() / "scripts" / "covariate_balance_love_plot.py"
+    def _covariate_balance_module(self):
+        return "mrsitoolbox.scripts.covariate_balance_love_plot"
 
     def _covariate_balance_output_dir(self, regressor_name):
         base_dir_text = self.output_dir_edit.text().strip() if hasattr(self, "output_dir_edit") else ""
@@ -1981,9 +2076,16 @@ class NBSPrepareDialog(QDialog):
             self._set_status("Covariate balance diagnostics are already running.")
             return
 
-        script_path = self._covariate_balance_script_path()
-        if not script_path.exists():
-            self._set_status(f"Covariate balance script not found: {script_path}")
+        module_name = self._covariate_balance_module()
+        try:
+            module_spec = importlib.util.find_spec(module_name)
+        except (ImportError, AttributeError, ValueError):
+            module_spec = None
+        if module_spec is None:
+            self._set_status(
+                "Covariate balance diagnostics require a newer mrsitoolbox pip package. "
+                "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+            )
             return
         try:
             input_path, output_dir, regressor_name, nuisance_terms = self._build_covariate_balance_input()
@@ -1993,7 +2095,8 @@ class NBSPrepareDialog(QDialog):
 
         python_exe = sys.executable or "python3"
         command = [
-            str(script_path),
+            "-m",
+            module_name,
             "--input",
             str(input_path),
             "--regressor",
@@ -2010,7 +2113,7 @@ class NBSPrepareDialog(QDialog):
         self._covariate_balance_process.readyReadStandardOutput.connect(self._on_covariate_balance_output)
         self._covariate_balance_process.readyReadStandardError.connect(self._on_covariate_balance_output)
         self._covariate_balance_process.finished.connect(self._on_covariate_balance_finished)
-        self._covariate_balance_process.setWorkingDirectory(str(self._covariate_balance_root()))
+        self._covariate_balance_process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
         self._covariate_balance_process.setProcessEnvironment(self._build_process_environment())
         self._append_terminal_line(f"[NBS-COVARS] Launch command: {shlex.join([python_exe] + command)}")
         self._set_status("Launching covariate balance diagnostics...")
@@ -2451,6 +2554,46 @@ class NBSPrepareDialog(QDialog):
             self._append_terminal_line(f"[NBS-EXPORT] Failed to delete {matlab_dir}: {exc}")
             return f"Could not delete {matlab_dir.name}: {exc}"
 
+    def _active_gradient_rgb_payload(self):
+        payload = None
+        if self._gradient_rgb_payload_callback is not None:
+            try:
+                payload = self._gradient_rgb_payload_callback()
+            except Exception as exc:
+                self._append_terminal_line(f"[NBS-EXPORT] Gradient RGB payload unavailable: {exc}")
+                payload = None
+        if payload is None:
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "_current_gradient_rgb_payload"):
+                try:
+                    payload = parent._current_gradient_rgb_payload()
+                except Exception:
+                    payload = None
+        if not isinstance(payload, dict) or not bool(payload.get("enabled", False)):
+            return None
+        model = payload.get("model")
+        if not isinstance(model, dict):
+            return None
+        return dict(payload)
+
+    def _write_gradient_rgb_payload_file(self, result_path):
+        payload = self._active_gradient_rgb_payload()
+        if not payload:
+            return None
+        try:
+            result = Path(str(result_path)).expanduser()
+            payload_path = result.parent / f"{result.stem}_gradient_rgb_payload.json"
+            payload["nbs_result_path"] = str(result)
+            with open(payload_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            self._append_terminal_line(
+                f"[NBS-EXPORT] Using active triangular RGB Gradient model: {payload_path}"
+            )
+            return str(payload_path)
+        except Exception as exc:
+            self._append_terminal_line(f"[NBS-EXPORT] Failed to write Gradient RGB payload: {exc}")
+            return None
+
     def _export_results(self):
         if self._process_is_running() or self._results_is_running():
             self._set_status("Wait for active processing to finish before exporting.")
@@ -2469,6 +2612,9 @@ class NBSPrepareDialog(QDialog):
 
         python_exe = sys.executable or "python3"
         command = [str(script_path), "--result", result_path]
+        gradient_payload_path = self._write_gradient_rgb_payload_file(result_path)
+        if gradient_payload_path:
+            command += ["--gradient-rgb-payload", gradient_payload_path]
         if not self.display_results_check.isChecked():
             command.append("--no-show")
         if self.display_collapse_check.isChecked():

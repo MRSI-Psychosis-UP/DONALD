@@ -18,26 +18,19 @@ from scipy.io import loadmat
 
 _SCRIPT_PATH = Path(__file__).resolve()
 _VIEWER_ROOT = _SCRIPT_PATH.parents[1]
-_LOCAL_MRSI_ROOT = _VIEWER_ROOT.parent / "mrsitoolbox"
-if _LOCAL_MRSI_ROOT.exists():
-    _local_path = str(_LOCAL_MRSI_ROOT)
-    if _local_path not in sys.path:
-        sys.path.insert(0, _local_path)
 
 try:
-    from tools.datautils import DataUtils
-    from tools.debug import Debug
-    from tools.participants import ParticipantSelector
-    from connectomics.nettools import NetTools
-    from connectomics.nbs import NBS
-    from graphplot.brain3d import Brain3D
-except Exception:
     from mrsitoolbox.tools.datautils import DataUtils
     from mrsitoolbox.tools.debug import Debug
     from mrsitoolbox.tools.participants import ParticipantSelector
     from mrsitoolbox.connectomics.nettools import NetTools
     from mrsitoolbox.connectomics.nbs import NBS
     from mrsitoolbox.graphplot.brain3d import Brain3D
+except ImportError as exc:
+    raise ImportError(
+        "Donald NBS requires the current mrsitoolbox pip package. "
+        "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+    ) from exc
 from rich.table import Table
 
 
@@ -398,6 +391,68 @@ def _expand_contrast_tokens(tokens, design_columns, matlab_regressor_cols, repla
     )
 
 
+def _build_contrast_specs(contrast_has_b, is_f_test, contrast_cli, tail_value):
+    """Return (two_tailed_b, specs) for the directional run(s) implied by the contrast/tail.
+
+    Each spec is (suffix, tail_for_run, sign). A directional contrast is inherently
+    one-tailed (NBS thresholds `stat > t_thresh`, never `abs(stat) > t_thresh`); the
+    two-tailed case is two directional runs (+contrast, -contrast) whose component
+    p-values get Bonferroni-doubled and merged by `_combine_tailed_results`. Shared by
+    the MATLAB and Python engines so both honour the same contrast -> tail convention.
+    """
+    if contrast_has_b and is_f_test:
+        raise ValueError("Contrast placeholder 'b' is only valid for t-tests.")
+    two_tailed_b = bool(contrast_has_b and not is_f_test)
+    if is_f_test:
+        return two_tailed_b, [("F", None, None)]
+    if two_tailed_b:
+        return two_tailed_b, [("pos", "right", 1.0), ("neg", "left", -1.0)]
+    if contrast_cli:
+        return two_tailed_b, [("custom", tail_value, None)]
+    if tail_value == "left":
+        return two_tailed_b, [("neg", "left", -1.0)]
+    if tail_value == "both":
+        return two_tailed_b, [("pos", "right", 1.0), ("neg", "left", -1.0)]
+    return two_tailed_b, [("pos", "right", 1.0)]
+
+
+def _combine_tailed_results(results_by_suffix, alpha, two_tailed_b, export_paths=None):
+    """Merge the one-or-two directional result dicts produced from `_build_contrast_specs`.
+
+    For a two-tailed run, Bonferroni-doubles each component's p-value and unions the
+    pos/neg components, matching NBS1.2's own two-tailed convention (run `+contrast` and
+    `-contrast` separately, double each p-value, cap at 1). Otherwise passes the single
+    directional result through unchanged.
+    """
+    if not two_tailed_b:
+        res = dict(next(iter(results_by_suffix.values())))
+        if export_paths is not None:
+            res["export_paths"] = export_paths
+        return res
+    pos_res = results_by_suffix.get("pos")
+    neg_res = results_by_suffix.get("neg")
+    if pos_res is None or neg_res is None:
+        raise ValueError("Two-tailed test requested but could not obtain both directional results.")
+    comp_masks = list(pos_res["comp_masks"]) + list(neg_res["comp_masks"])
+    comp_edges = list(pos_res["comp_edges"]) + list(neg_res["comp_edges"])
+    comp_pvals = [min(1.0, 2.0 * float(p)) for p in pos_res["comp_pvals"]]
+    comp_pvals += [min(1.0, 2.0 * float(p)) for p in neg_res["comp_pvals"]]
+    sig_mask = np.zeros_like(pos_res["t_mat"], dtype=bool)
+    for p, m in zip(comp_pvals, comp_masks):
+        if p <= alpha and m.shape == sig_mask.shape:
+            sig_mask |= m
+    return {
+        "comp_pvals": comp_pvals,
+        "comp_edges": comp_edges,
+        "comp_masks": comp_masks,
+        "sig_mask": sig_mask,
+        "t_mat": pos_res["t_mat"],
+        "iu": pos_res["iu"],
+        "null_max": pos_res.get("null_max", np.array([], dtype=float)),
+        "export_paths": export_paths if export_paths is not None else pos_res.get("export_paths"),
+    }
+
+
 def _mat_get(obj, field: str, default=None):
     if obj is None:
         return default
@@ -728,10 +783,7 @@ def _run_matlab_batch(matlab_cmd: str, matlab_call: str, expected_output: str | 
 
 def _resolve_matlab_helper_dir() -> str:
     script_dir = Path(__file__).resolve().parent
-    candidates = [
-        script_dir,
-        script_dir.parents[1] / "mrsitoolbox" / "experiments" / "MetSiM_analysis",
-    ]
+    candidates = [script_dir]
     for candidate in candidates:
         if (candidate / "nbs_run_cli.m").is_file():
             return str(candidate)
@@ -889,6 +941,8 @@ parser.add_argument('-c', '--contrast', type=str, default=None,
                 help="GLM contrast vector (e.g., '[0 0 1 1 1]').")
 parser.add_argument('--nperm', type=int, default=1500,
                     help="Number of permutations used by the NBS (default: 1000)")
+parser.add_argument('--seed', type=int, default=None,
+                    help="Seed for the python engine's permutation RNG (default: random each run)")
 parser.add_argument('--nthreads', type=int, default=8,
                     help="Number of CPU threads for permutation parallelism (default: 8)")
 parser.add_argument('--alpha', type=float, default=0.05,
@@ -915,9 +969,13 @@ parser.add_argument('--train_split', type=float, default=1.0,
 parser.add_argument('--select', '-s', dest='select', action='append', default=[],
                     help="Filter participants by covariate in connectivity NPZ covars. "
                          "Format: COVARNAME,VALUE or COVARNAME,>VALUE (e.g., --select Diag,0).")
-parser.add_argument('--engine', type=str, default="matlab",
+parser.add_argument('--engine', type=str, default="python",
                     choices=["python", "matlab"],
-                    help="Choose implementation to run: python or matlab.")
+                    help="Choose implementation to run: python (no MATLAB required, default) or matlab.")
+parser.add_argument('--export-matlab', dest='export_matlab', action='store_true', default=False,
+                    help="Also write a MATLAB NBS1.2-compatible export (matrices/, designMatrix.txt, "
+                         "COG.txt, nodeLabels.txt) under matlab_nbs/. Off by default for the python "
+                         "engine since it is not needed to run NBS; always on for --engine matlab.")
 parser.add_argument(
     "--python-impl",
     type=str,
@@ -1283,6 +1341,7 @@ _print_covariate_distribution(regressor_name, designmat_dict, nuisance_terms_pre
 
 requested_test = str(args.matlab_test).upper()
 requested_size = str(args.matlab_size).lower()
+is_f_test = requested_test == "F"
 
 matlab_regressor_cols = [regressor_name]
 regressor_for_bct = regressor_name
@@ -1334,7 +1393,8 @@ param_tag  = (
     f"_size-{_slugify_fragment(size_tag)}_tail-{tail_tag}{selection_tag}"
 )
 plot_dir = join(base_dir, "connectome_plots")
-matlab_export_dir = join(base_dir, "matlab_nbs", param_tag)
+want_matlab_export = run_matlab or bool(args.export_matlab)
+matlab_export_dir = join(base_dir, "matlab_nbs", param_tag) if want_matlab_export else None
 os.makedirs(plot_dir, exist_ok=True)
 predictor_label = regressor_for_bct if regressor_for_bct != regressor_name else regressor_name
 if (run_matlab or run_python_compat) and requested_test == "F" and matlab_regressor_cols:
@@ -1368,48 +1428,60 @@ if run_python_compat:
         raise ValueError(
             "python matlab_compat backend currently supports only --permtest freedman."
         )
-    analysis_subject_order = np.argsort(
-        np.asarray([f"subject{i+1}.txt" for i in range(MeSiM_list.shape[0])], dtype=object)
-    )
-    debug.info("python matlab_compat: using MATLAB-style lexicographic subject file ordering.")
-    if contrast_has_b:
-        raise ValueError(
-            "Contrast placeholder 'b' is not supported by python matlab_compat backend. "
-            "Use an explicit numeric contrast vector."
-        )
-    if contrast_tokens is None:
-        contrast_for_python = np.zeros(len(design_columns_for_run), dtype=float)
-        if requested_test == "F":
-            contrast_cols = matlab_regressor_cols or [regressor_for_bct]
-            for col in contrast_cols:
-                if col not in design_columns_for_run:
-                    raise ValueError(f"Contrast column '{col}' not found in design.")
-                contrast_for_python[design_columns_for_run.index(col)] = 1.0
-        else:
-            contrast_for_python[-1] = 1.0
-    else:
-        contrast_for_python = _expand_contrast_tokens(
+
+    def _python_contrast_for_spec(sign):
+        if contrast_tokens is None:
+            vec = np.zeros(len(design_columns_for_run), dtype=float)
+            if is_f_test:
+                contrast_cols = matlab_regressor_cols or [regressor_for_bct]
+                for col in contrast_cols:
+                    if col not in design_columns_for_run:
+                        raise ValueError(f"Contrast column '{col}' not found in design.")
+                    vec[design_columns_for_run.index(col)] = 1.0
+            else:
+                vec[-1] = float(sign) if sign is not None else 1.0
+            return vec
+        return _expand_contrast_tokens(
             contrast_tokens,
             design_columns_for_run,
             matlab_regressor_cols,
+            replace_val=sign,
         )
-    results_dict = nbs.bct_glm_matlab_compat(
-        MeSiM_list,
-        design_matrix=design_matrix_for_run,
-        contrast=contrast_for_python,
-        test=requested_test,
-        size=requested_size,
-        t_thresh=args.t_thresh,
-        n_perms=args.nperm,
-        nthreads=args.nthreads,
-        alpha=args.alpha,
-        export_matlab_dir=matlab_export_dir,
-        node_coords=centroids_world,
-        node_names=parcel_names,
-        subject_ids=subject_id_all,
-        design_columns=design_columns_for_run,
-        return_significant_only=True,
-        analysis_subject_order=analysis_subject_order,
+
+    two_tailed_b, contrast_specs_py = _build_contrast_specs(
+        contrast_has_b, is_f_test, contrast_cli, tail_value
+    )
+    specs_to_run_py = contrast_specs_py if two_tailed_b else contrast_specs_py[:1]
+    python_results = {}
+    for suffix, _tail_for_run, sign in specs_to_run_py:
+        python_results[suffix] = nbs.bct_glm_matlab_compat(
+            MeSiM_list,
+            design_matrix=design_matrix_for_run,
+            contrast=_python_contrast_for_spec(sign),
+            test=requested_test,
+            size=requested_size,
+            t_thresh=args.t_thresh,
+            n_perms=args.nperm,
+            nthreads=args.nthreads,
+            alpha=args.alpha,
+            seed=args.seed,
+            export_matlab_dir=matlab_export_dir,
+            node_coords=centroids_world,
+            node_names=parcel_names,
+            subject_ids=subject_id_all,
+            design_columns=design_columns_for_run,
+            # Keep every component the permutation test found, not just the ones that
+            # clear alpha, so a non-significant run still has a p-value to report
+            # instead of an empty comp_pvals/global_pvalue "NA". `sig_mask` inside
+            # bct_glm_matlab_compat is always computed from the full component list
+            # regardless of this flag, so significance itself is unaffected.
+            return_significant_only=False,
+        )
+    results_dict = _combine_tailed_results(
+        python_results,
+        args.alpha,
+        two_tailed_b,
+        export_paths=next(iter(python_results.values())).get("export_paths"),
     )
 elif run_python_legacy:
     results_dict = nbs.bct_corr(
@@ -1481,24 +1553,9 @@ if export_paths:
                         f"{len(design_columns)}. Design columns: [{cols_msg}]"
                     )
 
-        is_f_test = str(args.matlab_test).upper() == "F"
-        if contrast_has_b and is_f_test:
-            raise ValueError("Contrast placeholder 'b' is only valid for t-tests.")
-
-        two_tailed_b = bool(contrast_has_b and not is_f_test)
-        if is_f_test:
-            contrast_specs = [("F", None, None)]
-        else:
-            if two_tailed_b:
-                contrast_specs = [("pos", "right", 1.0), ("neg", "left", -1.0)]
-            elif contrast_cli:
-                contrast_specs = [("custom", tail_value, None)]
-            elif tail_value == "both":
-                contrast_specs = [("pos", "right", 1.0), ("neg", "left", -1.0)]
-            elif tail_value == "left":
-                contrast_specs = [("neg", "left", -1.0)]
-            else:
-                contrast_specs = [("pos", "right", 1.0)]
+        two_tailed_b, contrast_specs = _build_contrast_specs(
+            contrast_has_b, is_f_test, contrast_cli, tail_value
+        )
 
         script_dir = dirname(__file__)
         matlab_helper_dir = _resolve_matlab_helper_dir()
@@ -1600,7 +1657,7 @@ if export_paths:
                 debug.info(f"Running MATLAB NBS via: {matlab_cmd} -batch \"{matlab_call}\"")
                 _run_matlab_batch(matlab_cmd, matlab_call, expected_output=output_path)
             matlab_outputs.append((suffix, output_mat))
-        matlab_results = []
+        matlab_results = {}
         for suffix, output_mat in matlab_outputs:
             output_path = join(export_dir, output_mat)
             if not isfile(output_path):
@@ -1610,35 +1667,10 @@ if export_paths:
                 alpha=args.alpha,
                 expected_n=MeSiM_list.shape[1] if MeSiM_list.ndim >= 3 else None,
             )
-            res["export_paths"] = export_paths
-            matlab_results.append((suffix, res))
-        if two_tailed_b:
-            pos_res = next((r for s, r in matlab_results if s == "pos"), None)
-            neg_res = next((r for s, r in matlab_results if s == "neg"), None)
-            if pos_res is None or neg_res is None:
-                raise ValueError("Two-tailed test requested but could not load both MATLAB results.")
-            comp_masks = list(pos_res["comp_masks"]) + list(neg_res["comp_masks"])
-            comp_edges = list(pos_res["comp_edges"]) + list(neg_res["comp_edges"])
-            comp_pvals = [min(1.0, 2.0 * float(p)) for p in pos_res["comp_pvals"]]
-            comp_pvals += [min(1.0, 2.0 * float(p)) for p in neg_res["comp_pvals"]]
-            sig_mask = np.zeros_like(pos_res["t_mat"], dtype=bool)
-            for p, m in zip(comp_pvals, comp_masks):
-                if p <= args.alpha:
-                    if m.shape != sig_mask.shape:
-                        continue
-                    sig_mask |= m
-            results_dict = {
-                "comp_pvals": comp_pvals,
-                "comp_edges": comp_edges,
-                "comp_masks": comp_masks,
-                "sig_mask": sig_mask,
-                "t_mat": pos_res["t_mat"],
-                "iu": pos_res["iu"],
-                "null_max": pos_res.get("null_max", np.array([], dtype=float)),
-                "export_paths": export_paths,
-            }
-        else:
-            results_dict = matlab_results[0][1]
+            matlab_results[suffix] = res
+        results_dict = _combine_tailed_results(
+            matlab_results, args.alpha, two_tailed_b, export_paths=export_paths
+        )
 
 
 ids_sig    = np.where(np.array(results_dict["comp_pvals"]) <= args.alpha)[0]
@@ -1713,6 +1745,9 @@ np.savez(
     centroids_world=centroids_world,
     covars=covars_records,
     comp_edges=comp_edges_all,
+    engine=args.engine,
+    subject_order="numeric",
+    seed=np.array(args.seed if args.seed is not None else -1, dtype=int),
 )
 if stage_no_significant:
     debug.info("No significant components detected; staged bundled component results at", components_all_path)
@@ -1810,6 +1845,9 @@ if not stage_no_significant:
             parcel_names=parcel_names,
             centroids_world=centroids_world,
             covars=covars_records,
+            engine=args.engine,
+            subject_order="numeric",
+            seed=np.array(args.seed if args.seed is not None else -1, dtype=int),
         )
         summary_rows[comp_idx].update({
             "npz_path": npz_path,

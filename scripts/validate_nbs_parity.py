@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,17 +14,14 @@ from scipy.io import loadmat
 
 SCRIPT_PATH = Path(__file__).resolve()
 VIEWER_ROOT = SCRIPT_PATH.parents[1]
-PROJECT_ROOT = VIEWER_ROOT.parent
-MRSI_TOOLBOX_ROOT = PROJECT_ROOT / "mrsitoolbox"
-for candidate in (VIEWER_ROOT, MRSI_TOOLBOX_ROOT):
-    text = str(candidate)
-    if text not in sys.path and candidate.exists():
-        sys.path.insert(0, text)
 
 try:
-    from connectomics.nbs import NBS  # noqa: E402
-except Exception:
     from mrsitoolbox.connectomics.nbs import NBS  # noqa: E402
+except ImportError as exc:
+    raise ImportError(
+        "validate_nbs_parity.py requires the current mrsitoolbox pip package. "
+        "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+    ) from exc
 
 
 def _mat_get(obj, field, default=None):
@@ -222,6 +218,49 @@ def _component_mask_union(comp_masks):
     return out
 
 
+def _match_components(py_masks, mat_masks, min_overlap=0.5):
+    """Greedily pair python/MATLAB significant components by edge-mask Jaccard overlap.
+
+    MATLAB and the python port do not necessarily enumerate components in the same
+    order, so comparing `comp_pvals[i]` to `comp_pvals[i]` directly is meaningless.
+    Matching by mask overlap first is required to compare p-values component-by-component.
+
+    Returns (matches, unmatched_py, unmatched_mat) where matches is a list of
+    (py_idx, mat_idx, overlap_jaccard) and the unmatched lists are component indices
+    present in only one engine's output.
+    """
+    n_py = len(py_masks)
+    n_mat = len(mat_masks)
+    overlap = np.zeros((n_py, n_mat), dtype=float)
+    for i in range(n_py):
+        pm = np.asarray(py_masks[i], dtype=bool)
+        for j in range(n_mat):
+            mm = np.asarray(mat_masks[j], dtype=bool)
+            if pm.shape != mm.shape:
+                continue
+            inter = np.logical_and(pm, mm).sum()
+            union = np.logical_or(pm, mm).sum()
+            overlap[i, j] = float(inter / union) if union else 0.0
+
+    candidates = sorted(
+        ((overlap[i, j], i, j) for i in range(n_py) for j in range(n_mat)),
+        reverse=True,
+    )
+    matches = []
+    used_py, used_mat = set(), set()
+    for ov, i, j in candidates:
+        if ov < min_overlap:
+            break
+        if i in used_py or j in used_mat:
+            continue
+        matches.append((i, j, ov))
+        used_py.add(i)
+        used_mat.add(j)
+    unmatched_py = [i for i in range(n_py) if i not in used_py]
+    unmatched_mat = [j for j in range(n_mat) if j not in used_mat]
+    return matches, unmatched_py, unmatched_mat
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare python MATLAB-compatible NBS output with MATLAB NBS1.2."
@@ -265,6 +304,28 @@ def main():
         default=1e-8,
         help="Maximum absolute difference allowed for observed test-statistics.",
     )
+    parser.add_argument(
+        "--min-jaccard",
+        type=float,
+        default=0.95,
+        help="Minimum Jaccard overlap required between the python and MATLAB "
+             "significant-edge masks.",
+    )
+    parser.add_argument(
+        "--pval-tolerance",
+        type=float,
+        default=0.02,
+        help="Maximum absolute difference allowed between matched components' corrected "
+             "p-values (matched by mask overlap, not index). Widen this at low --perms, "
+             "since independent permutation draws add Monte-Carlo noise to both engines.",
+    )
+    parser.add_argument(
+        "--min-component-overlap",
+        type=float,
+        default=0.5,
+        help="Minimum edge-mask Jaccard overlap for two components (one per engine) to be "
+             "considered the same component when matching for the p-value comparison.",
+    )
     args = parser.parse_args()
 
     export_dir = Path(args.export_dir).expanduser().resolve()
@@ -280,9 +341,6 @@ def main():
 
     matrices = _load_export_matrices(export_dir)
     contrast_vec = _parse_contrast(args.contrast)
-    analysis_subject_order = np.argsort(
-        np.asarray([f"subject{i+1}.txt" for i in range(matrices.shape[2])], dtype=object)
-    )
 
     nbs = NBS()
     py_res = nbs.bct_glm_matlab_compat(
@@ -297,7 +355,6 @@ def main():
         alpha=args.alpha,
         seed=args.seed,
         return_significant_only=True,
-        analysis_subject_order=analysis_subject_order,
     )
 
     if args.matlab_output_mat:
@@ -345,6 +402,15 @@ def main():
         union = np.logical_or(py_sig_mask, mat_sig_mask).sum()
         jaccard = float(inter / union) if union else 1.0
 
+    matches, unmatched_py, unmatched_mat = _match_components(
+        py_res["comp_masks"], mat_res["comp_masks"], min_overlap=args.min_component_overlap
+    )
+    pval_diffs = [
+        abs(float(py_res["comp_pvals"][i]) - float(mat_res["comp_pvals"][j]))
+        for i, j, _ov in matches
+    ]
+    max_pval_diff = max(pval_diffs) if pval_diffs else 0.0
+
     print("=== NBS Parity Validation ===")
     print(f"Export dir: {export_dir}")
     print(f"MATLAB result: {matlab_mat_path}")
@@ -354,6 +420,12 @@ def main():
     print(f"Python significant components: {len(py_res['comp_pvals'])}")
     print(f"MATLAB significant components: {len(mat_res['comp_pvals'])}")
     print(f"Significant-edge Jaccard: {jaccard:.6f}")
+    print(
+        f"Matched components: {len(matches)}  "
+        f"(python-only: {len(unmatched_py)}, matlab-only: {len(unmatched_mat)})"
+    )
+    if pval_diffs:
+        print(f"Matched-component p-value max|Δ|: {max_pval_diff:.6g}")
     if py_res["comp_pvals"]:
         print("Python p-values:", ", ".join(f"{float(v):.6g}" for v in py_res["comp_pvals"]))
     else:
@@ -363,12 +435,32 @@ def main():
     else:
         print("MATLAB p-values: none")
 
+    failures = []
     if max_abs_t_diff > float(args.tolerance):
-        raise SystemExit(
-            f"FAIL: observed test-statistics differ by max {max_abs_t_diff:.8g} "
-            f"(tolerance {float(args.tolerance):.8g})."
+        failures.append(
+            f"observed test-statistics differ by max {max_abs_t_diff:.8g} "
+            f"(tolerance {float(args.tolerance):.8g})"
         )
-    print("PASS: observed test-statistics match within tolerance.")
+    if jaccard < float(args.min_jaccard):
+        failures.append(
+            f"significant-edge Jaccard {jaccard:.6f} below --min-jaccard "
+            f"{float(args.min_jaccard):.6f}"
+        )
+    if unmatched_py or unmatched_mat:
+        failures.append(
+            f"component structure mismatch: {len(unmatched_py)} python-only, "
+            f"{len(unmatched_mat)} matlab-only component(s) with no overlap "
+            f">= {float(args.min_component_overlap):.2f}"
+        )
+    if max_pval_diff > float(args.pval_tolerance):
+        failures.append(
+            f"matched-component p-values differ by max {max_pval_diff:.6g} "
+            f"(tolerance {float(args.pval_tolerance):.6g})"
+        )
+
+    if failures:
+        raise SystemExit("FAIL: " + "; ".join(failures) + ".")
+    print("PASS: statistics, component structure and p-values all match within tolerance.")
 
 
 if __name__ == "__main__":
