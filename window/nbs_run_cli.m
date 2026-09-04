@@ -61,6 +61,37 @@ matrix_files = dir(fullfile(matrices_dir, 'subject*.txt'));
 if isempty(matrix_files)
     error('No subject*.txt files found in %s', matrices_dir);
 end
+
+% NBSrun (via readUI's directory branch) loads matrices in dir() order -- i.e.
+% lexicographic, not numeric -- and pairs row i of the design matrix with the i'th
+% file in that listing without checking either the count or the order. Unpadded
+% names (subject1.txt, subject2.txt, ..., subject10.txt) sort lexicographically as
+% subject1, subject10, subject2, ... which silently pairs every subject past #1
+% with someone else's covariates. Catch both failure modes here instead.
+design_check = dlmread(design_path);
+n_design = size(design_check, 1);
+if numel(matrix_files) ~= n_design
+    error(['Matrix count (%d) in %s does not match design matrix rows (%d) in %s. ' ...
+           'NBSrun pairs matrices with design rows by listing order, so a mismatched ' ...
+           'count means the pairing would be wrong for every subject.'], ...
+          numel(matrix_files), matrices_dir, n_design, design_path);
+end
+subject_nums = zeros(numel(matrix_files), 1);
+for i = 1:numel(matrix_files)
+    tok = regexp(matrix_files(i).name, '^subject(\d+)\.txt$', 'tokens', 'once');
+    if isempty(tok)
+        error('Unexpected filename in %s: %s (expected subjectNNN.txt)', ...
+              matrices_dir, matrix_files(i).name);
+    end
+    subject_nums(i) = str2double(tok{1});
+end
+if ~isequal(subject_nums, sort(subject_nums))
+    error(['Matrix files in %s are not in numeric subject order under dir() (lexicographic) ' ...
+           'listing: %s. NBSrun pairs the i''th file it lists with the i''th design-matrix row, ' ...
+           'so lexicographic order must equal numeric order -- zero-pad the filenames ' ...
+           '(e.g. subject001.txt) so subject10.txt does not sort before subject2.txt.'], ...
+          matrices_dir, strjoin({matrix_files.name}, ', '));
+end
 first_matrix = fullfile(matrices_dir, matrix_files(1).name);
 
 UI = struct();

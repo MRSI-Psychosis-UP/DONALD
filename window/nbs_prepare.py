@@ -149,6 +149,36 @@ def _slugify_fragment(value):
     return slug or "value"
 
 
+def _describe_contrast_tail(contrast_text: str) -> str:
+    """Summarize the tail a contrast string implies, for display only.
+
+    Mirrors run_nbs.py's own contrast -> tail convention (sign of the numeric
+    entries; 'b' means a two-tailed pos/neg pair with Bonferroni doubling) without
+    importing that CLI module into the GUI process.
+    """
+    text = (contrast_text or "").strip()
+    if not text:
+        return "n/a (contrast required)"
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    parts = [p for p in re.split(r"[,\s]+", text) if p]
+    if any(p.lower() == "b" for p in parts):
+        return "both (two-tailed, Bonferroni-doubled)"
+    try:
+        values = [float(p) for p in parts]
+    except ValueError:
+        return "unknown"
+    has_pos = any(v > 0 for v in values)
+    has_neg = any(v < 0 for v in values)
+    if has_pos and has_neg:
+        return "both (mixed-sign contrast)"
+    if has_pos:
+        return "right (one-tailed)"
+    if has_neg:
+        return "left (one-tailed)"
+    return "unknown"
+
+
 def _connectivity_file_metadata(path: Path) -> dict:
     base_name = Path(path).name
     results = {}
@@ -775,8 +805,17 @@ class NBSPrepareDialog(QDialog):
         custom_layout.addWidget(QLabel("Custom contrast"))
         self.contrast_edit = QLineEdit("")
         self.contrast_edit.setPlaceholderText("e.g. 0 0 1 1 1")
+        self.contrast_edit.setToolTip(
+            "Tail is determined by the sign of the regressor's entry, not a separate setting:\n"
+            "  ...1   -> right-tailed, one run, p-value uncorrected\n"
+            "  ...-1  -> left-tailed, one run, p-value uncorrected\n"
+            "  ...b   -> two-tailed: runs +1 and -1 and Bonferroni-doubles each p-value (capped at 1)\n"
+            "Run the right- and left-tailed contrasts separately if you want to apply your own "
+            "correction for multiple comparisons instead of the built-in two-tailed doubling."
+        )
         custom_layout.addWidget(self.contrast_edit, 1)
         layout.addWidget(custom_contrast_frame)
+        self.contrast_edit.textChanged.connect(self._update_run_summary)
         return page
 
     def _build_step_nbs_settings(self):
@@ -830,8 +869,8 @@ class NBSPrepareDialog(QDialog):
 
         core_grid.addWidget(QLabel("Engine"), 3, 0)
         self.engine_combo = QComboBox()
-        self.engine_combo.addItem("MATLAB (reference)", "matlab")
         self.engine_combo.addItem("Python (MATLAB-compatible)", "python")
+        self.engine_combo.addItem("MATLAB (reference, requires MATLAB)", "matlab")
         self.engine_combo.setCurrentIndex(0)
         self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         self.engine_combo.currentIndexChanged.connect(self._update_run_summary)
@@ -845,17 +884,38 @@ class NBSPrepareDialog(QDialog):
         self.component_size_combo.currentIndexChanged.connect(self._update_run_summary)
         core_grid.addWidget(self.component_size_combo, 3, 3)
 
+        core_grid.addWidget(QLabel("Seed"), 4, 0)
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 2_147_483_647)
+        self.seed_spin.setSpecialValueText("random")
+        self.seed_spin.setValue(0)
+        self.seed_spin.setToolTip(
+            "Seed for the permutation RNG (python engine). Leave at 'random' for a fresh "
+            "null distribution on every run; set a value to make permutations reproducible."
+        )
+        self.seed_spin.valueChanged.connect(self._update_run_summary)
+        core_grid.addWidget(self.seed_spin, 4, 1)
+
+        self.export_matlab_check = QCheckBox("Also export MATLAB NBS1.2 inputs")
+        self.export_matlab_check.setChecked(False)
+        self.export_matlab_check.setToolTip(
+            "Write matrices/, designMatrix.txt, COG.txt and nodeLabels.txt under matlab_nbs/ "
+            "so the same analysis can be reproduced or cross-checked in MATLAB NBS1.2. Not "
+            "needed to run the python engine."
+        )
+        core_grid.addWidget(self.export_matlab_check, 4, 2, 1, 2)
+
         self.matlab_persistent_check = QCheckBox(
             "Persistent MATLAB session (reuse workers between runs)"
         )
         self.matlab_persistent_check.setChecked(True)
-        core_grid.addWidget(self.matlab_persistent_check, 4, 0, 1, 4)
+        core_grid.addWidget(self.matlab_persistent_check, 5, 0, 1, 4)
 
         self.matlab_no_precompute_check = QCheckBox(
             "Skip MATLAB precompute (lower memory, often slower)"
         )
         self.matlab_no_precompute_check.setChecked(False)
-        core_grid.addWidget(self.matlab_no_precompute_check, 5, 0, 1, 4)
+        core_grid.addWidget(self.matlab_no_precompute_check, 6, 0, 1, 4)
         self._on_engine_changed()
 
         layout.addWidget(core_group)
@@ -1169,6 +1229,14 @@ class NBSPrepareDialog(QDialog):
             self.matlab_persistent_check.setEnabled(is_matlab)
         if hasattr(self, "matlab_no_precompute_check"):
             self.matlab_no_precompute_check.setEnabled(is_matlab)
+        if hasattr(self, "export_matlab_check"):
+            if is_matlab:
+                # MATLAB engine always needs its own export; reflect that rather than
+                # letting the user uncheck something the run requires.
+                self.export_matlab_check.setChecked(True)
+            self.export_matlab_check.setEnabled(not is_matlab)
+        if hasattr(self, "seed_spin"):
+            self.seed_spin.setEnabled(not is_matlab)
 
     def _selected_regressor_type(self):
         mode = self.model_regressor_type_combo.currentText().strip().lower()
@@ -1216,14 +1284,24 @@ class NBSPrepareDialog(QDialog):
             if hasattr(self, "component_size_combo")
             else "Extent"
         )
+        tail_label = _describe_contrast_tail(
+            self.contrast_edit.text() if hasattr(self, "contrast_edit") else ""
+        )
+        seed_label = (
+            "random"
+            if not hasattr(self, "seed_spin") or self.seed_spin.value() == self.seed_spin.minimum()
+            else str(int(self.seed_spin.value()))
+        )
         self.run_summary_label.setText(
             f"Engine: {engine_label}\n"
             f"Regressor: {regressor}\n"
             f"Confounds: {confounds}\n"
             f"Test: {test_label}\n"
             f"Component size: {size_label}\n"
+            f"Tail (from contrast): {tail_label}\n"
             f"N included: {n_included}\n"
             f"Permutations: {nperm}\n"
+            f"Seed: {seed_label}\n"
             f"Threshold: {threshold}"
         )
 
@@ -1667,6 +1745,16 @@ class NBSPrepareDialog(QDialog):
             "modality": self.modality_combo.currentText().strip().lower(),
             "matlab_persistent": bool(self.matlab_persistent_check.isChecked()),
             "matlab_no_precompute": bool(self.matlab_no_precompute_check.isChecked()),
+            "seed": (
+                None
+                if not hasattr(self, "seed_spin") or self.seed_spin.value() == self.seed_spin.minimum()
+                else int(self.seed_spin.value())
+            ),
+            "export_matlab": (
+                bool(self.export_matlab_check.isChecked())
+                if hasattr(self, "export_matlab_check")
+                else False
+            ),
             "display_no_show": (not bool(self.display_results_check.isChecked())),
             "display_collapse_parcels": bool(self.display_collapse_check.isChecked()),
             "display_regressor_type": self._selected_export_regressor_type(),
@@ -1759,8 +1847,15 @@ class NBSPrepareDialog(QDialog):
             modality = selected_modality or modality_from_npz or "mrsi"
 
         reg_name = self._regressor_name() or "regressor"
+        # Path.stem only strips ".npz", so re-subsetting a source that is itself an
+        # already-built "..._nbs_input.npz" (e.g. re-importing a prior result's
+        # connectivity_path for verification) would otherwise double the suffix into
+        # "..._nbs_input_key-..._nbs_input.npz".
+        source_stem = self._source_path.stem
+        if source_stem.endswith("_nbs_input"):
+            source_stem = source_stem[: -len("_nbs_input")]
         subset_name = (
-            f"{self._source_path.stem}_key-{_slugify_fragment(self._matrix_key)}"
+            f"{source_stem}_key-{_slugify_fragment(self._matrix_key)}"
             f"_reg-{_slugify_fragment(reg_name)}_n-{indices.size}_nbs_input.npz"
         )
         subset_path = self._source_path.with_name(subset_name)
@@ -1825,6 +1920,10 @@ class NBSPrepareDialog(QDialog):
         ]
         if engine == "python":
             command += ["--python-impl", "matlab_compat"]
+            if hasattr(self, "seed_spin") and self.seed_spin.value() != self.seed_spin.minimum():
+                command += ["--seed", str(int(self.seed_spin.value()))]
+        if hasattr(self, "export_matlab_check") and self.export_matlab_check.isChecked():
+            command.append("--export-matlab")
         if nuisance_terms:
             command += ["--nuisance", ",".join(str(x) for x in nuisance_terms)]
 
