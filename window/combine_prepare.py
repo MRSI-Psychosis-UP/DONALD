@@ -13,6 +13,7 @@ try:
         QGroupBox,
         QHBoxLayout,
         QLabel,
+        QProgressBar,
         QPushButton,
         QVBoxLayout,
     )
@@ -24,6 +25,7 @@ except Exception:
         QGroupBox,
         QHBoxLayout,
         QLabel,
+        QProgressBar,
         QPushButton,
         QVBoxLayout,
     )
@@ -49,6 +51,8 @@ class CombinePrepareDialog(QDialog):
         ("Addition", "add"),
         ("Subtraction", "subtract"),
         ("Intersect", "intersect"),
+        ("Correct", "correct"),
+        ("Spatial Correction", "spatial_correction"),
         ("Correlation", "correlation"),
         ("Elementwise Product", "elementwise_product"),
         ("Matrix Multiplication", "matmul"),
@@ -113,6 +117,12 @@ class CombinePrepareDialog(QDialog):
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         root_layout.addWidget(self.status_label, 0)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("")
+        self.progress_bar.setVisible(False)
+        root_layout.addWidget(self.progress_bar, 0)
 
         result_group = QGroupBox("Result")
         result_layout = QVBoxLayout(result_group)
@@ -175,12 +185,25 @@ class CombinePrepareDialog(QDialog):
     def set_status(self, text: str):
         self.status_label.setText(str(text or ""))
 
+    def set_progress(self, minimum: int, maximum: int, value: int, text: str = ""):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(int(minimum), int(maximum))
+        self.progress_bar.setValue(int(value))
+        self.progress_bar.setFormat(str(text or ""))
+
+    def clear_progress(self):
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("")
+        self.progress_bar.setVisible(False)
+
     def set_can_confirm(self, enabled: bool):
         self.confirm_button.setEnabled(bool(enabled) and self._confirm_callback is not None)
 
     def clear_result(self, message: str = "No result yet."):
         self._result_payload = {"kind": "empty", "message": str(message or "No result yet.")}
         self.set_can_confirm(False)
+        self.clear_progress()
         self._render_result_payload()
 
     def show_matrix_result(self, matrix, *, title: str = "", summary_text: str = ""):
@@ -220,12 +243,20 @@ class CombinePrepareDialog(QDialog):
         self._render_result_payload()
 
     def _refresh_process_button(self):
+        operation = self.selected_operation()
+        needs_matrix_b = operation != "spatial_correction"
+        self.matrix_b_combo.setEnabled(bool(needs_matrix_b))
         enabled = (
             self._process_callback is not None
             and self.matrix_a_combo.count() > 0
-            and self.matrix_b_combo.count() > 0
             and self.selected_matrix_a_id() is not None
-            and self.selected_matrix_b_id() is not None
+            and (
+                not needs_matrix_b
+                or (
+                    self.matrix_b_combo.count() > 0
+                    and self.selected_matrix_b_id() is not None
+                )
+            )
         )
         self.process_button.setEnabled(enabled)
 
@@ -236,10 +267,11 @@ class CombinePrepareDialog(QDialog):
     def _trigger_process(self):
         if self._process_callback is None:
             return
+        operation = self.selected_operation()
         self._process_callback(
             self.selected_matrix_a_id(),
-            self.selected_matrix_b_id(),
-            self.selected_operation(),
+            None if operation == "spatial_correction" else self.selected_matrix_b_id(),
+            operation,
         )
 
     def _trigger_confirm(self):

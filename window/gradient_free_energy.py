@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free-energy order plot dialog for gradient path analysis."""
+"""Free-energy histogram dialog for gradient path analysis."""
 
 from pathlib import Path
 
@@ -29,7 +29,7 @@ def _dialog_theme_stylesheet(theme_name="Dark"):
 
 
 class GradientFreeEnergyDialog(QDialog):
-    """Order-plot viewer for path directionality energies and free energies."""
+    """Histogram viewer for path directionality energies and free energies."""
 
     def __init__(self, payload, *, parent=None, theme_name="Dark"):
         super().__init__(parent)
@@ -44,10 +44,13 @@ class GradientFreeEnergyDialog(QDialog):
         lambda_value = float(self._payload.get("lambda", 1.0))
         axis_text = f"{str(self._payload.get('y_axis_label', 'Y'))} vs {str(self._payload.get('x_axis_label', 'X'))}"
         include_line_proximity = bool(self._payload.get("use_line_proximity_energy", True))
+        normalize_by_segments = bool(self._payload.get("normalize_energy_by_segments", False))
         if include_line_proximity:
-            energy_text = "Energy = sum((1 - step_unit dot ref_unit) + d_line / |ref|)"
+            energy_text = "Energy = sum((|step| - step dot ref_unit) + |step| * d_line / |ref|)"
         else:
-            energy_text = "Energy = sum(1 - step_unit dot ref_unit)"
+            energy_text = "Energy = sum(|step| - step dot ref_unit)"
+        if normalize_by_segments:
+            energy_text += " / segments"
         self.info_label = QLabel(
             f"lambda = {lambda_value:.3f} | {energy_text} | {axis_text}"
         )
@@ -86,7 +89,8 @@ class GradientFreeEnergyDialog(QDialog):
         axes = np.asarray(self.figure.subplots(n_rows, n_cols, squeeze=False), dtype=object)
         title_text = str(self._payload.get("title", "Gradients"))
         rotation_text = str(self._payload.get("rotation", "Default"))
-        self.figure.suptitle(f"Free Energy Order Plot - {title_text} | Rotation: {rotation_text}", fontsize=12)
+        norm_text = " | Energy/segments" if bool(self._payload.get("normalize_energy_by_segments", False)) else ""
+        self.figure.suptitle(f"Free Energy Histogram - {title_text} | Rotation: {rotation_text}{norm_text}", fontsize=12)
 
         for row_idx, group in enumerate(groups):
             families = [dict(family) for family in list(group.get("families", []))]
@@ -101,35 +105,35 @@ class GradientFreeEnergyDialog(QDialog):
                     ax.text(0.5, 0.5, "No paths", ha="center", va="center")
                     ax.axis("off")
                     continue
-                x_order = np.arange(1, energies.size + 1, dtype=int)
                 color = np.asarray(family.get("color", (0.2, 0.2, 0.2)), dtype=float).reshape(-1)
                 if color.shape != (3,):
                     color = np.asarray((0.2, 0.2, 0.2), dtype=float)
                 free_energy = float(family.get("free_energy", float("nan")))
-                ax.plot(
-                    x_order,
+                mean_energy = float(np.mean(energies)) if energies.size else float("nan")
+                n_bins = max(6, min(20, int(np.ceil(np.sqrt(energies.size)))))
+                ax.hist(
                     energies,
+                    bins=n_bins,
                     color=tuple(color.tolist()),
-                    marker="o",
-                    markersize=3.8,
-                    linewidth=1.2,
-                    alpha=0.95,
+                    alpha=0.7,
+                    edgecolor="#111827",
+                    linewidth=0.8,
                 )
-                if np.isfinite(free_energy):
-                    ax.axhline(
-                        free_energy,
+                if np.isfinite(mean_energy):
+                    ax.axvline(
+                        mean_energy,
                         color=tuple(color.tolist()),
                         linestyle="--",
-                        linewidth=1.0,
-                        alpha=0.7,
+                        linewidth=1.3,
+                        alpha=0.95,
                     )
                 ax.set_title(
                     f"{str(group.get('group', 'all')).upper()} | {str(family.get('label', 'path'))}\n"
                     f"F={free_energy:.4f} | n={int(family.get('n_paths', energies.size))}",
                     fontsize=10,
                 )
-                ax.set_xlabel("Ordered path rank")
-                ax.set_ylabel("Energy")
+                ax.set_xlabel("Energy / segments" if bool(self._payload.get("normalize_energy_by_segments", False)) else "Energy")
+                ax.set_ylabel("Count")
                 ax.grid(True, alpha=0.25)
 
         self.canvas.draw_idle()

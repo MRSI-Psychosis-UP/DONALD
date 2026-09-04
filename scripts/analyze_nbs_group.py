@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import argparse, os
+import argparse, json, os
 from os.path import isfile, join
 import numpy as np
 import pandas as pd
@@ -14,14 +14,20 @@ import matplotlib.colors as mcolors
 import matplotlib.patches as m_patches
 import matplotlib.path as m_path
 
-from tools.debug import Debug
-from tools.datautils import DataUtils
-from connectomics.nettools import NetTools
+try:
+    from mrsitoolbox.tools.debug import Debug
+    from mrsitoolbox.tools.datautils import DataUtils
+    from mrsitoolbox.connectomics.nettools import NetTools
+    from mrsitoolbox.graphplot.circular import plot_connectivity_circle
+    from mrsitoolbox.graphplot.colorbar import ColorBar
+except ImportError as exc:
+    raise ImportError(
+        "analyze_nbs_group.py requires the current mrsitoolbox pip package. "
+        "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+    ) from exc
 import matplotlib.pyplot as plt
 from rich.table import Table
 from rich.console import Console
-from graphplot.circular import plot_connectivity_circle
-from graphplot.colorbar import ColorBar
 from scipy.interpolate import make_interp_spline
 from scipy.stats import zscore
 from matplotlib.lines import Line2D
@@ -81,6 +87,307 @@ def collapse_parcels(con_matrix, parcel_names, node_values, significant_indices)
         sig_labels.add(base)
 
     return collapsed_matrix, collapsed_names, collapsed_values, sig_labels
+
+
+def exclude_parcels_by_substring(
+    con_matrix,
+    parcel_names,
+    node_values,
+    node_values_ref,
+    substrings,
+    parcel_labels=None,
+):
+    """Remove matching parcels while preserving alignment across plot arrays."""
+    normalized = tuple(
+        token.strip().lower()
+        for value in substrings
+        for token in str(value).split(",")
+        if token.strip()
+    )
+    names = [str(name) for name in parcel_names]
+    if not normalized:
+        return con_matrix, names, node_values, node_values_ref, parcel_labels, []
+
+    keep_indices = [
+        idx
+        for idx, name in enumerate(names)
+        if not any(token in name.lower() for token in normalized)
+    ]
+    excluded_names = [name for idx, name in enumerate(names) if idx not in keep_indices]
+    if not keep_indices:
+        raise ValueError(
+            "--exclude-parcel-substring removed every parcel from the circular plot."
+        )
+
+    keep = np.asarray(keep_indices, dtype=int)
+    filtered_matrix = np.asarray(con_matrix)[np.ix_(keep, keep)]
+    filtered_values = np.asarray(node_values)[keep]
+    filtered_values_ref = (
+        np.asarray(node_values_ref)[keep] if node_values_ref is not None else None
+    )
+    filtered_labels = (
+        np.asarray(parcel_labels)[keep] if parcel_labels is not None else None
+    )
+    filtered_names = [names[idx] for idx in keep_indices]
+    return (
+        filtered_matrix,
+        filtered_names,
+        filtered_values,
+        filtered_values_ref,
+        filtered_labels,
+        excluded_names,
+    )
+
+
+def _object_items(value):
+    """Normalize object-array/list payloads from saved NPZ dictionaries."""
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            value = value.item()
+        else:
+            return value.reshape(-1).tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _object_dict(value):
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        value = value.item()
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _path_parcel_token(name, collapse_parcels=False):
+    token = str(name).strip().lower()
+    if collapse_parcels:
+        token = re.sub(r"_(\d+)$", "", token)
+    return token
+
+
+def _path_channel_order(value):
+    order = []
+    for channel in str(value or "").strip().upper():
+        if channel in {"R", "G", "B"} and channel not in order:
+            order.append(channel)
+    return "".join(order) if len(order) == 3 else ""
+
+
+def load_highlight_path_sequence(
+    paths_npz,
+    *,
+    path_group="any",
+    path_index=None,
+    random_seed=None,
+    collapse_parcels=False,
+):
+    """Select complete three-endpoint CTX paths and induced GM-adjacency edges."""
+    input_path = os.path.abspath(os.path.expanduser(str(paths_npz)))
+    if not isfile(input_path):
+        raise FileNotFoundError(f"Free-energy paths NPZ not found: {input_path}")
+
+    with np.load(input_path, allow_pickle=True) as path_data:
+        if "groups" not in path_data.files:
+            raise ValueError(f"Free-energy paths NPZ has no 'groups' payload: {input_path}")
+        source_parcel_names = (
+            np.asarray(path_data["parcel_names"], dtype=object).reshape(-1)
+            if "parcel_names" in path_data.files
+            else np.asarray([], dtype=object)
+        )
+        adjacency_path = (
+            str(np.asarray(path_data["adjacency_path"]).reshape(-1)[0]).strip()
+            if "adjacency_path" in path_data.files
+            else ""
+        )
+        candidates_by_group = {"lh": [], "rh": []}
+        for raw_group in _object_items(path_data["groups"]):
+            group_dict = _object_dict(raw_group)
+            group_name = str(group_dict.get("group", "")).strip().lower()
+            if group_name not in candidates_by_group:
+                continue
+            path_order = _path_channel_order(
+                group_dict.get("path_order", group_dict.get("color_order", ""))
+            )
+            if not path_order:
+                continue
+            required_route_segments = [
+                path_order[0] + path_order[1],
+                path_order[1] + path_order[2],
+            ]
+            saved_segment_labels = [
+                str(label).strip().upper()
+                for label in _object_items(group_dict.get("ctx_segment_labels", []))
+                if str(label).strip()
+            ]
+            records = _object_items(group_dict.get("ctx_paths", []))
+            if not records and group_dict.get("ctx_optimal_path") is not None:
+                records = [group_dict.get("ctx_optimal_path")]
+            for record_index, raw_record in enumerate(records, start=1):
+                record = _object_dict(raw_record)
+                segment_labels = [
+                    str(label).strip().upper()
+                    for label in _object_items(record.get("segment_labels", []))
+                    if str(label).strip()
+                ]
+                record_order = _path_channel_order(record.get("path_label", ""))
+                if record_order and record_order != path_order:
+                    continue
+                effective_segment_labels = segment_labels or saved_segment_labels
+                if not all(
+                    label in effective_segment_labels for label in required_route_segments
+                ):
+                    continue
+                node_names = [
+                    str(name)
+                    for name in _object_items(record.get("node_names", []))
+                    if str(name).strip()
+                ]
+                if not node_names:
+                    for raw_node in _object_items(record.get("nodes", [])):
+                        try:
+                            node_index = int(raw_node)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= node_index < source_parcel_names.size:
+                            node_names.append(str(source_parcel_names[node_index]))
+                if node_names:
+                    candidates_by_group[group_name].append(
+                        {
+                            "group": group_name or "unknown",
+                            "record_index": record_index,
+                            "node_names": node_names,
+                            "path_order": path_order,
+                            "segment_labels": effective_segment_labels,
+                        }
+                    )
+
+    rng = np.random.default_rng(random_seed)
+
+    def _select_candidate(candidates, selection_label):
+        if not candidates:
+            raise ValueError(
+                f"No saved complete three-endpoint CTX paths matched group "
+                f"'{selection_label}' in {input_path}."
+            )
+        if path_index is None:
+            selected_position = int(rng.integers(0, len(candidates)))
+        else:
+            selected_position = int(path_index) - 1
+            if selected_position < 0 or selected_position >= len(candidates):
+                raise ValueError(
+                    f"--highlight-path-index must be between 1 and {len(candidates)} "
+                    f"for group '{selection_label}'."
+                )
+        selected = dict(candidates[selected_position])
+        selected["candidate_index"] = selected_position + 1
+        selected["candidate_count"] = len(candidates)
+        return selected
+
+    if path_group == "both":
+        selections = [
+            _select_candidate(candidates_by_group["lh"], "lh"),
+            _select_candidate(candidates_by_group["rh"], "rh"),
+        ]
+    elif path_group in {"lh", "rh"}:
+        selections = [_select_candidate(candidates_by_group[path_group], path_group)]
+    else:
+        all_candidates = candidates_by_group["lh"] + candidates_by_group["rh"]
+        selections = [_select_candidate(all_candidates, "any")]
+
+    tokens = {
+        _path_parcel_token(name, collapse_parcels=collapse_parcels)
+        for selected in selections
+        for name in selected["node_names"]
+    }
+    tokens.discard("")
+    for selected in selections:
+        selected["unique_parcel_count"] = len(
+            {
+                _path_parcel_token(name, collapse_parcels=collapse_parcels)
+                for name in selected["node_names"]
+            }
+        )
+        selected["input_path"] = input_path
+
+    if adjacency_path and not os.path.isabs(adjacency_path):
+        adjacency_path = os.path.join(os.path.dirname(input_path), adjacency_path)
+    adjacency_path = os.path.abspath(os.path.expanduser(adjacency_path))
+    if not adjacency_path or not isfile(adjacency_path):
+        raise FileNotFoundError(
+            f"GM adjacency referenced by the free-energy paths NPZ was not found: {adjacency_path}"
+        )
+    with np.load(adjacency_path, allow_pickle=True) as adjacency_data:
+        if "adjacency_mat" not in adjacency_data.files:
+            raise ValueError(f"GM adjacency NPZ has no 'adjacency_mat': {adjacency_path}")
+        adjacency_matrix = np.asarray(adjacency_data["adjacency_mat"], dtype=float)
+        adjacency_names = (
+            np.asarray(adjacency_data["parcel_names"], dtype=object).reshape(-1)
+            if "parcel_names" in adjacency_data.files
+            else source_parcel_names
+        )
+    if adjacency_matrix.shape != (adjacency_names.size, adjacency_names.size):
+        raise ValueError(
+            f"GM adjacency shape {adjacency_matrix.shape} does not match "
+            f"{adjacency_names.size} parcel names."
+        )
+
+    selected_exact_tokens = {
+        _path_parcel_token(name, collapse_parcels=False)
+        for selected in selections
+        for name in selected["node_names"]
+    }
+    selected_adjacency_indices = [
+        idx
+        for idx, name in enumerate(adjacency_names)
+        if _path_parcel_token(name, collapse_parcels=False) in selected_exact_tokens
+    ]
+    edge_name_pairs = []
+    if selected_adjacency_indices:
+        selected_idx = np.asarray(selected_adjacency_indices, dtype=int)
+        selected_matrix = adjacency_matrix[np.ix_(selected_idx, selected_idx)]
+        edge_rows, edge_cols = np.where(np.triu(selected_matrix != 0, k=1))
+        edge_name_pairs = [
+            (
+                str(adjacency_names[selected_idx[row]]),
+                str(adjacency_names[selected_idx[col]]),
+            )
+            for row, col in zip(edge_rows.tolist(), edge_cols.tolist())
+        ]
+    if not edge_name_pairs:
+        raise ValueError(
+            "The selected saved path parcels have no matching edges in the referenced GM adjacency."
+        )
+    return tokens, selections, edge_name_pairs, adjacency_path
+
+
+def build_path_gm_adjacency(parcel_names, edge_name_pairs, *, collapse_parcels=False):
+    """Build a binary GM-adjacency matrix aligned to the plotted parcel order."""
+    name_to_index = {
+        _path_parcel_token(name, collapse_parcels=collapse_parcels): idx
+        for idx, name in enumerate(parcel_names)
+    }
+    matrix = np.zeros((len(parcel_names), len(parcel_names)), dtype=float)
+    matched_edges = 0
+    for source_name, target_name in edge_name_pairs:
+        source_idx = name_to_index.get(
+            _path_parcel_token(source_name, collapse_parcels=collapse_parcels)
+        )
+        target_idx = name_to_index.get(
+            _path_parcel_token(target_name, collapse_parcels=collapse_parcels)
+        )
+        if source_idx is None or target_idx is None or source_idx == target_idx:
+            continue
+        if matrix[source_idx, target_idx] == 0:
+            matched_edges += 1
+        matrix[source_idx, target_idx] = 1.0
+        matrix[target_idx, source_idx] = 1.0
+    return matrix, matched_edges
 
 
 def _draw_similarity_edge(ax, theta_a, theta_b, radius=8.5, color="white", linewidth=3.5):
@@ -167,7 +474,7 @@ def compute_cluster_metab_deltas(
     ref_group: float,
     n_clusters: int,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Cluster cmp MS-mode values and compute metabolic profile deltas per node."""
+    """Cluster compare-group Gradient values and compute metabolic profile deltas per node."""
     cmp_values = np.asarray(cmp_values, dtype=float)
     ref_values = np.asarray(ref_values, dtype=float)
     if cmp_values.size == 0 or significant_indices.size == 0:
@@ -197,6 +504,262 @@ def compute_cluster_metab_deltas(
         ref_profile = np.nanmean(ref_subset, axis=reduce_axes)
         deltas[mask] = ref_profile - cmp_profile
     return deltas, cluster_labels
+
+
+def _load_gradient_rgb_payload(path_value):
+    if path_value is None or str(path_value).strip() == "":
+        return None
+    path = os.path.expanduser(str(path_value))
+    if not os.path.isfile(path):
+        debug.warning(f"Gradient RGB payload not found: {path}")
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        debug.warning(f"Failed to read Gradient RGB payload {path}: {exc}")
+        return None
+    if not isinstance(payload, dict) or not bool(payload.get("enabled", False)):
+        return None
+    model = payload.get("model")
+    if not isinstance(model, dict):
+        debug.warning("Gradient RGB payload is missing its fitted model.")
+        return None
+    if "vertices" not in model or "anchor_points" not in model:
+        debug.warning("Gradient RGB payload model is missing vertices/anchor points.")
+        return None
+    payload["payload_path"] = path
+    return payload
+
+
+def _lookup_token(value):
+    token = str(value).strip().lower()
+    if not token:
+        return ""
+    token = re.sub(r"\s+", " ", token)
+    return token
+
+
+def _add_lookup_token(lookup, value, index):
+    token = _lookup_token(value)
+    if token:
+        lookup.setdefault(token, int(index))
+        lookup.setdefault(re.sub(r"_(\d+)$", "", token), int(index))
+    try:
+        numeric = int(float(str(value).strip()))
+        lookup.setdefault(str(numeric), int(index))
+    except Exception:
+        pass
+
+
+def _payload_reference_coords(payload, parcel_labels, parcel_names):
+    x_values = np.asarray(payload.get("rgb_x_values", []), dtype=float).reshape(-1)
+    y_values = np.asarray(payload.get("rgb_y_values", []), dtype=float).reshape(-1)
+    if x_values.size == 0 or x_values.shape != y_values.shape:
+        return None, 0
+
+    lookup = {}
+    point_ids = list(payload.get("point_ids", []))
+    point_labels = list(payload.get("point_labels", []))
+    for idx in range(x_values.size):
+        if idx < len(point_ids):
+            _add_lookup_token(lookup, point_ids[idx], idx)
+        if idx < len(point_labels):
+            _add_lookup_token(lookup, point_labels[idx], idx)
+
+    parcel_labels = np.asarray(parcel_labels).reshape(-1)
+    parcel_names = np.asarray(parcel_names, dtype=object).reshape(-1)
+    coords = np.full((parcel_labels.size, 2), np.nan, dtype=float)
+    matched = 0
+    for out_idx, label in enumerate(parcel_labels.tolist()):
+        candidates = [label]
+        if out_idx < parcel_names.size:
+            candidates.append(parcel_names[out_idx])
+        source_idx = None
+        for candidate in candidates:
+            token = _lookup_token(candidate)
+            source_idx = lookup.get(token)
+            if source_idx is None:
+                source_idx = lookup.get(re.sub(r"_(\d+)$", "", token))
+            if source_idx is not None:
+                break
+        if source_idx is None:
+            continue
+        coords[out_idx, 0] = x_values[int(source_idx)]
+        coords[out_idx, 1] = y_values[int(source_idx)]
+        matched += 1
+    return coords, matched
+
+
+def _align_coords_to_reference(coords, reference_coords):
+    coords = np.asarray(coords, dtype=float)
+    reference_coords = np.asarray(reference_coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 2 or reference_coords.shape != coords.shape:
+        return coords, 0
+    finite_mask = np.all(np.isfinite(coords), axis=1) & np.all(np.isfinite(reference_coords), axis=1)
+    if np.count_nonzero(finite_mask) < 3:
+        return coords, int(np.count_nonzero(finite_mask))
+
+    source = coords[finite_mask]
+    target = reference_coords[finite_mask]
+    source_mean = np.nanmean(source, axis=0, keepdims=True)
+    target_mean = np.nanmean(target, axis=0, keepdims=True)
+    source_centered = source - source_mean
+    target_centered = target - target_mean
+    denom = float(np.sum(np.square(source_centered)))
+    if not np.isfinite(denom) or denom <= 1e-12:
+        return coords, int(np.count_nonzero(finite_mask))
+    try:
+        u_mat, singular_values, vt_mat = np.linalg.svd(source_centered.T @ target_centered)
+    except Exception:
+        return coords, int(np.count_nonzero(finite_mask))
+    rotation = u_mat @ vt_mat
+    scale = float(np.sum(singular_values) / denom)
+    aligned = (coords - source_mean) @ rotation * scale + target_mean
+    return np.asarray(aligned, dtype=float), int(np.count_nonzero(finite_mask))
+
+
+def _normalized_rgb_order(model, fallback="RBG"):
+    raw = str(dict(model or {}).get("order", fallback) or fallback).strip().upper()
+    order = []
+    for channel in raw:
+        if channel in {"R", "G", "B"} and channel not in order:
+            order.append(channel)
+    for channel in str(fallback or "RBG").strip().upper():
+        if channel in {"R", "G", "B"} and channel not in order:
+            order.append(channel)
+    for channel in ("R", "G", "B"):
+        if channel not in order:
+            order.append(channel)
+    return order[:3]
+
+
+def _triangle_rgb_weights_from_model(x_values, y_values, model):
+    x_valid = np.asarray(x_values, dtype=float).reshape(-1)
+    y_valid = np.asarray(y_values, dtype=float).reshape(-1)
+    weights_full = np.zeros((x_valid.shape[0], 3), dtype=float)
+    finite_mask = np.isfinite(x_valid) & np.isfinite(y_valid)
+    if not np.any(finite_mask):
+        return weights_full
+    vertices = np.asarray(model.get("vertices"), dtype=float)
+    if vertices.shape != (3, 2):
+        return weights_full
+    v0, v1, v2 = vertices
+    denom = (v1[1] - v2[1]) * (v0[0] - v2[0]) + (v2[0] - v1[0]) * (v0[1] - v2[1])
+    if np.isclose(denom, 0.0):
+        return weights_full
+    points = np.column_stack((x_valid[finite_mask], y_valid[finite_mask]))
+    w0 = (
+        (v1[1] - v2[1]) * (points[:, 0] - v2[0])
+        + (v2[0] - v1[0]) * (points[:, 1] - v2[1])
+    ) / denom
+    w1 = (
+        (v2[1] - v0[1]) * (points[:, 0] - v2[0])
+        + (v0[0] - v2[0]) * (points[:, 1] - v2[1])
+    ) / denom
+    w2 = 1.0 - w0 - w1
+    weights = np.column_stack((w0, w1, w2))
+    weights = np.clip(weights, 0.0, 1.0)
+    weight_sum = weights.sum(axis=1, keepdims=True)
+    weight_sum[weight_sum <= 0.0] = 1.0
+    weights_full[finite_mask] = weights / weight_sum
+    return weights_full
+
+
+def _square_rgb_weights_from_model(x_values, y_values, model):
+    x_valid = np.asarray(x_values, dtype=float).reshape(-1)
+    y_valid = np.asarray(y_values, dtype=float).reshape(-1)
+    weights_full = np.zeros((x_valid.shape[0], 3), dtype=float)
+    finite_mask = np.isfinite(x_valid) & np.isfinite(y_valid)
+    if not np.any(finite_mask):
+        return weights_full
+    anchors = np.asarray(model.get("anchor_points"), dtype=float)
+    if anchors.shape != (3, 2):
+        return weights_full
+    points = np.column_stack((x_valid[finite_mask], y_valid[finite_mask]))
+    distances = np.sqrt(np.sum(np.square(points[:, np.newaxis, :] - anchors[np.newaxis, :, :]), axis=2))
+    weights = 1.0 / np.maximum(distances, 1e-9)
+    close_mask = distances <= 1e-9
+    if np.any(close_mask):
+        for row_idx in np.flatnonzero(np.any(close_mask, axis=1)).tolist():
+            weights[row_idx, :] = close_mask[row_idx, :].astype(float)
+    weight_sum = weights.sum(axis=1, keepdims=True)
+    weight_sum[weight_sum <= 0.0] = 1.0
+    weights_full[finite_mask] = weights / weight_sum
+    return weights_full
+
+
+def _rgb_scalar_from_model(x_values, y_values, model, fallback_order="RBG"):
+    fit_mode = str(dict(model or {}).get("fit_mode", "triangle") or "triangle").strip().lower()
+    if fit_mode == "square":
+        weights = _square_rgb_weights_from_model(x_values, y_values, model)
+    else:
+        weights = _triangle_rgb_weights_from_model(x_values, y_values, model)
+    scalar_map = {"R": 0.0, "B": 0.5, "G": 1.0}
+    order = _normalized_rgb_order(model, fallback=fallback_order)
+    vertex_scalars = np.asarray(
+        [scalar_map.get(channel, float(idx)) for idx, channel in enumerate(order)],
+        dtype=float,
+    )
+    scalar_values = np.full(weights.shape[0], np.nan, dtype=float)
+    valid_mask = np.sum(weights, axis=1) > 0.0
+    if np.any(valid_mask):
+        scalar_values[valid_mask] = weights[valid_mask] @ vertex_scalars
+    return scalar_values
+
+
+def _gradient_pair_from_matrix(matrix):
+    matrix_arr = np.asarray(matrix, dtype=float)
+    gradient1 = nettools.dimreduce_matrix(
+        matrix_arr,
+        method="diffusion",
+        output_dim=1,
+        scale_factor=1.0,
+        norm=False,
+    )
+    gradient2 = nettools.dimreduce_matrix(
+        matrix_arr,
+        method="diffusion",
+        output_dim=2,
+        scale_factor=1.0,
+        norm=False,
+    )
+    return np.column_stack((np.asarray(gradient2, dtype=float), np.asarray(gradient1, dtype=float)))
+
+
+def _gradient_values_from_payload(matrix, payload, parcel_labels, parcel_names):
+    coords = _gradient_pair_from_matrix(matrix)
+    reference_coords, matched = _payload_reference_coords(payload, parcel_labels, parcel_names)
+    if reference_coords is not None and matched >= 3:
+        coords, aligned_count = _align_coords_to_reference(coords, reference_coords)
+        if aligned_count >= 3:
+            debug.info(f"Aligned group Gradient coordinates to triangular RGB payload ({aligned_count} nodes).")
+    else:
+        debug.warning("Gradient RGB payload did not match enough parcel labels; using unaligned group coordinates.")
+    model = dict(payload.get("model") or {})
+    fallback_order = str(payload.get("color_order", model.get("order", "RBG")) or "RBG")
+    return _rgb_scalar_from_model(coords[:, 0], coords[:, 1], model, fallback_order=fallback_order)
+
+
+def _gradient_values_from_matrix(matrix, color_order="RBG"):
+    try:
+        if hasattr(nettools, "metsim_triangle_scalar_values"):
+            return np.asarray(
+                nettools.metsim_triangle_scalar_values(
+                    matrix,
+                    color_order=color_order,
+                    x_component=2,
+                    y_component=1,
+                    scale_factor=1.0,
+                    return_details=False,
+                ),
+                dtype=float,
+            )
+    except Exception as exc:
+        debug.warning(f"Triangular RGB scalar helper failed; falling back to local model: {exc}")
+    coords = _gradient_pair_from_matrix(matrix)
+    model = nettools.triangular_rgb_model(coords[:, 0], coords[:, 1], color_order=color_order)
+    return _rgb_scalar_from_model(coords[:, 0], coords[:, 1], model, fallback_order=color_order)
 
 
 def _normalize_id(value: str) -> str:
@@ -253,9 +816,17 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument(
     "--result",
-    required=False,
+    required=True,
     help="Path to the component NPZ produced by nbs_groups.py.",
-    default="/home/flucchetti/Connectome/Dev/mrsitoolbox/results/controls_vs_patients/nbs/LPN-Project/connectome_plots/group/group-LPN-Project_parc-LFMIHIFIS_scale-3_diag-controls_perm-freedman_nperm-1024_th-3.75_reg-state_nuis-age-sex_lobes-all_comp-2_results.npz",
+)
+parser.add_argument(
+    "--output-path",
+    "--output",
+    default=None,
+    help=(
+        "Optional circular-plot output path. The filename must end in .pdf, .svg, "
+        "or .png; parent directories are created automatically."
+    ),
 )
 parser.add_argument(
     "--similarity-hubs-left",
@@ -273,7 +844,7 @@ parser.add_argument(
     "--nclusters",
     type=int,
     default=5,
-    help="Number of Gaussian clusters for MS-mode metabolic profiling.",
+    help="Number of Gaussian clusters for Gradient metabolic profiling.",
 )
 parser.add_argument(
     "--metabolite-delta-mode",
@@ -300,9 +871,16 @@ parser.add_argument(
     help="Run analysis for all subject-session pairs found in the NPZ subset.",
 )
 parser.add_argument(
+    "--align-compare-gradient",
+    action="store_true",
+    dest="align_compare_gradient",
+    help="Compatibility flag; Gradient alignment is handled by the RGB payload when available.",
+)
+parser.add_argument(
     "--align-compare-msmode",
     action="store_true",
-    help="Allow flipping the compare-group MS-mode to better align with controls.",
+    dest="align_compare_gradient",
+    help=argparse.SUPPRESS,
 )
 parser.add_argument(
     "--aggregate-deltas",
@@ -313,6 +891,25 @@ parser.add_argument(
     "--no-show",
     action="store_true",
     help="Disable interactive plot display (useful for batch mode).",
+)
+parser.add_argument(
+    "--hide-node-labels",
+    "--hide-label-names",
+    action="store_true",
+    help="Hide parcel names around the circular plot.",
+)
+parser.add_argument(
+    "--hide-colorbar",
+    "--hide-colorbars",
+    action="store_true",
+    help="Hide all circular-plot colorbars and their labels.",
+)
+parser.add_argument(
+    "--theme",
+    "--plot-theme",
+    choices=["dark", "light"],
+    default="dark",
+    help="Circular-plot theme. Default: dark; light uses a white background and black path edges.",
 )
 parser.add_argument(
     "--display_ppath",
@@ -346,11 +943,108 @@ parser.add_argument(
     action="store_true",
     help="Collapse parcel names ending with _<int> into base parcels before plotting.",
 )
+parser.add_argument(
+    "--exclude-parcel-substring",
+    "--exclude-parcel-substrings",
+    action="append",
+    default=[],
+    metavar="TEXT",
+    help=(
+        "Exclude circular-plot parcels whose names contain TEXT (case-insensitive). "
+        "Repeat this option or provide comma-separated substrings."
+    ),
+)
+parser.add_argument(
+    "--highlight-paths-npz",
+    "--highlight-path-npz",
+    "--paths-npz",
+    default=None,
+    help=(
+        "Optional *_desc-free_energy_paths.npz archive. One saved CTX path is selected "
+        "and only its parcels retain their group colors in the circular plot."
+    ),
+)
+parser.add_argument(
+    "--highlight-path-group",
+    choices=["any", "lh", "rh", "both"],
+    default="any",
+    help=(
+        "Hemisphere from which to select a full saved CTX path. 'both' selects one "
+        "independent path from each hemisphere. Default: any."
+    ),
+)
+parser.add_argument(
+    "--highlight-path-index",
+    type=int,
+    default=None,
+    help="Optional 1-based path index within the selected group; default selects randomly.",
+)
+parser.add_argument(
+    "--highlight-path-seed",
+    type=int,
+    default=None,
+    help="Optional random seed used when --highlight-path-index is omitted.",
+)
+parser.add_argument(
+    "--gradient-rgb-payload",
+    default=None,
+    help=(
+        "JSON payload exported by the active Gradient scatter triangular RGB view. "
+        "When present, NBS node values are scalarized from that fitted RGB model."
+    ),
+)
 
 args = parser.parse_args()
+if args.output_path:
+    args.output_path = os.path.abspath(os.path.expanduser(args.output_path))
+    output_extension = os.path.splitext(args.output_path)[1].lower()
+    if output_extension not in {".pdf", ".svg", ".png"}:
+        parser.error("--output-path must end in .pdf, .svg, or .png.")
+    if args.batch:
+        parser.error("--output-path cannot be used with --batch because each run needs a unique file.")
+if not args.highlight_paths_npz and (
+    args.highlight_path_index is not None or args.highlight_path_seed is not None
+):
+    parser.error(
+        "--highlight-path-index/--highlight-path-seed require --highlight-paths-npz."
+    )
 base_plot_dir = os.path.split(args.result)[0]
 target_pairs = []
 show_figures = False
+gradient_rgb_payload = _load_gradient_rgb_payload(args.gradient_rgb_payload)
+if gradient_rgb_payload is not None:
+    fit_mode = str(gradient_rgb_payload.get("fit_mode", "triangle") or "triangle")
+    color_order = str(gradient_rgb_payload.get("color_order", "RBG") or "RBG")
+    debug.info(f"Using active Gradient RGB payload (fit={fit_mode}, order={color_order}).")
+highlight_path_tokens = set()
+highlight_path_infos = []
+highlight_gm_edges = []
+highlight_adjacency_path = ""
+if args.highlight_paths_npz:
+    (
+        highlight_path_tokens,
+        highlight_path_infos,
+        highlight_gm_edges,
+        highlight_adjacency_path,
+    ) = load_highlight_path_sequence(
+        args.highlight_paths_npz,
+        path_group=args.highlight_path_group,
+        path_index=args.highlight_path_index,
+        random_seed=args.highlight_path_seed,
+        collapse_parcels=args.collapse_parcels,
+    )
+    for highlight_path_info in highlight_path_infos:
+        debug.info(
+            "Selected complete three-endpoint highlight path "
+            f"{highlight_path_info['candidate_index']}/{highlight_path_info['candidate_count']} "
+            f"({highlight_path_info['group']} record {highlight_path_info['record_index']}, "
+            f"order={highlight_path_info['path_order']}, "
+            f"segments={','.join(highlight_path_info['segment_labels'])}, "
+            f"{highlight_path_info['unique_parcel_count']} unique parcels) from "
+            f"{highlight_path_info['input_path']}"
+        )
+        debug.info("Highlight path sequence: " + " -> ".join(highlight_path_info["node_names"]))
+    debug.info(f"Using GM adjacency for highlighted path edges: {highlight_adjacency_path}")
 
 if args.subject_id or args.session:
     if len(args.subject_id) != len(args.session):
@@ -644,8 +1338,26 @@ if args.batch:
         ]
         if args.regressor:
             cmd.extend(["--regressor", args.regressor])
+        if args.collapse_parcels:
+            cmd.append("--collapse-parcels")
+        for substring in args.exclude_parcel_substring:
+            cmd.extend(["--exclude-parcel-substring", substring])
+        if args.highlight_paths_npz:
+            cmd.extend(["--highlight-paths-npz", args.highlight_paths_npz])
+            cmd.extend(["--highlight-path-group", args.highlight_path_group])
+            if args.highlight_path_index is not None:
+                cmd.extend(["--highlight-path-index", str(args.highlight_path_index)])
+            if args.highlight_path_seed is not None:
+                cmd.extend(["--highlight-path-seed", str(args.highlight_path_seed)])
+        if args.gradient_rgb_payload:
+            cmd.extend(["--gradient-rgb-payload", args.gradient_rgb_payload])
         if args.aggregate_deltas:
             cmd.append("--aggregate-deltas")
+        if args.hide_node_labels:
+            cmd.append("--hide-node-labels")
+        if args.hide_colorbar:
+            cmd.append("--hide-colorbar")
+        cmd.extend(["--theme", args.theme])
         cmd.append("--no-show")
         subprocess.run(cmd, check=False)
     if args.aggregate_deltas:
@@ -779,7 +1491,7 @@ for value in unique_groups:
         "sessions": stored_sessions[mask],
     }
     if group_splits[value]["mesim"].size == 0:
-        debug.warning(f"No subjects in group {value} for MS-mode/metab calculations; skipping this group.")
+        debug.warning(f"No subjects in group {value} for Gradient/metab calculations; skipping this group.")
     else:
         debug.info(
             f"Group {value}: MeSiM shape {group_splits[value]['mesim'].shape}, "
@@ -789,7 +1501,7 @@ if target_idx is not None and target_reg_value in group_splits:
     if target_reg_value == control_group_value:
         debug.info("Target pair belongs to control group; keeping control group averaged.")
     else:
-        # override compare group with only the target subject/session for MS-mode and metab profiles
+        # override compare group with only the target subject/session for Gradient and metab profiles
         group_mask = regressor_values == target_reg_value
         group_indices = np.where(group_mask)[0]
         if target_idx in group_indices:
@@ -806,7 +1518,7 @@ if target_idx is not None and target_reg_value in group_splits:
             )
 
 
-########################## MS-mode comparison between groups ##########################
+########################## Gradient comparison between groups ##########################
 if comp_mask is None:
     raise ValueError("Component mask missing from NPZ; cannot extract NBS nodes.")
 
@@ -815,45 +1527,47 @@ significant_nodes = np.where(mask_bool.sum(axis=0) > 0)[0]
 if significant_nodes.size == 0:
     debug.warning("No nodes associated with the NBS component; skipping edge plotting.")
 
-msmode_by_group: dict[float, np.ndarray] = {}
+gradient_by_group: dict[float, np.ndarray] = {}
+gradient_color_order = (
+    str(gradient_rgb_payload.get("color_order", "RBG") or "RBG")
+    if gradient_rgb_payload is not None
+    else "RBG"
+)
 for value in unique_groups:
     group_mesim = group_splits[value]["mesim"]
     if group_mesim.size == 0:
-        debug.warning(f"No subjects in group {value} for MS-mode calculation; skipping.")
+        debug.warning(f"No subjects in group {value} for Gradient calculation; skipping.")
         continue
     avg_mesim = np.nanmean(group_mesim, axis=0)
-    msmode = nettools.dimreduce_matrix(
-        avg_mesim,
-        method="diffusion",
-        output_dim=1 ,
-        perplexity=30,
-        scale_factor=-1.0,
-    )
-    msmode_by_group[value] = msmode
-    debug.warning("msmode",value,"----",msmode.min(),"-->",msmode.max())
-
-if len(msmode_by_group) >= 2:
-    group_order = [g for g in unique_groups if g in msmode_by_group]
-    aligned = nettools.align_gradients_procrustes(
-        [msmode_by_group[g] for g in group_order],
-        reference=msmode_by_group[group_order[0]],
-    )
-    for g, aligned_vec in zip(group_order, aligned):
-        msmode_by_group[g] = aligned_vec
-    debug.info("Aligned MS-mode gradients across groups using Procrustes.")
+    if gradient_rgb_payload is not None:
+        gradient_values = _gradient_values_from_payload(
+            avg_mesim,
+            gradient_rgb_payload,
+            parcel_labels,
+            parcel_names,
+        )
+    else:
+        gradient_values = _gradient_values_from_matrix(avg_mesim, color_order=gradient_color_order)
+    gradient_by_group[value] = np.asarray(gradient_values, dtype=float)
+    finite_gradient = gradient_by_group[value][np.isfinite(gradient_by_group[value])]
+    if finite_gradient.size:
+        debug.info(
+            f"Gradient {value}: {finite_gradient.min():.3f} --> {finite_gradient.max():.3f}"
+        )
+    else:
+        debug.warning(f"Gradient {value}: no finite values resolved.")
 
 
-
-if unique_groups.size >= 2 and len(msmode_by_group) >= 2 and significant_nodes.size > 0:
+if unique_groups.size >= 2 and len(gradient_by_group) >= 2 and significant_nodes.size > 0:
     ref = unique_groups[0]
     compare = unique_groups[1]
-    if ref not in msmode_by_group or compare not in msmode_by_group:
+    if ref not in gradient_by_group or compare not in gradient_by_group:
         ref_values_raw = np.array([])
         cmp_values_raw = np.array([])
-        debug.warning("One of the groups lacks MS-mode data; skipping MS-mode delta computation.")
+        debug.warning("One of the groups lacks Gradient data; skipping Gradient delta computation.")
     else:
-        ref_values_raw = msmode_by_group[ref][significant_nodes]
-        cmp_values_raw = msmode_by_group[compare][significant_nodes]
+        ref_values_raw = gradient_by_group[ref][significant_nodes]
+        cmp_values_raw = gradient_by_group[compare][significant_nodes]
 else:
     ref_values_raw = np.array([])
     cmp_values_raw = np.array([])
@@ -872,7 +1586,7 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
     cmp_values = np.array([_combine_signed(vals["cmp"]) for vals in merged_curves.values()])
     delta = cmp_values - ref_values
     debug.info(
-        f"Delta MS-mode ({compare} - {ref}) on {len(merged_labels)} merged nodes: "
+        f"Delta Gradient ({compare} - {ref}) on {len(merged_labels)} merged nodes: "
         f"min={delta.min():.3f}, max={delta.max():.3f}"
     )
     tick_labels = ["\n".join(lbl.split()) for lbl in merged_labels]
@@ -884,9 +1598,9 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
     )
     fig, ax = plt.subplots(figsize=(fig_width, 8))
     ax.plot(cmp_values, marker="o", linestyle="-", color="tab:red", label=compare_label)
-    ax.plot(ref_values, marker="o", linestyle="-", color="tab:green", label="controls")
+    ax.plot(ref_values, marker="s", linestyle="-", color="tab:green", label="controls")
     ax.axhline(0, color="black", linewidth=1)
-    ax.set_ylabel("MS-mode", fontsize=FONTSIZE)
+    ax.set_ylabel("Gradient", fontsize=FONTSIZE)
     ax.set_xlabel("NBS Nodes", fontsize=FONTSIZE)
     ax.legend(loc="best")
     ax.set_xticks(range(len(merged_labels)))
@@ -895,28 +1609,28 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
     ax.yaxis.set_major_locator(mticker.MaxNLocator(6))
     ax.grid(True, axis="y", alpha=0.3)
     plt.tight_layout()
-    table = Table(title=f"MS-mode Δ ({compare} - {ref})")
+    table = Table(title=f"Gradient Δ ({compare} - {ref})")
     table.add_column("Node Label")
-    table.add_column("Δ MS-mode", justify="right")
+    table.add_column("Δ Gradient", justify="right")
     for label, value in zip(merged_labels, delta):
         table.add_row(label, f"{value:.3f}")
     # console.print(table)
     if npz_path:
         base_name = os.path.splitext(os.path.basename(npz_path))[0]
-        data_path = os.path.join(plot_dir, f"{base_name}_msmode_values.tsv")
+        data_path = os.path.join(plot_dir, f"{base_name}_gradient_values.tsv")
         df_values = pd.DataFrame({
             "node_label": merged_labels,
-            f"MSmode_group_{compare}": cmp_values,
-            f"MSmode_group_{ref}": ref_values,
+            f"gradient_group_{compare}": cmp_values,
+            f"gradient_group_{ref}": ref_values,
             "delta": delta,
         })
         df_values.to_csv(data_path, sep="\t", index=False)
-        debug.success("Saved MS-mode table to", data_path)
+        debug.success("Saved Gradient table to", data_path)
     if npz_path:
         base_name = os.path.splitext(os.path.basename(npz_path))[0]
-        plot_path_linear = os.path.join(plot_dir, f"{base_name}_msmode_profile.pdf")
+        plot_path_linear = os.path.join(plot_dir, f"{base_name}_gradient_profile.pdf")
         plt.savefig(plot_path_linear, bbox_inches="tight", dpi=300)
-        debug.success("Saved MS-mode comparison plot to", plot_path_linear)
+        debug.success("Saved Gradient comparison plot to", plot_path_linear)
     show_figures = True
     try:
         delta_metab, cluster_ids = compute_cluster_metab_deltas(
@@ -955,24 +1669,24 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
         node_labels_full = parcel_names[significant_nodes]
         df_cluster.insert(0, "node_label", node_labels_full)
         delta_lookup = {label: val for label, val in zip(merged_labels, delta)}
-        df_cluster["delta_ms_mode"] = [
+        df_cluster["delta_gradient"] = [
             delta_lookup.get(re.sub(r"_(\d+)$", "", name), np.nan)
             for name in node_labels_full
         ]
         ref_lookup = {label: val for label, val in zip(merged_labels, ref_values)}
         cmp_lookup = {label: val for label, val in zip(merged_labels, cmp_values)}
-        df_cluster["ms_mode_ref"] = [
+        df_cluster["gradient_ref"] = [
             ref_lookup.get(re.sub(r"_(\d+)$", "", name), np.nan) for name in node_labels_full
         ]
-        df_cluster["ms_mode_cmp"] = [
+        df_cluster["gradient_cmp"] = [
             cmp_lookup.get(re.sub(r"_(\d+)$", "", name), np.nan) for name in node_labels_full
         ]
         table_clusters = Table(title=f"Metabolic Profile Δ per Node (n_clusters={args.nclusters})")
         table_clusters.add_column("Node Label")
         table_clusters.add_column("Cluster", justify="right")
-        table_clusters.add_column("Δ MS-mode", justify="right")
-        table_clusters.add_column("MS-mode (ref)", justify="right")
-        table_clusters.add_column("MS-mode (cmp)", justify="right")
+        table_clusters.add_column("Δ Gradient", justify="right")
+        table_clusters.add_column("Gradient (ref)", justify="right")
+        table_clusters.add_column("Gradient (cmp)", justify="right")
         for m in metabolite_names:
             table_clusters.add_column(f"Δ {m}{value_suffix}", justify="right")
 
@@ -991,9 +1705,9 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
             row_values = [
                 row["node_label"],
                 str(row["cluster_id"]),
-                _format_delta(row["delta_ms_mode"]),
-                f"{row['ms_mode_ref']:.4f}",
-                f"{row['ms_mode_cmp']:.4f}",
+                _format_delta(row["delta_gradient"]),
+                f"{row['gradient_ref']:.4f}",
+                f"{row['gradient_cmp']:.4f}",
             ] + [
                 _format_delta(
                     row[f"{column_prefix}{m}"], as_percent=is_percent_mode
@@ -1009,9 +1723,9 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
             debug.success("Saved metabolic profile deltas to", delta_path)
 else:
     if significant_nodes.size == 0:
-        debug.warning("No significant nodes; skipping MS-mode deltas.")
+        debug.warning("No significant nodes; skipping Gradient deltas.")
     else:
-        debug.warning("Less than two groups present; cannot compute MS-mode deltas.")
+        debug.warning("Less than two groups present; cannot compute Gradient deltas.")
 
 # Plot circular connectivity for the significant component (or empty edges)
 if t_mat is not None and comp_mask is not None:
@@ -1032,8 +1746,8 @@ if t_mat is not None and comp_mask is not None:
         vmax = 1.0
     order_group = unique_groups[0]
     plot_group = unique_groups[1] if unique_groups.size > 1 else unique_groups[0]
-    node_values_plot = msmode_by_group[plot_group]
-    node_values_order = msmode_by_group[order_group]
+    node_values_plot = gradient_by_group[plot_group]
+    node_values_order = gradient_by_group[order_group]
     if args.collapse_parcels:
         collapse_nodes = (
             significant_nodes if has_edges else np.arange(len(parcel_names))
@@ -1066,6 +1780,27 @@ if t_mat is not None and comp_mask is not None:
         sig_labels = (
             set(parcel_names[idx] for idx in significant_nodes) if has_edges else set()
         )
+    (
+        collapsed_matrix,
+        collapsed_names,
+        collapsed_values,
+        collapsed_values_order,
+        _,
+        excluded_parcel_names,
+    ) = exclude_parcels_by_substring(
+        collapsed_matrix,
+        collapsed_names,
+        collapsed_values,
+        collapsed_values_order,
+        args.exclude_parcel_substring,
+    )
+    if excluded_parcel_names:
+        retained_names = set(collapsed_names)
+        sig_labels = {name for name in sig_labels if name in retained_names}
+        debug.info(
+            f"Excluded {len(excluded_parcel_names)} circular-plot parcels by substring: "
+            + ", ".join(excluded_parcel_names)
+        )
     def _hemi_side(name: str) -> str:
         lowered = name.lower()
         if "lh" in lowered or "left" in lowered: 
@@ -1087,6 +1822,21 @@ if t_mat is not None and comp_mask is not None:
         collapsed_values = collapsed_values[new_order]
         if collapsed_values_order is not None:
             collapsed_values_order = collapsed_values_order[new_order]
+    path_edge_mode = bool(highlight_path_tokens)
+    if path_edge_mode:
+        collapsed_matrix, matched_gm_edges = build_path_gm_adjacency(
+            collapsed_names,
+            highlight_gm_edges,
+            collapse_parcels=args.collapse_parcels,
+        )
+        if matched_gm_edges == 0:
+            raise ValueError(
+                "No selected-path GM-adjacency edges matched the circular-plot parcels."
+            )
+        debug.info(
+            f"Replaced the NBS edge network with {matched_gm_edges} GM-adjacency "
+            "edges among selected path parcels."
+        )
     edge_weight_matrix = np.array(collapsed_matrix, copy=True)
     cmap_nodes = color_loader.load_fsl_cmap(map="spectrum_iso", plotly=False)
     norm_nodes = plt.Normalize(
@@ -1099,6 +1849,29 @@ if t_mat is not None and comp_mask is not None:
             vmin=np.nanmin(collapsed_values_order), vmax=np.nanmax(collapsed_values_order)
         )
         node_colors_ref = [cmap_nodes(norm_nodes_ref(val)) for val in collapsed_values_order]
+    if highlight_path_tokens:
+        highlighted_mask = np.asarray(
+            [
+                _path_parcel_token(name, collapse_parcels=args.collapse_parcels)
+                in highlight_path_tokens
+                for name in collapsed_names
+            ],
+            dtype=bool,
+        )
+        gray_color = mcolors.to_rgba("#b8b8b8")
+        node_colors = [
+            color if highlighted else gray_color
+            for color, highlighted in zip(node_colors, highlighted_mask)
+        ]
+        if node_colors_ref is not None:
+            node_colors_ref = [
+                color if highlighted else gray_color
+                for color, highlighted in zip(node_colors_ref, highlighted_mask)
+            ]
+        debug.info(
+            f"Highlighted {int(np.count_nonzero(highlighted_mask))}/{len(collapsed_names)} "
+            "circular-plot parcels from the selected saved path."
+        )
     node_angles_deg = (
         -np.linspace(0, 360, len(collapsed_names), endpoint=False) + 90
     ) % 360
@@ -1112,25 +1885,35 @@ if t_mat is not None and comp_mask is not None:
         edge_abs_max = 1.0
 
     collapsed_names_display = [name[:MAXLEN_NODE_NAME] for name in collapsed_names]
+    plotted_node_names = (
+        [""] * len(collapsed_names_display)
+        if args.hide_node_labels
+        else collapsed_names_display
+    )
     name_lookup = {name.lower(): name for name in collapsed_names}
     for display, full in zip(collapsed_names_display, collapsed_names):
         name_lookup.setdefault(display.lower(), full)
     angle_lookup = {name: angle for name, angle in zip(collapsed_names, node_angles_rad)}
     node_label_fontsize = 16
+    theme_facecolor = "black" if args.theme == "dark" else "white"
+    theme_textcolor = "white" if args.theme == "dark" else "black"
+    path_edge_colormap = "Greys_r" if args.theme == "dark" else "Greys"
     fig_circle, ax_circle = plot_connectivity_circle(
         mat,
-        collapsed_names_display,
+        plotted_node_names,
         node_colors=node_colors,
         node_colors_ref=node_colors_ref,
         node_angles=node_angles_deg,
-        colormap="PiYG",
-        vmin=-edge_abs_max,
-        vmax=edge_abs_max,
+        colormap=path_edge_colormap if path_edge_mode else "PiYG",
+        vmin=0.0 if path_edge_mode else -edge_abs_max,
+        vmax=1.0 if path_edge_mode else edge_abs_max,
         linewidth=1,
         edge_weights=edge_weight_matrix,
         # title=f"T-matrix masked (component {component_idx})",
         fontsize_title=FONTSIZE - 4,
         fontsize_names=node_label_fontsize,
+        facecolor=theme_facecolor,
+        textcolor=theme_textcolor,
         colorbar=False,
         show=False,
     )
@@ -1152,7 +1935,9 @@ if t_mat is not None and comp_mask is not None:
             draw=args.display_ppath,
         )
     similarity_node_set = set(name for values in resolved_hubs.values() for name in values)
-    if similarity_node_set and has_edges:
+    if path_edge_mode:
+        debug.info("Similarity Hub vs NBS overlap statistics skipped in saved-path mode.")
+    elif similarity_node_set and has_edges:
         overlap_nodes = similarity_node_set & sig_labels
         total_similarity = len(similarity_node_set)
         overlap_pct = len(overlap_nodes) / total_similarity * 100
@@ -1203,24 +1988,34 @@ if t_mat is not None and comp_mask is not None:
 
     bg_luminance = np.mean(mcolors.to_rgb(fig_circle.get_facecolor()))
     label_color = "white" if bg_luminance < 0.5 else "black"
-    if has_edges:
-        sm_edges = plt.cm.ScalarMappable(
-            cmap="PiYG", norm=plt.Normalize(vmin=-vmax, vmax=vmax)
-        )
-        sm_edges.set_array([])
-        cb_edges = fig_circle.colorbar(sm_edges, ax=ax_circle, fraction=0.046, pad=0.08)
-        cb_edges.set_label("T-Score", fontsize=FONTSIZE, color=label_color)
-        cb_edges.ax.yaxis.set_tick_params(labelsize=FONTSIZE - 4, color=label_color)
-        plt.setp(plt.getp(cb_edges.ax.axes, "yticklabels"), color=label_color)
-    sm_nodes = plt.cm.ScalarMappable(cmap=cmap_nodes, norm=norm_nodes)
-    sm_nodes.set_array([])
-    cb_nodes = fig_circle.colorbar(sm_nodes, ax=ax_circle, fraction=0.046, pad=0.16)
-    cb_nodes.set_label("MS Mode", fontsize=FONTSIZE, color=label_color)
-    cb_nodes.ax.yaxis.set_tick_params(labelsize=FONTSIZE - 4, color=label_color)
-    plt.setp(plt.getp(cb_nodes.ax.axes, "yticklabels"), color=label_color)
-    if npz_path:
+    if not args.hide_colorbar:
+        if has_edges and not path_edge_mode:
+            sm_edges = plt.cm.ScalarMappable(
+                cmap="PiYG", norm=plt.Normalize(vmin=-vmax, vmax=vmax)
+            )
+            sm_edges.set_array([])
+            cb_edges = fig_circle.colorbar(sm_edges, ax=ax_circle, fraction=0.046, pad=0.08)
+            cb_edges.set_label("T-Score", fontsize=FONTSIZE, color=label_color)
+            cb_edges.ax.yaxis.set_tick_params(labelsize=FONTSIZE - 4, color=label_color)
+            plt.setp(plt.getp(cb_edges.ax.axes, "yticklabels"), color=label_color)
+        sm_nodes = plt.cm.ScalarMappable(cmap=cmap_nodes, norm=norm_nodes)
+        sm_nodes.set_array([])
+        cb_nodes = fig_circle.colorbar(sm_nodes, ax=ax_circle, fraction=0.046, pad=0.16)
+        cb_nodes.set_label("Gradient", fontsize=FONTSIZE, color=label_color)
+        cb_nodes.ax.yaxis.set_tick_params(labelsize=FONTSIZE - 4, color=label_color)
+        plt.setp(plt.getp(cb_nodes.ax.axes, "yticklabels"), color=label_color)
+    if args.output_path:
+        plot_path_circle = args.output_path
+    elif npz_path:
         base_name = os.path.splitext(os.path.basename(npz_path))[0]
-        plot_path_circle = os.path.join(plot_dir, f"{base_name}_tmask_circle.pdf")
+        circle_suffix = (
+            "path_gm_adjacency_circle" if path_edge_mode else "tmask_circle"
+        )
+        plot_path_circle = os.path.join(plot_dir, f"{base_name}_{circle_suffix}.pdf")
+    else:
+        plot_path_circle = None
+    if plot_path_circle:
+        os.makedirs(os.path.dirname(os.path.abspath(plot_path_circle)), exist_ok=True)
         fig_circle.savefig(plot_path_circle, bbox_inches="tight", dpi=300)
         debug.success("Saved circular plot to", plot_path_circle)
     show_figures = True

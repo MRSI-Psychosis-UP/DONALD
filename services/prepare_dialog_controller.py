@@ -206,6 +206,7 @@ class PrepareDialogController:
             atlas_dir_default=viewer._atlas_dir_default,
             bids_dir_default=viewer._bids_dir_default,
             workspace_reference_options=self._workspace_reference_options(),
+            gradient_rgb_payload_callback=getattr(viewer, "_current_gradient_rgb_payload", None),
             theme_name=viewer._theme_name,
             parent=viewer,
         )

@@ -21,6 +21,15 @@ from mrsitoolbox.connectomics.nettools import NetTools
 from .data_access import MatrixDataAccess as _MatrixDataAccess
 
 nettools = NetTools()
+
+# Edit these values to tune the 3D glass-brain path edges without changing GUI code.
+GLASSBRAIN_EDGE_COLOR = (0.0, 0.0, 0.0)
+GLASSBRAIN_EDGE_WIDTH_MULTIPLIER = 1.8
+GLASSBRAIN_EDGE_MIN_WIDTH = 5.0
+GLASSBRAIN_EDGE_RADIUS_SCALE = 0.12
+GLASSBRAIN_SUBC_DASH_LENGTH = 7.0
+GLASSBRAIN_SUBC_DASH_GAP = 4.0
+
 PARCEL_LABEL_KEYS = ()
 PARCEL_NAME_KEYS = ()
 _to_string_list = None
@@ -48,6 +57,8 @@ class GradientDialogController:
         '_normalize_gradient_classification_axis',
         '_normalize_gradient_scatter_rotation',
         '_normalize_gradient_triangular_color_order',
+        '_normalize_gradient_rgb_scalar_mode',
+        '_normalize_gradient_rgb_mask_strictness',
         '_normalize_gradient_classification_fit_mode',
         '_normalize_gradient_rotation_preset',
         '_normalize_gradient_network_component',
@@ -62,17 +73,25 @@ class GradientDialogController:
         '_selected_gradient_classification_hemisphere_mode',
         '_selected_gradient_scatter_rotation',
         '_selected_gradient_triangular_rgb',
+        '_selected_gradient_preload_matching_paths',
         '_selected_gradient_classification_fit_mode',
         '_selected_gradient_triangular_color_order',
+        '_selected_gradient_rgb_scalar_mode',
+        '_selected_gradient_rgb_mask_strictness',
         '_selected_gradient_classification_colormap',
         '_selected_gradient_classification_component',
         '_selected_gradient_classification_x_axis',
         '_selected_gradient_classification_y_axis',
+        '_selected_gradient_classification_z_axis',
+        '_selected_gradient_classification_ref_entry_id',
         '_selected_gradient_classification_ignore_lh_parcel',
         '_selected_gradient_classification_ignore_rh_parcel',
         '_gradient_classification_ignore_parcel_options',
         '_is_gradient_classification_axis_available',
         '_gradient_classification_axis_label',
+        '_classification_uses_reference_axis',
+        '_classification_reference_component_count',
+        '_classification_axis_component_count',
         '_infer_projection_hemisphere_from_name',
         '_gradient_projection_hemisphere_codes',
         '_gradient_projection_hemisphere_mask',
@@ -92,12 +111,17 @@ class GradientDialogController:
         '_on_gradient_classification_hemisphere_changed',
         '_on_gradient_scatter_rotation_changed',
         '_on_gradient_triangular_rgb_changed',
+        '_on_gradient_preload_matching_paths_changed',
         '_on_gradient_classification_fit_mode_changed',
         '_on_gradient_triangular_color_order_changed',
+        '_on_gradient_rgb_scalar_mode_changed',
+        '_on_gradient_rgb_mask_strictness_changed',
         '_on_gradient_classification_colormap_changed',
         '_on_gradient_classification_component_changed',
         '_on_gradient_classification_x_axis_changed',
         '_on_gradient_classification_y_axis_changed',
+        '_on_gradient_classification_z_axis_changed',
+        '_on_gradient_classification_ref_entry_changed',
         '_on_gradient_classification_ignore_lh_changed',
         '_on_gradient_classification_ignore_rh_changed',
         '_load_gradient_classification_adjacency_npz',
@@ -107,8 +131,22 @@ class GradientDialogController:
         '_clear_gradient_classification_adjacency',
         '_npz_optional_scalar_text',
         '_npz_optional_display_vector',
+        '_npz_optional_array',
+        '_npz_subject_session_vectors',
+        '_metabolite_names_from_array',
+        '_reduce_metabolite_profiles',
+        '_reduce_water_signal_profile',
+        '_append_water_signal_profile',
+        '_load_metabolite_profiles_from_npz',
+        '_selected_gradient_metabolite_profiles_path',
+        '_metabolite_subject_labels_from_npz',
+        '_load_metabolite_profiles_for_gradient_context',
         '_canonicalize_precomputed_gradients',
         '_canonicalize_average_gradients',
+        '_path_exists_safely',
+        '_resolve_existing_path',
+        '_portable_parcellation_path_candidates',
+        '_resolve_portable_parcellation_path',
         '_load_precomputed_gradient_bundle',
         '_gradient_precomputed_row_pair',
         '_gradient_precomputed_selection_text',
@@ -117,17 +155,26 @@ class GradientDialogController:
         '_classification_scatter_edge_pairs',
         '_gradient_entry_source_path',
         '_entry_parcel_metadata',
+        '_preferred_parcel_key',
+        '_parcel_key_option_label',
+        '_available_gradient_parcel_key_options',
+        '_selected_gradient_parcel_label_key',
+        '_selected_gradient_parcel_name_key',
         '_gradient_matrix_label_for_entry',
         '_available_gradient_matrix_entries',
+        '_available_gradient_reference_matrix_entries',
         '_available_combine_matrix_entries',
         '_sync_combine_dialog_state',
         '_update_combine_button',
         '_selected_gradient_entry_id',
         '_selected_gradient_entry',
+        '_selected_gradient_classification_ref_entry',
         '_gradient_matrix_for_entry',
         '_has_square_matrix_entry',
         '_selected_gradient_matrix_label',
         '_on_gradient_matrix_entry_changed',
+        '_on_gradient_parcel_label_key_changed',
+        '_on_gradient_parcel_name_key_changed',
         '_on_gradient_network_component_changed',
         '_on_gradient_rotation_changed',
         '_sync_gradients_dialog_state',
@@ -143,10 +190,12 @@ class GradientDialogController:
         '_gradient_spatial_embedding',
         '_classification_spatial_embedding',
         '_classification_spatial_indices',
+        '_classification_reference_gradient_payload',
         '_classification_axis_payload',
         '_rescale_classification_axis_to_range',
         '_render_gradients_3d',
         '_classify_gradients_fsaverage',
+        '_project_classification_paths_to_fibrenet',
         '_project_classification_paths_to_brain',
         '_gradient_rotation_angles',
         '_actor_bounds_center',
@@ -199,6 +248,9 @@ class GradientDialogController:
             descriptor = owner.__dict__.get(name)
             if isinstance(descriptor, staticmethod):
                 setattr(self._viewer, name, descriptor.__func__)
+                continue
+            if isinstance(descriptor, classmethod):
+                setattr(self._viewer, name, getattr(owner, name))
                 continue
             if descriptor is None:
                 setattr(self._viewer, name, getattr(self, name))
@@ -285,10 +337,25 @@ class GradientDialogController:
     @staticmethod
     def _normalize_gradient_classification_axis(value: str, default: str = "gradient1") -> str:
         fallback = str(default or "gradient1").strip().lower()
-        if fallback not in {"gradient1", "gradient2", "spatial"}:
+        valid_axes = {
+            "none",
+            "gradient1",
+            "gradient2",
+            "gradient3",
+            "gradient_ref1",
+            "gradient_ref2",
+            "gradient_ref3",
+            "spatial",
+        }
+        if fallback not in valid_axes:
             fallback = "gradient1"
         text = str(value or "").strip().lower()
+        compact = re.sub(r"[\s_\-]+", "", text)
         mapping = {
+            "none": "none",
+            "2d": "none",
+            "no z": "none",
+            "no z axis": "none",
             "gradient1": "gradient1",
             "gradient 1": "gradient1",
             "g1": "gradient1",
@@ -299,11 +366,56 @@ class GradientDialogController:
             "g2": "gradient2",
             "c2": "gradient2",
             "2": "gradient2",
+            "gradient3": "gradient3",
+            "gradient 3": "gradient3",
+            "g3": "gradient3",
+            "c3": "gradient3",
+            "3": "gradient3",
+            "gradient_ref1": "gradient_ref1",
+            "gradient ref 1": "gradient_ref1",
+            "gradient reference 1": "gradient_ref1",
+            "reference gradient 1": "gradient_ref1",
+            "ref gradient 1": "gradient_ref1",
+            "gref1": "gradient_ref1",
+            "ref1": "gradient_ref1",
+            "r1": "gradient_ref1",
+            "gradient_ref2": "gradient_ref2",
+            "gradient ref 2": "gradient_ref2",
+            "gradient reference 2": "gradient_ref2",
+            "reference gradient 2": "gradient_ref2",
+            "ref gradient 2": "gradient_ref2",
+            "gref2": "gradient_ref2",
+            "ref2": "gradient_ref2",
+            "r2": "gradient_ref2",
+            "gradient_ref3": "gradient_ref3",
+            "gradient ref 3": "gradient_ref3",
+            "gradient reference 3": "gradient_ref3",
+            "reference gradient 3": "gradient_ref3",
+            "ref gradient 3": "gradient_ref3",
+            "gref3": "gradient_ref3",
+            "ref3": "gradient_ref3",
+            "r3": "gradient_ref3",
             "spatial": "spatial",
             "space": "spatial",
         }
-        normalized = mapping.get(text, mapping.get(text.replace(" ", ""), fallback))
-        if normalized not in {"gradient1", "gradient2", "spatial"}:
+        compact_mapping = {
+            "noz": "none",
+            "nozaxis": "none",
+            "gradientref1": "gradient_ref1",
+            "gradientreference1": "gradient_ref1",
+            "referencegradient1": "gradient_ref1",
+            "refgradient1": "gradient_ref1",
+            "gradientref2": "gradient_ref2",
+            "gradientreference2": "gradient_ref2",
+            "referencegradient2": "gradient_ref2",
+            "refgradient2": "gradient_ref2",
+            "gradientref3": "gradient_ref3",
+            "gradientreference3": "gradient_ref3",
+            "referencegradient3": "gradient_ref3",
+            "refgradient3": "gradient_ref3",
+        }
+        normalized = mapping.get(text, compact_mapping.get(compact, mapping.get(compact, fallback)))
+        if normalized not in valid_axes:
             normalized = fallback
         return normalized
 
@@ -322,6 +434,25 @@ class GradientDialogController:
         if text not in valid:
             text = "RBG"
         return text
+
+    @staticmethod
+    def _normalize_gradient_rgb_scalar_mode(value: str) -> str:
+        text = str(value or "barycentric").strip().lower().replace("-", "_").replace(" ", "_")
+        mapping = {
+            "bary": "barycentric",
+            "barycentric": "barycentric",
+            "principal": "principal_curve",
+            "principal_curve": "principal_curve",
+            "principalcurve": "principal_curve",
+        }
+        return mapping.get(text, "barycentric")
+
+    @staticmethod
+    def _normalize_gradient_rgb_mask_strictness(value) -> float:
+        try:
+            return max(0.0, min(5.0, float(value)))
+        except Exception:
+            return 1.0
 
     @staticmethod
     def _normalize_gradient_classification_fit_mode(value: str) -> str:
@@ -499,6 +630,20 @@ class GradientDialogController:
         self._gradient_scatter_triangular_rgb = bool(self._gradient_scatter_triangular_rgb)
         return self._gradient_scatter_triangular_rgb
 
+    def _selected_gradient_preload_matching_paths(self) -> bool:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None:
+            try:
+                self._gradient_preload_matching_paths = bool(
+                    dialog.preload_matching_paths()
+                )
+            except Exception:
+                pass
+        self._gradient_preload_matching_paths = bool(
+            getattr(self, "_gradient_preload_matching_paths", False)
+        )
+        return self._gradient_preload_matching_paths
+
     def _selected_gradient_classification_fit_mode(self) -> str:
         dialog = getattr(self, "_gradients_dialog", None)
         if dialog is not None:
@@ -526,6 +671,34 @@ class GradientDialogController:
             self._gradient_triangular_color_order
         )
         return self._gradient_triangular_color_order
+
+    def _selected_gradient_rgb_scalar_mode(self) -> str:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_rgb_scalar_mode"):
+            try:
+                self._gradient_rgb_scalar_mode = self._normalize_gradient_rgb_scalar_mode(
+                    dialog.selected_rgb_scalar_mode()
+                )
+            except Exception:
+                pass
+        self._gradient_rgb_scalar_mode = self._normalize_gradient_rgb_scalar_mode(
+            getattr(self, "_gradient_rgb_scalar_mode", "barycentric")
+        )
+        return self._gradient_rgb_scalar_mode
+
+    def _selected_gradient_rgb_mask_strictness(self) -> float:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None:
+            try:
+                self._gradient_rgb_mask_strictness = self._normalize_gradient_rgb_mask_strictness(
+                    dialog.selected_rgb_mask_strictness()
+                )
+            except Exception:
+                pass
+        self._gradient_rgb_mask_strictness = self._normalize_gradient_rgb_mask_strictness(
+            getattr(self, "_gradient_rgb_mask_strictness", 1.0)
+        )
+        return self._gradient_rgb_mask_strictness
 
     def _selected_gradient_classification_colormap(self) -> str:
         dialog = getattr(self, "_gradients_dialog", None)
@@ -591,6 +764,46 @@ class GradientDialogController:
             default="gradient1",
         )
         return self._gradient_classification_y_axis
+
+    def _selected_gradient_classification_z_axis(self) -> str:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_classification_z_axis"):
+            try:
+                self._gradient_classification_z_axis = self._normalize_gradient_classification_axis(
+                    dialog.selected_classification_z_axis(),
+                    default="none",
+                )
+            except Exception:
+                pass
+        self._gradient_classification_z_axis = self._normalize_gradient_classification_axis(
+            getattr(self, "_gradient_classification_z_axis", "none"),
+            default="none",
+        )
+        return self._gradient_classification_z_axis
+
+    def _selected_gradient_classification_ref_entry_id(self):
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_classification_ref_matrix_entry_id"):
+            try:
+                candidate = dialog.selected_classification_ref_matrix_entry_id()
+                if candidate in self._entries:
+                    self._gradient_classification_ref_entry_id = candidate
+            except Exception:
+                pass
+
+        stored = getattr(self, "_gradient_classification_ref_entry_id", None)
+        if stored in self._entries:
+            current_gradient_entry_id = self._selected_gradient_entry_id()
+            if stored != current_gradient_entry_id or self._gradient_use_precomputed_bundle:
+                return stored
+
+        for option in self._available_gradient_reference_matrix_entries():
+            entry_id = option.get("id")
+            if entry_id in self._entries:
+                self._gradient_classification_ref_entry_id = entry_id
+                return entry_id
+        self._gradient_classification_ref_entry_id = None
+        return None
 
     def _selected_gradient_classification_ignore_lh_parcel(self) -> str:
         dialog = getattr(self, "_gradients_dialog", None)
@@ -670,6 +883,16 @@ class GradientDialogController:
             return n_grad >= 1
         if axis == "gradient2":
             return n_grad >= 2
+        if axis == "gradient3":
+            return n_grad >= 3
+        if axis == "gradient_ref1":
+            return self._selected_gradient_classification_ref_entry_id() in self._entries
+        if axis == "gradient_ref2":
+            return self._selected_gradient_classification_ref_entry_id() in self._entries
+        if axis == "gradient_ref3":
+            return self._selected_gradient_classification_ref_entry_id() in self._entries
+        if axis == "none":
+            return True
         if axis == "spatial":
             try:
                 projection_labels = np.asarray(current.get("projection_labels"), dtype=int).reshape(-1)
@@ -687,7 +910,49 @@ class GradientDialogController:
             return "Gradient 1"
         if axis == "gradient2":
             return "Gradient 2"
+        if axis == "gradient3":
+            return "Gradient 3"
+        if axis == "gradient_ref1":
+            return "Gradient Ref 1"
+        if axis == "gradient_ref2":
+            return "Gradient Ref 2"
+        if axis == "gradient_ref3":
+            return "Gradient Ref 3"
+        if axis == "none":
+            return ""
         return "Spatial 1" if str(axis_role).strip().lower() == "x" else "Spatial 2"
+
+    @staticmethod
+    def _classification_uses_reference_axis(*axes) -> bool:
+        axes = {
+            GradientDialogController._normalize_gradient_classification_axis(axis, default="none")
+            for axis in axes
+        }
+        return bool(axes & {"gradient_ref1", "gradient_ref2", "gradient_ref3"})
+
+    @staticmethod
+    def _classification_reference_component_count(*axes) -> int:
+        count = 0
+        for raw_axis in axes:
+            axis = GradientDialogController._normalize_gradient_classification_axis(raw_axis, default="none")
+            if axis == "gradient_ref1":
+                count = max(count, 1)
+            elif axis == "gradient_ref2":
+                count = max(count, 2)
+            elif axis == "gradient_ref3":
+                count = max(count, 3)
+        return count
+
+    @staticmethod
+    def _classification_axis_component_count(axis_key: str) -> int:
+        axis = GradientDialogController._normalize_gradient_classification_axis(axis_key, default="none")
+        if axis in {"gradient3", "gradient_ref3"}:
+            return 3
+        if axis in {"gradient2", "gradient_ref2"}:
+            return 2
+        if axis in {"gradient1", "gradient_ref1"}:
+            return 1
+        return 0
 
     @staticmethod
     def _infer_projection_hemisphere_from_name(name):
@@ -816,9 +1081,11 @@ class GradientDialogController:
             return False
         x_axis = self._selected_gradient_classification_x_axis()
         y_axis = self._selected_gradient_classification_y_axis()
-        return self._is_gradient_classification_axis_available(x_axis, results) and self._is_gradient_classification_axis_available(
-            y_axis,
-            results,
+        z_axis = self._selected_gradient_classification_z_axis()
+        return (
+            self._is_gradient_classification_axis_available(x_axis, results)
+            and self._is_gradient_classification_axis_available(y_axis, results)
+            and self._is_gradient_classification_axis_available(z_axis, results)
         )
 
     def _current_gradient_rotation_presets(self):
@@ -938,12 +1205,22 @@ class GradientDialogController:
 
     def _on_gradient_triangular_rgb_changed(self, enabled: bool) -> None:
         self._gradient_scatter_triangular_rgb = bool(enabled)
+        self._sync_gradients_dialog_state()
+
+    def _on_gradient_preload_matching_paths_changed(self, enabled: bool) -> None:
+        self._gradient_preload_matching_paths = bool(enabled)
 
     def _on_gradient_classification_fit_mode_changed(self, value: str) -> None:
         self._gradient_classification_fit_mode = self._normalize_gradient_classification_fit_mode(value)
 
     def _on_gradient_triangular_color_order_changed(self, value: str) -> None:
         self._gradient_triangular_color_order = self._normalize_gradient_triangular_color_order(value)
+
+    def _on_gradient_rgb_scalar_mode_changed(self, value: str) -> None:
+        self._gradient_rgb_scalar_mode = self._normalize_gradient_rgb_scalar_mode(value)
+
+    def _on_gradient_rgb_mask_strictness_changed(self, value) -> None:
+        self._gradient_rgb_mask_strictness = self._normalize_gradient_rgb_mask_strictness(value)
 
     def _on_gradient_classification_colormap_changed(self, value: str) -> None:
         text = str(value or "").strip()
@@ -970,6 +1247,17 @@ class GradientDialogController:
         )
         self._sync_gradients_dialog_state()
 
+    def _on_gradient_classification_z_axis_changed(self, value: str) -> None:
+        self._gradient_classification_z_axis = self._normalize_gradient_classification_axis(
+            value,
+            default="none",
+        )
+        self._sync_gradients_dialog_state()
+
+    def _on_gradient_classification_ref_entry_changed(self, entry_id) -> None:
+        self._gradient_classification_ref_entry_id = entry_id if entry_id in self._entries else None
+        self._sync_gradients_dialog_state()
+
     def _on_gradient_classification_ignore_lh_changed(self, value: str) -> None:
         self._gradient_classification_ignore_lh_parcel = str(value or "").strip()
 
@@ -983,7 +1271,7 @@ class GradientDialogController:
                 raise KeyError("Key 'adjacency_mat' was not found in the selected NPZ.")
             adjacency = np.asarray(npz["adjacency_mat"], dtype=float)
             parcel_labels = None
-            for key in ("parcel_labels", "parcel_labels_group", "parcel_labels_group.npy"):
+            for key in ("parcel_labels",) + PARCEL_LABEL_KEYS:
                 if key in npz:
                     parcel_labels = npz[key]
                     break
@@ -1086,6 +1374,522 @@ class GradientDialogController:
         return None
 
     @staticmethod
+    def _npz_optional_array(npz, *keys):
+        for key in keys:
+            if key not in npz:
+                continue
+            try:
+                return np.asarray(npz[key])
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    def _npz_subject_session_vectors(cls, npz, *, path=None):
+        subjects = cls._npz_optional_display_vector(
+            npz,
+            "subject_id_list",
+            "participant_id_list",
+            "subject_ids",
+            "participant_ids",
+        )
+        sessions = cls._npz_optional_display_vector(
+            npz,
+            "session_id_list",
+            "session_ids",
+            "sessions",
+        )
+        if subjects:
+            return list(subjects or []), list(sessions or [])
+
+        covars = None
+        if "covars" in npz:
+            try:
+                covars = np.asarray(npz["covars"])
+            except Exception:
+                covars = None
+        if covars is not None and getattr(covars.dtype, "names", None):
+            field_lookup = {str(name).strip().lower(): str(name) for name in covars.dtype.names}
+            subject_field = (
+                field_lookup.get("participant_id")
+                or field_lookup.get("subject_id")
+                or field_lookup.get("subject")
+                or field_lookup.get("sub")
+                or field_lookup.get("id")
+            )
+            session_field = field_lookup.get("session_id") or field_lookup.get("session") or field_lookup.get("ses")
+            if subject_field:
+                subjects = [_display_text(value).strip() for value in covars[subject_field].reshape(-1).tolist()]
+                sessions = (
+                    [_display_text(value).strip() for value in covars[session_field].reshape(-1).tolist()]
+                    if session_field
+                    else []
+                )
+                return subjects, sessions
+
+        if path is not None and _load_covars_info is not None and _covars_to_rows is not None:
+            try:
+                covars_info = _load_covars_info(Path(path))
+                covars_columns, covars_rows = _covars_to_rows(covars_info)
+            except Exception:
+                covars_columns, covars_rows = [], []
+            column_lookup = {str(column).strip().lower(): idx for idx, column in enumerate(covars_columns or [])}
+            subject_idx = None
+            for key in ("participant_id", "subject_id", "subject", "sub", "id"):
+                if key in column_lookup:
+                    subject_idx = column_lookup[key]
+                    break
+            session_idx = None
+            for key in ("session_id", "session", "ses"):
+                if key in column_lookup:
+                    session_idx = column_lookup[key]
+                    break
+            if subject_idx is not None and covars_rows:
+                subjects = []
+                sessions = []
+                for row in covars_rows:
+                    if isinstance(row, dict):
+                        row_lookup = {str(key).strip().lower(): value for key, value in row.items()}
+                        subjects.append(
+                            _display_text(
+                                row_lookup.get("participant_id")
+                                or row_lookup.get("subject_id")
+                                or row_lookup.get("subject")
+                                or row_lookup.get("sub")
+                                or row_lookup.get("id")
+                                or ""
+                            ).strip()
+                        )
+                        sessions.append(
+                            _display_text(
+                                row_lookup.get("session_id")
+                                or row_lookup.get("session")
+                                or row_lookup.get("ses")
+                                or ""
+                            ).strip()
+                        )
+                    else:
+                        row_values = list(row)
+                        subjects.append(_display_text(row_values[subject_idx]).strip() if subject_idx < len(row_values) else "")
+                        sessions.append(_display_text(row_values[session_idx]).strip() if session_idx is not None and session_idx < len(row_values) else "")
+                return subjects, sessions
+        return [], []
+
+    @staticmethod
+    def _metabolite_names_from_array(values):
+        if values is None:
+            return []
+        try:
+            names = [str(value).strip() for value in np.asarray(values).reshape(-1).tolist()]
+        except Exception:
+            return []
+        return [name for name in names if name and name.lower() not in {"nan", "none"}]
+
+    @classmethod
+    def _reduce_metabolite_profiles(
+        cls,
+        profiles,
+        metabolites,
+        *,
+        n_nodes,
+        keep_indices=None,
+        row_index=None,
+        subject_count=None,
+        preserve_subjects=False,
+    ):
+        names = cls._metabolite_names_from_array(metabolites)
+        if not names:
+            return None, []
+        try:
+            arr = np.asarray(profiles, dtype=float)
+        except Exception:
+            return None, []
+        if arr.ndim < 2 or arr.size == 0:
+            return None, []
+
+        try:
+            n_nodes = int(n_nodes)
+        except Exception:
+            n_nodes = 0
+        if n_nodes <= 0:
+            return None, []
+
+        try:
+            subject_count = int(subject_count) if subject_count is not None else 0
+        except Exception:
+            subject_count = 0
+
+        subject_axis = None
+        if subject_count > 0:
+            subject_candidates = [
+                axis
+                for axis, size in enumerate(arr.shape)
+                if int(size) == subject_count and int(size) != n_nodes
+            ]
+            if not subject_candidates:
+                subject_candidates = [
+                    axis
+                    for axis, size in enumerate(arr.shape)
+                    if int(size) == subject_count
+                ]
+            if subject_candidates:
+                subject_axis = int(subject_candidates[0])
+
+        if row_index is not None and subject_axis is not None:
+            try:
+                idx = int(row_index)
+            except Exception:
+                idx = -1
+            if 0 <= idx < arr.shape[subject_axis]:
+                arr = np.take(arr, idx, axis=subject_axis)
+                subject_axis = None
+
+        n_met = int(len(names))
+        node_axes = [
+            axis
+            for axis, size in enumerate(arr.shape)
+            if int(size) == n_nodes and axis != subject_axis
+        ]
+        if not node_axes:
+            return None, []
+        if keep_indices is not None:
+            node_axis = int(node_axes[0])
+        else:
+            preferred = [axis for axis in node_axes if axis != 0 or subject_axis == 0]
+            node_axis = int(preferred[0] if preferred else node_axes[0])
+
+        met_axes = [
+            axis
+            for axis, size in enumerate(arr.shape)
+            if int(size) == n_met and axis not in {node_axis, subject_axis}
+        ]
+        if not met_axes:
+            return None, []
+        met_axis = int(met_axes[-1])
+
+        if keep_indices is not None:
+            try:
+                keep = np.asarray(keep_indices, dtype=int).reshape(-1)
+            except Exception:
+                keep = np.zeros(0, dtype=int)
+            if keep.size:
+                keep = keep[(keep >= 0) & (keep < arr.shape[node_axis])]
+                if keep.size == 0:
+                    return None, []
+                arr = np.take(arr, keep, axis=node_axis)
+
+        original_axes = list(range(arr.ndim))
+        if bool(preserve_subjects) and subject_axis is not None:
+            ordered_axes = [
+                subject_axis,
+                node_axis,
+                met_axis,
+            ] + [
+                axis
+                for axis in original_axes
+                if axis not in {subject_axis, node_axis, met_axis}
+            ]
+            arr = np.transpose(arr, ordered_axes)
+            if arr.ndim > 3:
+                profile = np.nanmean(arr, axis=tuple(range(3, arr.ndim)))
+            else:
+                profile = arr
+        else:
+            moved_axes = [node_axis] + [axis for axis in original_axes if axis != node_axis]
+            arr = np.moveaxis(arr, node_axis, 0)
+            met_axis = moved_axes.index(met_axis)
+            arr = np.moveaxis(arr, met_axis, -1)
+            if arr.ndim > 2:
+                profile = np.nanmean(arr, axis=tuple(range(1, arr.ndim - 1)))
+            else:
+                profile = arr
+        profile = np.asarray(profile, dtype=float)
+        if profile.ndim not in {2, 3} or profile.shape[0] == 0:
+            return None, []
+        met_size = profile.shape[-1]
+        if met_size != n_met:
+            count = min(met_size, n_met)
+            if count <= 0:
+                return None, []
+            profile = profile[..., :count]
+            names = names[:count]
+        return profile, names
+
+    @classmethod
+    def _reduce_water_signal_profile(
+        cls,
+        water_signal,
+        *,
+        n_nodes,
+        keep_indices=None,
+        row_index=None,
+        subject_count=None,
+        preserve_subjects=False,
+    ):
+        if water_signal is None:
+            return None
+        try:
+            arr = np.asarray(water_signal, dtype=float)
+        except Exception:
+            return None
+        if arr.ndim == 0 or arr.size == 0:
+            return None
+        if arr.ndim == 1:
+            arr = arr[:, np.newaxis]
+        elif arr.ndim == 2:
+            arr = arr[:, :, np.newaxis]
+        profile, names = cls._reduce_metabolite_profiles(
+            arr,
+            ["water"],
+            n_nodes=n_nodes,
+            keep_indices=keep_indices,
+            row_index=row_index,
+            subject_count=subject_count,
+            preserve_subjects=preserve_subjects,
+        )
+        if profile is None or not names:
+            return None
+        return np.asarray(profile, dtype=float)
+
+    @staticmethod
+    def _append_water_signal_profile(profile, names, water_profile):
+        if profile is None or water_profile is None:
+            return profile, names
+        normalized = {str(name).strip().lower() for name in list(names or [])}
+        if "water" in normalized:
+            return profile, names
+        try:
+            profile_arr = np.asarray(profile, dtype=float)
+            water_arr = np.asarray(water_profile, dtype=float)
+        except Exception:
+            return profile, names
+        if profile_arr.ndim not in {2, 3} or water_arr.ndim not in {2, 3}:
+            return profile, names
+        if water_arr.shape[-1] != 1:
+            return profile, names
+        if profile_arr.shape[:-1] != water_arr.shape[:-1]:
+            return profile, names
+        return np.concatenate([profile_arr, water_arr], axis=-1), list(names or []) + ["water"]
+
+    @classmethod
+    def _load_metabolite_profiles_from_npz(
+        cls,
+        path: Path,
+        *,
+        n_nodes,
+        keep_indices=None,
+        row_index=None,
+        preserve_subjects=False,
+    ):
+        try:
+            with np.load(Path(path), allow_pickle=True) as npz:
+                metabolites = cls._npz_optional_array(npz, "metabolites", "metabolites.npy")
+                profiles = cls._npz_optional_array(
+                    npz,
+                    "metab_profiles_subj_list",
+                    "metab_profiles_subj_list.npy",
+                )
+                water_signal = cls._npz_optional_array(
+                    npz,
+                    "water_signal_subj_list",
+                    "water_signal_subj_list.npy",
+                    "water_signal",
+                    "water_signal.npy",
+                )
+                subject_values, _session_values = cls._npz_subject_session_vectors(npz, path=path)
+                subject_count = len(subject_values or [])
+                if subject_count <= 0:
+                    matrix_stack = cls._npz_optional_array(npz, "matrix_subj_list", "matrix_subj_list.npy")
+                    if matrix_stack is not None and np.asarray(matrix_stack).ndim >= 3:
+                        subject_count = int(np.asarray(matrix_stack).shape[0])
+        except Exception:
+            return None, []
+        if metabolites is None or profiles is None:
+            return None, []
+        profile, names = cls._reduce_metabolite_profiles(
+            profiles,
+            metabolites,
+            n_nodes=n_nodes,
+            keep_indices=keep_indices,
+            row_index=row_index,
+            subject_count=subject_count,
+            preserve_subjects=preserve_subjects,
+        )
+        water_profile = cls._reduce_water_signal_profile(
+            water_signal,
+            n_nodes=n_nodes,
+            keep_indices=keep_indices,
+            row_index=row_index,
+            subject_count=subject_count,
+            preserve_subjects=preserve_subjects,
+        )
+        return cls._append_water_signal_profile(profile, names, water_profile)
+
+    def _selected_gradient_metabolite_profiles_path(self):
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is None or not hasattr(dialog, "metabolite_profiles_path"):
+            return None
+        try:
+            text = str(dialog.metabolite_profiles_path() or "").strip()
+        except Exception:
+            text = ""
+        return Path(text).expanduser() if text else None
+
+    @classmethod
+    def _metabolite_subject_labels_from_npz(cls, path: Path):
+        try:
+            with np.load(Path(path), allow_pickle=True) as npz:
+                subjects, sessions = cls._npz_subject_session_vectors(npz, path=path)
+        except Exception:
+            return []
+        subjects = list(subjects or [])
+        sessions = list(sessions or [])
+        if not subjects:
+            return []
+        labels = []
+        for idx, subject in enumerate(subjects):
+            subject_text = str(subject).strip()
+            session_text = str(sessions[idx]).strip() if idx < len(sessions) else ""
+            labels.append(f"{subject_text} {session_text}".strip() or f"Subject {idx + 1}")
+        return labels
+
+    @classmethod
+    def _load_metabolite_profiles_for_gradient_context(
+        cls,
+        path: Path,
+        *,
+        target_labels,
+        target_names=None,
+        row_index=None,
+        preserve_subjects=True,
+    ):
+        try:
+            with np.load(Path(path), allow_pickle=True) as npz:
+                metabolites = cls._npz_optional_array(npz, "metabolites", "metabolites.npy")
+                profiles = cls._npz_optional_array(
+                    npz,
+                    "metab_profiles_subj_list",
+                    "metab_profiles_subj_list.npy",
+                    "metab_profiles",
+                    "metab_profiles.npy",
+                    "node_signals_subj_list",
+                    "node_signals_subj_list.npy",
+                    "parcel_concentrations",
+                    "parcel_concentrations.npy",
+                )
+                water_signal = cls._npz_optional_array(
+                    npz,
+                    "water_signal_subj_list",
+                    "water_signal_subj_list.npy",
+                    "water_signal",
+                    "water_signal.npy",
+                )
+                source_labels = cls._npz_optional_array(
+                    npz,
+                    *PARCEL_LABEL_KEYS,
+                    "parcel_labels",
+                    "parcel_labels.npy",
+                    "labels_indices",
+                    "labels_indices.npy",
+                )
+                source_names = cls._npz_optional_display_vector(
+                    npz,
+                    *PARCEL_NAME_KEYS,
+                    "parcel_names",
+                    "parcel_names.npy",
+                    "labels",
+                    "labels.npy",
+                )
+                subject_values, _session_values = cls._npz_subject_session_vectors(npz, path=path)
+                subject_count = len(subject_values or [])
+                if subject_count <= 0:
+                    matrix_stack = cls._npz_optional_array(npz, "matrix_subj_list", "matrix_subj_list.npy")
+                    if matrix_stack is not None and np.asarray(matrix_stack).ndim >= 3:
+                        subject_count = int(np.asarray(matrix_stack).shape[0])
+        except Exception:
+            return None, []
+
+        names = cls._metabolite_names_from_array(metabolites)
+        if profiles is None or not names:
+            return None, []
+
+        target_labels_arr = np.asarray(target_labels, dtype=int).reshape(-1)
+        if target_labels_arr.size == 0:
+            return None, []
+        target_name_list = []
+        if target_names is not None:
+            try:
+                target_name_list = [
+                    str(value).strip()
+                    for value in np.asarray(target_names, dtype=object).reshape(-1).tolist()
+                ]
+            except Exception:
+                target_name_list = []
+
+        keep_indices = None
+        source_node_count = None
+        if source_labels is not None:
+            try:
+                src_labels = np.asarray(source_labels, dtype=int).reshape(-1)
+            except Exception:
+                src_labels = np.zeros(0, dtype=int)
+            if src_labels.size:
+                label_to_index = {}
+                for idx, label in enumerate(src_labels.tolist()):
+                    label_to_index.setdefault(int(label), int(idx))
+                mapped = [label_to_index.get(int(label), -1) for label in target_labels_arr.tolist()]
+                if all(idx >= 0 for idx in mapped):
+                    keep_indices = np.asarray(mapped, dtype=int)
+                    source_node_count = int(src_labels.size)
+
+        if keep_indices is None and source_names is not None and target_name_list:
+            source_name_list = [str(value).strip() for value in list(source_names)]
+            if source_name_list:
+                name_to_index = {}
+                for idx, name in enumerate(source_name_list):
+                    normalized = str(name).strip().lower()
+                    if normalized:
+                        name_to_index.setdefault(normalized, int(idx))
+                mapped = [
+                    name_to_index.get(str(name).strip().lower(), -1)
+                    for name in target_name_list
+                ]
+                if len(mapped) == target_labels_arr.size and all(idx >= 0 for idx in mapped):
+                    keep_indices = np.asarray(mapped, dtype=int)
+                    source_node_count = int(len(source_name_list))
+
+        if source_node_count is None:
+            source_node_count = int(target_labels_arr.size)
+            keep_indices = None
+
+        profile, names = cls._reduce_metabolite_profiles(
+            profiles,
+            metabolites,
+            n_nodes=source_node_count,
+            keep_indices=keep_indices,
+            row_index=row_index,
+            subject_count=subject_count,
+            preserve_subjects=preserve_subjects,
+        )
+        if profile is None:
+            return None, []
+        profile = np.asarray(profile, dtype=float)
+        water_profile = cls._reduce_water_signal_profile(
+            water_signal,
+            n_nodes=source_node_count,
+            keep_indices=keep_indices,
+            row_index=row_index,
+            subject_count=subject_count,
+            preserve_subjects=preserve_subjects,
+        )
+        profile, names = cls._append_water_signal_profile(profile, names, water_profile)
+        profile = np.asarray(profile, dtype=float)
+        node_axis = 1 if profile.ndim == 3 else 0
+        if profile.shape[node_axis] != target_labels_arr.size:
+            return None, []
+        return profile, names
+
+    @staticmethod
     def _canonicalize_precomputed_gradients(raw_gradients, *, row_count=None, label_count=None):
         gradients = np.asarray(raw_gradients, dtype=float)
         if gradients.ndim != 3:
@@ -1143,6 +1947,54 @@ class GradientDialogController:
         if gradients_avg.shape[1] >= gradients_avg.shape[0]:
             return np.asarray(gradients_avg, dtype=float)
         return np.asarray(gradients_avg.T, dtype=float)
+
+    @staticmethod
+    def _path_exists_safely(path_value) -> bool:
+        try:
+            return Path(path_value).expanduser().exists()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _resolve_existing_path(path_value):
+        path = Path(path_value).expanduser()
+        try:
+            return path.resolve()
+        except OSError:
+            return path
+
+    def _portable_parcellation_path_candidates(self, path_value):
+        path = Path(path_value).expanduser()
+        yielded = set()
+
+        def _yield(candidate):
+            candidate = Path(candidate).expanduser()
+            key = str(candidate)
+            if key in yielded:
+                return
+            yielded.add(key)
+            yield candidate
+
+        yield from _yield(path)
+
+        parts = path.parts
+        if "mrsi_viewer" in parts:
+            idx = parts.index("mrsi_viewer")
+            suffix_parts = parts[idx + 1 :]
+            repo_root = Path(__file__).resolve().parents[1]
+            candidate = repo_root.joinpath(*suffix_parts) if suffix_parts else repo_root
+            yield from _yield(candidate)
+
+        if len(parts) > 3 and parts[0] == "/" and parts[1] == "home":
+            candidate = Path.home().joinpath(*parts[3:])
+            yield from _yield(candidate)
+
+    def _resolve_portable_parcellation_path(self, path_value):
+        path = Path(path_value).expanduser()
+        for candidate in self._portable_parcellation_path_candidates(path):
+            if self._path_exists_safely(candidate):
+                return self._resolve_existing_path(candidate)
+        return path
 
     def _load_precomputed_gradient_bundle(self, path: Path):
         path = Path(path)
@@ -1281,13 +2133,27 @@ class GradientDialogController:
                     self._npz_optional_display_vector(npz, "metabolites"),
                 )
 
+                metabolites = self._npz_optional_array(npz, "metabolites", "metabolites.npy")
+                metab_profiles = self._npz_optional_array(
+                    npz,
+                    "metab_profiles_subj_list",
+                    "metab_profiles_subj_list.npy",
+                )
+                water_signal = self._npz_optional_array(
+                    npz,
+                    "water_signal_subj_list",
+                    "water_signal_subj_list.npy",
+                    "water_signal",
+                    "water_signal.npy",
+                )
+
                 parcellation_path = None
                 parcellation_text = self._npz_optional_scalar_text(npz, "parc_path", "parc_path.npy")
                 if parcellation_text:
                     candidate = Path(parcellation_text).expanduser()
                     if not candidate.is_absolute():
                         candidate = (path.parent / candidate).resolve()
-                    parcellation_path = candidate
+                    parcellation_path = self._resolve_portable_parcellation_path(candidate)
         except Exception:
             raise
 
@@ -1307,6 +2173,10 @@ class GradientDialogController:
             "covars_rows": row_dicts,
             "dialog_covars_rows": dialog_rows,
             "parcellation_path": parcellation_path,
+            "parcellation_path_original": str(parcellation_text or ""),
+            "metabolites": None if metabolites is None else np.asarray(metabolites),
+            "metab_profiles_subj_list": None if metab_profiles is None else np.asarray(metab_profiles),
+            "water_signal": None if water_signal is None else np.asarray(water_signal),
         }
 
     @staticmethod
@@ -1362,7 +2232,8 @@ class GradientDialogController:
 
         parcellation_path = bundle.get("parcellation_path")
         did_reset = False
-        if isinstance(parcellation_path, Path) and parcellation_path.exists():
+        parcellation_exists = isinstance(parcellation_path, Path) and self._path_exists_safely(parcellation_path)
+        if parcellation_exists:
             active_path = Path(self._active_parcellation_path) if self._active_parcellation_path is not None else None
             if active_path != parcellation_path:
                 did_reset = bool(self._set_active_parcellation(parcellation_path))
@@ -1378,7 +2249,10 @@ class GradientDialogController:
                 pass
 
         status = f"Loaded precomputed gradients from {bundle.get('label', 'bundle')}. Select a participant/session row."
-        if isinstance(parcellation_path, Path) and not parcellation_path.exists():
+        original_path_text = str(bundle.get("parcellation_path_original") or "").strip()
+        if did_reset and original_path_text and str(parcellation_path) != original_path_text:
+            status += " Adapted bundle parcellation path to this checkout."
+        if isinstance(parcellation_path, Path) and not parcellation_exists:
             status += " Bundle parcellation path was not found; set it manually before confirming."
         self.statusBar().showMessage(status)
 
@@ -1448,6 +2322,39 @@ class GradientDialogController:
         elif self._active_parcellation_path is not None:
             template_path_text = str(self._active_parcellation_path)
 
+        custom_metabolite_path = self._selected_gradient_metabolite_profiles_path()
+        if custom_metabolite_path is not None and custom_metabolite_path.exists():
+            metabolite_profiles, metabolite_names = self._load_metabolite_profiles_for_gradient_context(
+                custom_metabolite_path,
+                target_labels=np.asarray(parcel_labels, dtype=int),
+                target_names=parcel_names,
+                row_index=row_index,
+                preserve_subjects=False,
+            )
+            if metabolite_profiles is None:
+                self.statusBar().showMessage(
+                    f"Custom metabolite profiles did not align to the selected gradient row: {custom_metabolite_path}"
+                )
+        else:
+            metabolite_profiles, metabolite_names = self._reduce_metabolite_profiles(
+                bundle.get("metab_profiles_subj_list"),
+                bundle.get("metabolites"),
+                n_nodes=parcel_labels.size,
+                row_index=row_index,
+                subject_count=bundle.get("n_rows"),
+            )
+            water_profile = self._reduce_water_signal_profile(
+                bundle.get("water_signal"),
+                n_nodes=parcel_labels.size,
+                row_index=row_index,
+                subject_count=bundle.get("n_rows"),
+            )
+            metabolite_profiles, metabolite_names = self._append_water_signal_profile(
+                metabolite_profiles,
+                metabolite_names,
+                water_profile,
+            )
+
         self._gradient_component_count = n_grad
         self._gradient_surface_render_count = 1
         self._gradient_precomputed_selected_row = row_index
@@ -1470,6 +2377,8 @@ class GradientDialogController:
             "matrix_label": bundle.get("label", ""),
             "precomputed_source_path": str(bundle["path"]),
             "precomputed_row_index": int(row_index),
+            "metabolite_profiles": metabolite_profiles,
+            "metabolite_names": metabolite_names,
         }
         self._set_gradients_progress(0, n_grad, n_grad, self._gradient_precomputed_selection_text())
         self._sync_gradients_dialog_state()
@@ -1539,8 +2448,109 @@ class GradientDialogController:
     def _gradient_entry_source_path(entry):
         return _MatrixDataAccess.entry_source_path(entry)
 
-    def _entry_parcel_metadata(self, entry, expected_len=None):
-        return self._data_access.entry_parcel_metadata(entry, expected_len=expected_len)
+    def _entry_parcel_metadata(self, entry, expected_len=None, label_key: str = "", name_key: str = ""):
+        try:
+            return self._data_access.entry_parcel_metadata(
+                entry,
+                expected_len=expected_len,
+                label_key=label_key,
+                name_key=name_key,
+            )
+        except TypeError:
+            return self._data_access.entry_parcel_metadata(entry, expected_len=expected_len)
+
+    @staticmethod
+    def _preferred_parcel_key(options, preferred_keys):
+        keys = [str(option.get("key", "")).strip() for option in list(options or []) if isinstance(option, dict)]
+        keys = [key for key in keys if key]
+        if not keys:
+            return ""
+        key_set = set(keys)
+        for preferred in preferred_keys:
+            text = str(preferred or "").strip()
+            if text in key_set:
+                return text
+        lower_to_key = {key.lower(): key for key in keys}
+        for preferred in preferred_keys:
+            text = str(preferred or "").strip().lower()
+            if text in lower_to_key:
+                return lower_to_key[text]
+        return ""
+
+    @staticmethod
+    def _parcel_key_option_label(option) -> str:
+        if not isinstance(option, dict):
+            return str(option or "").strip()
+        key = str(option.get("key", "")).strip()
+        if not key:
+            return ""
+        shape = option.get("shape")
+        dtype = str(option.get("dtype", "")).strip()
+        if shape:
+            shape_text = "x".join(str(dim) for dim in tuple(shape))
+            suffix = f" [{shape_text}"
+            if dtype:
+                suffix += f", {dtype}"
+            suffix += "]"
+            return f"{key}{suffix}"
+        return key
+
+    def _available_gradient_parcel_key_options(self):
+        entry = self._selected_gradient_entry()
+        source_path = self._gradient_entry_source_path(entry)
+        if source_path is None or not source_path.exists():
+            return {
+                "labels": [],
+                "names": [],
+                "auto_label_key": "",
+                "auto_name_key": "",
+            }
+        expected_len = None
+        try:
+            matrix = np.asarray(self._gradient_matrix_for_entry(entry))
+            if matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1]:
+                expected_len = int(matrix.shape[0])
+        except Exception:
+            expected_len = None
+        vector_options = self._data_access.npz_vector_keys(source_path, expected_len=expected_len)
+        formatted_options = []
+        for option in vector_options:
+            key = str(option.get("key", "")).strip()
+            label = self._parcel_key_option_label(option)
+            if key and label:
+                item = dict(option)
+                item["label"] = label
+                formatted_options.append(item)
+        return {
+            "labels": formatted_options,
+            "names": formatted_options,
+            "auto_label_key": self._preferred_parcel_key(formatted_options, PARCEL_LABEL_KEYS),
+            "auto_name_key": self._preferred_parcel_key(formatted_options, PARCEL_NAME_KEYS),
+        }
+
+    def _selected_gradient_parcel_label_key(self) -> str:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_parcel_label_key"):
+            try:
+                self._gradient_parcel_label_key = str(dialog.selected_parcel_label_key() or "").strip()
+            except Exception:
+                pass
+        self._gradient_parcel_label_key = str(
+            getattr(self, "_gradient_parcel_label_key", "") or ""
+        ).strip()
+        return self._gradient_parcel_label_key
+
+    def _selected_gradient_parcel_name_key(self) -> str:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_parcel_name_key"):
+            try:
+                self._gradient_parcel_name_key = str(dialog.selected_parcel_name_key() or "").strip()
+            except Exception:
+                pass
+        self._gradient_parcel_name_key = str(
+            getattr(self, "_gradient_parcel_name_key", "") or ""
+        ).strip()
+        return self._gradient_parcel_name_key
 
     def _gradient_matrix_label_for_entry(self, entry) -> str:
         if entry is None:
@@ -1566,6 +2576,19 @@ class GradientDialogController:
                     "label": self._gradient_matrix_label_for_entry(entry),
                 }
             )
+        return options
+
+    def _available_gradient_reference_matrix_entries(self):
+        current_gradient_entry_id = self._selected_gradient_entry_id()
+        options = []
+        for option in self._available_gradient_matrix_entries():
+            entry_id = option.get("id")
+            if (
+                entry_id == current_gradient_entry_id
+                and not bool(getattr(self, "_gradient_use_precomputed_bundle", False))
+            ):
+                continue
+            options.append(option)
         return options
 
     def _available_combine_matrix_entries(self):
@@ -1602,6 +2625,12 @@ class GradientDialogController:
             return None
         return self._entries.get(entry_id)
 
+    def _selected_gradient_classification_ref_entry(self):
+        entry_id = self._selected_gradient_classification_ref_entry_id()
+        if entry_id is None:
+            return None
+        return self._entries.get(entry_id)
+
     def _gradient_matrix_for_entry(self, entry):
         if entry is None:
             return None
@@ -1627,6 +2656,20 @@ class GradientDialogController:
         if normalized_id == self._gradient_selected_entry_id:
             return
         self._gradient_selected_entry_id = normalized_id
+        self._reset_gradients_output()
+
+    def _on_gradient_parcel_label_key_changed(self, value: str) -> None:
+        text = str(value or "").strip()
+        if text == str(getattr(self, "_gradient_parcel_label_key", "") or "").strip():
+            return
+        self._gradient_parcel_label_key = text
+        self._reset_gradients_output()
+
+    def _on_gradient_parcel_name_key_changed(self, value: str) -> None:
+        text = str(value or "").strip()
+        if text == str(getattr(self, "_gradient_parcel_name_key", "") or "").strip():
+            return
+        self._gradient_parcel_name_key = text
         self._reset_gradients_output()
 
     def _on_gradient_network_component_changed(self, value: str) -> None:
@@ -1683,6 +2726,20 @@ class GradientDialogController:
             matrix_source = self._gradient_matrix_label_for_entry(selected_entry)
 
         dialog.set_matrix_options(matrix_options, selected_entry_id=selected_entry_id)
+        parcel_key_options = self._available_gradient_parcel_key_options()
+        if hasattr(dialog, "set_parcel_key_options"):
+            dialog.set_parcel_key_options(
+                parcel_key_options.get("labels", []),
+                parcel_key_options.get("names", []),
+                selected_label_key=self._selected_gradient_parcel_label_key(),
+                selected_name_key=self._selected_gradient_parcel_name_key(),
+                auto_label_key=parcel_key_options.get("auto_label_key", ""),
+                auto_name_key=parcel_key_options.get("auto_name_key", ""),
+            )
+        dialog.set_classification_reference_matrix_options(
+            self._available_gradient_reference_matrix_entries(),
+            selected_entry_id=self._selected_gradient_classification_ref_entry_id(),
+        )
         dialog.set_matrix_source(matrix_source)
         dialog.set_component_count(component_count)
         dialog.set_surface_render_component_limit(self._available_gradient_network_component_count())
@@ -1697,8 +2754,14 @@ class GradientDialogController:
         dialog.set_classification_hemisphere_mode(self._selected_gradient_classification_hemisphere_mode())
         dialog.set_scatter_rotation(self._selected_gradient_scatter_rotation())
         dialog.set_triangular_rgb(self._selected_gradient_triangular_rgb())
+        dialog.set_preload_matching_paths(
+            self._selected_gradient_preload_matching_paths()
+        )
         dialog.set_classification_fit_mode(self._selected_gradient_classification_fit_mode())
         dialog.set_triangular_color_order(self._selected_gradient_triangular_color_order())
+        if hasattr(dialog, "set_rgb_scalar_mode"):
+            dialog.set_rgb_scalar_mode(self._selected_gradient_rgb_scalar_mode())
+        dialog.set_rgb_mask_strictness(self._selected_gradient_rgb_mask_strictness())
         dialog.set_classification_colormap(self._selected_gradient_classification_colormap())
         dialog.set_classification_component_options(
             self._available_gradient_network_component_count(),
@@ -1707,6 +2770,7 @@ class GradientDialogController:
         dialog.set_classification_axes(
             self._selected_gradient_classification_x_axis(),
             self._selected_gradient_classification_y_axis(),
+            self._selected_gradient_classification_z_axis(),
         )
         ignore_options = self._gradient_classification_ignore_parcel_options()
         dialog.set_classification_ignore_parcel_options(
@@ -1778,6 +2842,8 @@ class GradientDialogController:
                 classify_callback=self._classify_gradients_fsaverage,
                 render_network_callback=self._render_gradients_network,
                 matrix_changed_callback=self._on_gradient_matrix_entry_changed,
+                parcel_label_key_changed_callback=self._on_gradient_parcel_label_key_changed,
+                parcel_name_key_changed_callback=self._on_gradient_parcel_name_key_changed,
                 component_changed_callback=self._on_gradient_component_changed,
                 colormap_changed_callback=self._on_gradient_colormap_changed,
                 hemisphere_changed_callback=self._on_gradient_hemisphere_changed,
@@ -1788,12 +2854,19 @@ class GradientDialogController:
                 classification_hemisphere_changed_callback=self._on_gradient_classification_hemisphere_changed,
                 scatter_rotation_changed_callback=self._on_gradient_scatter_rotation_changed,
                 triangular_rgb_changed_callback=self._on_gradient_triangular_rgb_changed,
+                preload_matching_paths_changed_callback=(
+                    self._on_gradient_preload_matching_paths_changed
+                ),
                 classification_fit_mode_changed_callback=self._on_gradient_classification_fit_mode_changed,
                 triangular_color_order_changed_callback=self._on_gradient_triangular_color_order_changed,
+                rgb_scalar_mode_changed_callback=self._on_gradient_rgb_scalar_mode_changed,
+                rgb_mask_strictness_changed_callback=self._on_gradient_rgb_mask_strictness_changed,
                 classification_colormap_changed_callback=self._on_gradient_classification_colormap_changed,
                 classification_component_changed_callback=self._on_gradient_classification_component_changed,
                 classification_x_axis_changed_callback=self._on_gradient_classification_x_axis_changed,
                 classification_y_axis_changed_callback=self._on_gradient_classification_y_axis_changed,
+                classification_z_axis_changed_callback=self._on_gradient_classification_z_axis_changed,
+                classification_ref_matrix_changed_callback=self._on_gradient_classification_ref_entry_changed,
                 classification_ignore_lh_changed_callback=self._on_gradient_classification_ignore_lh_changed,
                 classification_ignore_rh_changed_callback=self._on_gradient_classification_ignore_rh_changed,
                 open_classification_adjacency_callback=self._select_gradient_classification_adjacency,
@@ -1842,16 +2915,28 @@ class GradientDialogController:
             self.statusBar().showMessage("No active parcellation template.")
             return
 
-        parcel_labels, parcel_names = self._entry_parcel_metadata(entry, expected_len=conn_matrix.shape[0])
+        label_key = self._selected_gradient_parcel_label_key()
+        name_key = self._selected_gradient_parcel_name_key()
+        parcel_labels, parcel_names = self._entry_parcel_metadata(
+            entry,
+            expected_len=conn_matrix.shape[0],
+            label_key=label_key,
+            name_key=name_key,
+        )
         source_path = self._gradient_entry_source_path(entry)
         if (source_path is None or not source_path.exists()) and parcel_labels is None:
             self.statusBar().showMessage("Projection requires parcel labels for the selected matrix.")
             return
         label_indices = _coerce_label_indices(parcel_labels, conn_matrix.shape[0])
         if label_indices is None:
-            self.statusBar().showMessage(
-                "parcel_labels_group missing/invalid or does not match matrix nodes."
-            )
+            if label_key:
+                self.statusBar().showMessage(
+                    f"Selected parcel label key '{label_key}' is missing/invalid or does not match matrix nodes."
+                )
+            else:
+                self.statusBar().showMessage(
+                    "Parcel labels missing/invalid or do not match matrix nodes. Select the label key in Gradients."
+                )
             return
         template_labels = set(np.asarray(template_data, dtype=int).reshape(-1).tolist())
         template_labels.discard(0)
@@ -1908,6 +2993,30 @@ class GradientDialogController:
         )
         source_stem = source_path.stem if source_path is not None else "matrix"
         default_name = f"{source_stem}_diffusion_components-{n_grad}.nii.gz"
+        metabolite_profiles = None
+        metabolite_names = []
+        custom_metabolite_path = self._selected_gradient_metabolite_profiles_path()
+        if custom_metabolite_path is not None:
+            if custom_metabolite_path.exists():
+                metabolite_profiles, metabolite_names = self._load_metabolite_profiles_for_gradient_context(
+                    custom_metabolite_path,
+                    target_labels=np.asarray(projection_labels, dtype=int),
+                    target_names=kept_names,
+                    preserve_subjects=True,
+                )
+                if metabolite_profiles is None:
+                    self.statusBar().showMessage(
+                        f"Custom metabolite profiles did not align to the gradient parcels: {custom_metabolite_path}"
+                    )
+            else:
+                self.statusBar().showMessage(f"Custom metabolite profile file does not exist: {custom_metabolite_path}")
+        elif source_path is not None and source_path.exists():
+            metabolite_profiles, metabolite_names = self._load_metabolite_profiles_from_npz(
+                source_path,
+                n_nodes=conn_matrix.shape[0],
+                keep_indices=keep_indices,
+                preserve_subjects=True,
+            )
 
         self._last_gradients = {
             "gradients": np.asarray(gradients, dtype=float),
@@ -1926,6 +3035,8 @@ class GradientDialogController:
             "parcel_names": kept_names,
             "matrix_entry_id": self._selected_gradient_entry_id(),
             "matrix_label": matrix_label,
+            "metabolite_profiles": metabolite_profiles,
+            "metabolite_names": metabolite_names,
         }
         self._set_gradients_progress(0, n_grad, n_grad, f"{n_grad}/{n_grad} components (done)")
         self._sync_gradients_dialog_state()
@@ -2377,12 +3488,102 @@ class GradientDialogController:
         if x_norm == "spatial" and y_norm == "spatial":
             return 0, 1, "Spatial 1", "Spatial 2"
         if x_norm == "spatial":
-            x_index = 1 if y_norm == "gradient2" else 0
+            x_index = 1 if y_norm in {"gradient2", "gradient3", "gradient_ref2", "gradient_ref3"} else 0
             return x_index, 0, "Spatial", "Spatial"
         if y_norm == "spatial":
-            y_index = 1 if x_norm == "gradient2" else 0
+            y_index = 1 if x_norm in {"gradient2", "gradient3", "gradient_ref2", "gradient_ref3"} else 0
             return 0, y_index, "Spatial", "Spatial"
         return 0, 0, "Spatial", "Spatial"
+
+    def _classification_reference_gradient_payload(self, required_components: int):
+        try:
+            required_components = int(required_components)
+        except Exception:
+            required_components = 1
+        required_components = max(1, min(3, required_components))
+
+        entry = self._selected_gradient_classification_ref_entry()
+        if entry is None:
+            raise RuntimeError("Select a reference matrix for Gradient Ref classification axes.")
+
+        ref_label = self._gradient_matrix_label_for_entry(entry)
+        try:
+            ref_matrix = np.asarray(self._gradient_matrix_for_entry(entry), dtype=float)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load reference matrix {ref_label}: {exc}") from exc
+        if ref_matrix.ndim != 2 or ref_matrix.shape[0] != ref_matrix.shape[1]:
+            raise RuntimeError(f"Reference gradients require a square matrix. {ref_label} is not square.")
+
+        results = self._last_gradients or {}
+        projection_labels = np.asarray(results.get("projection_labels"), dtype=int).reshape(-1)
+        if projection_labels.size == 0:
+            raise RuntimeError("Current gradient projection labels are unavailable.")
+
+        ref_labels_raw, _ref_names = self._entry_parcel_metadata(entry, expected_len=ref_matrix.shape[0])
+        ref_label_indices = _coerce_label_indices(ref_labels_raw, ref_matrix.shape[0])
+        if ref_label_indices is not None:
+            ref_label_indices = np.asarray(ref_label_indices, dtype=int).reshape(-1)
+            if np.unique(ref_label_indices).size != ref_label_indices.size:
+                raise RuntimeError("Reference matrix parcel_labels_group must be unique.")
+            label_to_index = {
+                int(label): int(idx)
+                for idx, label in enumerate(ref_label_indices.tolist())
+            }
+            missing = [int(label) for label in projection_labels.tolist() if int(label) not in label_to_index]
+            if missing:
+                preview = ", ".join(str(label) for label in missing[:8])
+                if len(missing) > 8:
+                    preview += ", ..."
+                raise RuntimeError(
+                    f"Reference matrix {ref_label} is missing projection label(s): {preview}"
+                )
+            ref_keep_indices = np.asarray(
+                [label_to_index[int(label)] for label in projection_labels.tolist()],
+                dtype=int,
+            )
+        else:
+            keep_indices = np.asarray(results.get("keep_indices", []), dtype=int).reshape(-1)
+            if ref_matrix.shape[0] == projection_labels.size:
+                ref_keep_indices = np.arange(projection_labels.size, dtype=int)
+            elif (
+                keep_indices.size == projection_labels.size
+                and keep_indices.size > 0
+                and int(np.max(keep_indices)) < ref_matrix.shape[0]
+            ):
+                ref_keep_indices = np.asarray(keep_indices, dtype=int)
+            else:
+                raise RuntimeError(
+                    "Reference matrix needs parcel_labels_group matching the active projection labels, "
+                    "or the same row order/size as the current matrix."
+                )
+
+        ref_gradients = np.zeros((projection_labels.size, required_components), dtype=float)
+        for comp_idx in range(1, required_components + 1):
+            try:
+                component = nettools.dimreduce_matrix(
+                    ref_matrix,
+                    method="diffusion",
+                    scale_factor=1.0,
+                    output_dim=comp_idx,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to compute Gradient Ref {comp_idx} from {ref_label}: {exc}"
+                ) from exc
+            component = np.asarray(component, dtype=float).reshape(-1)
+            if component.size != ref_matrix.shape[0]:
+                raise RuntimeError(
+                    f"Gradient Ref {comp_idx} size mismatch ({component.size} vs {ref_matrix.shape[0]})."
+                )
+            ref_gradients[:, comp_idx - 1] = np.asarray(component[ref_keep_indices], dtype=float)
+
+        projected_data = self._project_gradient_matrix_to_volume(ref_gradients)
+        return {
+            "entry_id": entry.get("id"),
+            "label": ref_label,
+            "gradients": np.asarray(ref_gradients, dtype=float),
+            "projected_data": projected_data,
+        }
 
     def _classification_axis_payload(
         self,
@@ -2393,6 +3594,7 @@ class GradientDialogController:
         spatial_index: int = 0,
         spatial_label: str = "Spatial",
         spatial_embedding_override=None,
+        reference_payload=None,
     ):
         axis = self._normalize_gradient_classification_axis(axis_key, default="gradient1")
         if axis == "gradient1":
@@ -2409,6 +3611,32 @@ class GradientDialogController:
             if projected_data.ndim != 4 or projected_data.shape[3] < 2:
                 raise RuntimeError("Projected Gradient 2 volume is not available.")
             return np.asarray(gradients[:, 1], dtype=float), np.asarray(projected_data[..., 1], dtype=float), "Gradient 2"
+        if axis == "gradient3":
+            if gradients.ndim != 2 or gradients.shape[1] < 3:
+                raise RuntimeError("Gradient 3 is not available for classification.")
+            if projected_data.ndim != 4 or projected_data.shape[3] < 3:
+                raise RuntimeError("Projected Gradient 3 volume is not available.")
+            return np.asarray(gradients[:, 2], dtype=float), np.asarray(projected_data[..., 2], dtype=float), "Gradient 3"
+
+        if axis in {"gradient_ref1", "gradient_ref2", "gradient_ref3"}:
+            if not isinstance(reference_payload, dict):
+                raise RuntimeError("Reference gradients are not available.")
+            ref_gradients = np.asarray(reference_payload.get("gradients"), dtype=float)
+            ref_projected = np.asarray(reference_payload.get("projected_data"), dtype=float)
+            comp_idx = {"gradient_ref1": 0, "gradient_ref2": 1, "gradient_ref3": 2}.get(axis, 0)
+            if ref_gradients.ndim != 2 or ref_gradients.shape[1] <= comp_idx:
+                raise RuntimeError(f"Gradient Ref {comp_idx + 1} is not available for classification.")
+            if comp_idx == 0 and ref_projected.ndim == 3:
+                volume = np.asarray(ref_projected, dtype=float)
+            elif ref_projected.ndim == 4 and ref_projected.shape[3] > comp_idx:
+                volume = np.asarray(ref_projected[..., comp_idx], dtype=float)
+            else:
+                raise RuntimeError(f"Projected Gradient Ref {comp_idx + 1} volume is not available.")
+            return (
+                np.asarray(ref_gradients[:, comp_idx], dtype=float),
+                volume,
+                f"Gradient Ref {comp_idx + 1}",
+            )
 
         spatial = (
             dict(spatial_embedding_override)
@@ -2560,10 +3788,16 @@ class GradientDialogController:
             surface_mesh = self._selected_gradient_classification_surface_mesh()
             scatter_rotation = self._selected_gradient_scatter_rotation()
             use_triangular_rgb = self._selected_gradient_triangular_rgb()
+            preload_matching_paths = self._selected_gradient_preload_matching_paths()
             classification_fit_mode = self._selected_gradient_classification_fit_mode()
             triangular_color_order = self._selected_gradient_triangular_color_order()
+            rgb_scalar_mode = self._selected_gradient_rgb_scalar_mode()
+            rgb_mask_strictness = self._selected_gradient_rgb_mask_strictness()
             x_axis = self._selected_gradient_classification_x_axis()
             y_axis = self._selected_gradient_classification_y_axis()
+            z_axis = self._selected_gradient_classification_z_axis()
+            is_3d_embedding = z_axis != "none"
+            effective_use_triangular_rgb = bool(use_triangular_rgb) or is_3d_embedding
             x_spatial_index, y_spatial_index, x_spatial_label, y_spatial_label = self._classification_spatial_indices(
                 x_axis,
                 y_axis,
@@ -2575,21 +3809,65 @@ class GradientDialogController:
                 )
             ) - 1
             class_component = max(0, min(class_component, gradients.shape[1] - 1))
+            use_own_rgb_source = bool(effective_use_triangular_rgb) and self._classification_uses_reference_axis(
+                x_axis,
+                y_axis,
+                z_axis,
+            )
+            required_rgb_components = 3 if is_3d_embedding else 2
+            if use_own_rgb_source and gradients.shape[1] < required_rgb_components:
+                raise RuntimeError(
+                    f"Gradient Ref RGB coloring requires current Gradient 1 through Gradient {required_rgb_components}."
+                )
             required_projection_count = 1
-            if x_axis == "gradient2" or y_axis == "gradient2":
-                required_projection_count = max(required_projection_count, 2)
-            if not use_triangular_rgb:
-                required_projection_count = max(required_projection_count, class_component + 1)
+            required_projection_count = max(
+                required_projection_count,
+                self._classification_axis_component_count(x_axis),
+                self._classification_axis_component_count(y_axis),
+                self._classification_axis_component_count(z_axis),
+            )
+            if use_own_rgb_source:
+                required_projection_count = max(required_projection_count, required_rgb_components)
+            required_projection_count = max(required_projection_count, class_component + 1)
             projected_data = self._ensure_projected_gradient_data(required_projection_count)
             if projected_data is None:
                 raise RuntimeError("No projected fsaverage data are available for classification.")
             classification_cmap_name = self._selected_gradient_classification_colormap()
             classification_cmap = self._selected_surface_colormap(classification_cmap_name)
             axis_gradients = np.asarray(gradients, dtype=float)
+            rgb_x_values = None
+            rgb_y_values = None
+            rgb_z_values = None
+            rgb_x_volume = None
+            rgb_y_volume = None
+            rgb_z_volume = None
+            if use_own_rgb_source:
+                rgb_x_values = np.asarray(axis_gradients[:, 1], dtype=float)
+                rgb_y_values = np.asarray(axis_gradients[:, 0], dtype=float)
+                if is_3d_embedding:
+                    rgb_z_values = np.asarray(axis_gradients[:, 2], dtype=float)
+                if projected_data.ndim != 4 or projected_data.shape[3] < required_rgb_components:
+                    raise RuntimeError(
+                        f"Projected current Gradient 1 through Gradient {required_rgb_components} volumes are required for RGB coloring."
+                    )
+                rgb_y_volume = np.asarray(projected_data[..., 0], dtype=float)
+                rgb_x_volume = np.asarray(projected_data[..., 1], dtype=float)
+                if is_3d_embedding:
+                    rgb_z_volume = np.asarray(projected_data[..., 2], dtype=float)
+            reference_payload = None
+            reference_component_count = self._classification_reference_component_count(x_axis, y_axis, z_axis)
+            if reference_component_count > 0:
+                reference_payload = self._classification_reference_gradient_payload(reference_component_count)
             spatial_embedding_override = None
             if x_axis == "spatial" or y_axis == "spatial":
+                spatial_alignment_gradients = axis_gradients
+                if reference_payload is not None and (
+                    x_axis in {"gradient_ref1", "gradient_ref2", "gradient_ref3"}
+                    or y_axis in {"gradient_ref1", "gradient_ref2", "gradient_ref3"}
+                ):
+                    spatial_alignment_gradients = np.asarray(reference_payload.get("gradients"), dtype=float)
                 spatial_embedding_override = self._classification_spatial_embedding(
-                    axis_gradients,
+                    spatial_alignment_gradients,
                     align_to_gradients=True,
                 )
             x_values, x_volume, x_label = self._classification_axis_payload(
@@ -2599,6 +3877,7 @@ class GradientDialogController:
                 spatial_index=x_spatial_index,
                 spatial_label=x_spatial_label,
                 spatial_embedding_override=spatial_embedding_override,
+                reference_payload=reference_payload,
             )
             y_values, y_volume, y_label = self._classification_axis_payload(
                 y_axis,
@@ -2607,14 +3886,26 @@ class GradientDialogController:
                 spatial_index=y_spatial_index,
                 spatial_label=y_spatial_label,
                 spatial_embedding_override=spatial_embedding_override,
+                reference_payload=reference_payload,
             )
-            if x_axis == "spatial" and y_axis in {"gradient1", "gradient2"}:
+            z_values = None
+            z_volume = None
+            z_label = ""
+            if is_3d_embedding:
+                z_values, z_volume, z_label = self._classification_axis_payload(
+                    z_axis,
+                    axis_gradients,
+                    projected_data,
+                    reference_payload=reference_payload,
+                )
+            gradient_like_axes = {"gradient1", "gradient2", "gradient3", "gradient_ref1", "gradient_ref2", "gradient_ref3"}
+            if x_axis == "spatial" and y_axis in gradient_like_axes:
                 x_values, x_volume = self._rescale_classification_axis_to_range(
                     x_values,
                     x_volume,
                     y_values,
                 )
-            if y_axis == "spatial" and x_axis in {"gradient1", "gradient2"}:
+            if y_axis == "spatial" and x_axis in gradient_like_axes:
                 y_values, y_volume = self._rescale_classification_axis_to_range(
                     y_values,
                     y_volume,
@@ -2622,8 +3913,15 @@ class GradientDialogController:
                 )
             class_component_values = np.asarray(axis_gradients[:, class_component], dtype=float)
             finite_mask = np.isfinite(x_values) & np.isfinite(y_values) & np.isfinite(class_component_values)
+            if is_3d_embedding:
+                finite_mask &= np.isfinite(z_values)
+            if use_own_rgb_source:
+                finite_mask &= np.isfinite(rgb_x_values) & np.isfinite(rgb_y_values)
+                if is_3d_embedding:
+                    finite_mask &= np.isfinite(rgb_z_values)
             if not np.any(finite_mask):
-                self.statusBar().showMessage(f"No finite values available for {y_label} vs {x_label} classification.")
+                axis_text = f"{z_label} vs {y_label} vs {x_label}" if is_3d_embedding else f"{y_label} vs {x_label}"
+                self.statusBar().showMessage(f"No finite values available for {axis_text} classification.")
                 return
             projection_labels = np.asarray(self._last_gradients.get("projection_labels"), dtype=int).reshape(-1)
             if projection_labels.shape[0] != x_values.shape[0]:
@@ -2673,20 +3971,80 @@ class GradientDialogController:
                     f"No parcels remain for {y_label} vs {x_label} after applying the ignore-parcel selection."
                 )
                 return
-            scatter_title = f"{y_label} vs {x_label} - {source_name}"
+            metabolite_profiles = self._last_gradients.get("metabolite_profiles")
+            metabolite_names = list(self._last_gradients.get("metabolite_names") or [])
+            metabolite_subject_labels = list(self._last_gradients.get("metabolite_subject_labels") or [])
+            custom_metabolite_path = self._selected_gradient_metabolite_profiles_path()
+            if custom_metabolite_path is not None:
+                if custom_metabolite_path.exists():
+                    metabolite_subject_labels = self._metabolite_subject_labels_from_npz(custom_metabolite_path)
+                    row_index_for_profiles = self._last_gradients.get("precomputed_row_index", None)
+                    metabolite_profiles, metabolite_names = self._load_metabolite_profiles_for_gradient_context(
+                        custom_metabolite_path,
+                        target_labels=projection_labels,
+                        target_names=point_labels,
+                        row_index=row_index_for_profiles,
+                        preserve_subjects=row_index_for_profiles is None,
+                    )
+                    if metabolite_profiles is None:
+                        metabolite_names = []
+                        self.statusBar().showMessage(
+                            f"Custom metabolite profiles did not align to this gradient context: {custom_metabolite_path}"
+                        )
+                else:
+                    metabolite_profiles = None
+                    metabolite_names = []
+                    metabolite_subject_labels = []
+                    self.statusBar().showMessage(f"Custom metabolite profile file does not exist: {custom_metabolite_path}")
+            elif not metabolite_subject_labels:
+                entry_id = self._last_gradients.get("matrix_entry_id")
+                entry = self._entries.get(entry_id) if entry_id in self._entries else None
+                profile_source_path = self._gradient_entry_source_path(entry)
+                if profile_source_path is not None and profile_source_path.exists():
+                    metabolite_subject_labels = self._metabolite_subject_labels_from_npz(profile_source_path)
+            if metabolite_profiles is not None:
+                try:
+                    metabolite_profiles = np.asarray(metabolite_profiles, dtype=float)
+                    valid_metabolite_profiles = (
+                        metabolite_profiles.ndim == 2
+                        and metabolite_profiles.shape[0] == finite_mask.shape[0]
+                        and metabolite_profiles.shape[1] > 0
+                    ) or (
+                        metabolite_profiles.ndim == 3
+                        and metabolite_profiles.shape[1] == finite_mask.shape[0]
+                        and metabolite_profiles.shape[2] > 0
+                    )
+                    if not valid_metabolite_profiles:
+                        metabolite_profiles = None
+                        metabolite_names = []
+                        metabolite_subject_labels = []
+                    elif metabolite_profiles.ndim == 3 and len(metabolite_subject_labels) != metabolite_profiles.shape[0]:
+                        metabolite_subject_labels = [
+                            f"Subject {idx + 1}" for idx in range(int(metabolite_profiles.shape[0]))
+                        ]
+                except Exception:
+                    metabolite_profiles = None
+                    metabolite_names = []
+                    metabolite_subject_labels = []
+            scatter_title = (
+                f"{z_label} vs {y_label} vs {x_label} - {source_name}"
+                if is_3d_embedding
+                else f"{y_label} vs {x_label} - {source_name}"
+            )
         except Exception as exc:
             self.statusBar().showMessage(f"Failed to prepare classification axes: {exc}")
             return
 
         edge_pairs = np.zeros((0, 2), dtype=int)
         adjacency_note = None
-        try:
-            edge_pairs, adjacency_note = self._classification_scatter_edge_pairs(
-                projection_labels,
-                finite_mask,
-            )
-        except Exception as exc:
-            adjacency_note = f"Adjacency skipped: {exc}"
+        if not is_3d_embedding:
+            try:
+                edge_pairs, adjacency_note = self._classification_scatter_edge_pairs(
+                    projection_labels,
+                    finite_mask,
+                )
+            except Exception as exc:
+                adjacency_note = f"Adjacency skipped: {exc}"
 
         scatter_error = None
         surface_error = None
@@ -2697,6 +4055,8 @@ class GradientDialogController:
             scatter_export_metadata = {
                 "source_name": source_name,
                 "source_dir": str(self._last_gradients.get("source_dir", self._default_results_dir())),
+                "input_path": str(self._last_gradients.get("precomputed_source_path", "") or ""),
+                "group_gradients_path": str(self._last_gradients.get("precomputed_source_path", "") or ""),
                 "parc_path": str(self._last_gradients.get("template_path", "") or ""),
                 "template_path": str(self._last_gradients.get("template_path", "") or ""),
                 "adjacency_path": str(self._gradient_classification_adjacency_path or ""),
@@ -2704,6 +4064,11 @@ class GradientDialogController:
                 "gradient2_values": (
                     np.asarray(axis_gradients[:, 1], dtype=float)[finite_mask]
                     if axis_gradients.ndim == 2 and axis_gradients.shape[1] >= 2
+                    else np.full(scatter_projection_labels.shape, np.nan, dtype=float)
+                ),
+                "gradient3_values": (
+                    np.asarray(axis_gradients[:, 2], dtype=float)[finite_mask]
+                    if axis_gradients.ndim == 2 and axis_gradients.shape[1] >= 3
                     else np.full(scatter_projection_labels.shape, np.nan, dtype=float)
                 ),
             }
@@ -2750,8 +4115,19 @@ class GradientDialogController:
                         with np.load(source_path, allow_pickle=True) as npz:
                             group_value = self._npz_optional_scalar_text(npz, "group")
                             modality_value = self._npz_optional_scalar_text(npz, "modality")
+                            participant = self._npz_optional_scalar_text(
+                                npz,
+                                "subject_id",
+                                "participant_id",
+                            )
+                            session = self._npz_optional_scalar_text(
+                                npz,
+                                "session_id",
+                                "session",
+                            )
                     except Exception:
                         pass
+                    scatter_export_metadata["source_path"] = str(source_path)
             scatter_export_metadata["subject_id"] = participant
             scatter_export_metadata["session_id"] = session
             scatter_export_metadata["group"] = group_value
@@ -2772,33 +4148,50 @@ class GradientDialogController:
             self._gradient_scatter_dialog = GradientScatterDialog(
                 x_values[finite_mask],
                 y_values[finite_mask],
+                z_values=z_values[finite_mask] if is_3d_embedding else None,
                 color_values=class_component_values[finite_mask],
                 gradient1_values=np.asarray(axis_gradients[:, 0], dtype=float)[finite_mask],
+                rgb_x_values=rgb_x_values[finite_mask] if use_own_rgb_source else None,
+                rgb_y_values=rgb_y_values[finite_mask] if use_own_rgb_source else None,
+                rgb_z_values=rgb_z_values[finite_mask] if use_own_rgb_source and is_3d_embedding else None,
                 path_metric_coords=np.asarray(axis_gradients, dtype=float)[finite_mask],
                 point_labels=point_labels[finite_mask],
                 point_ids=scatter_projection_labels,
+                metabolite_profiles=(
+                    None
+                    if metabolite_profiles is None
+                    else (
+                        np.asarray(metabolite_profiles, dtype=float)[finite_mask]
+                        if np.asarray(metabolite_profiles, dtype=float).ndim == 2
+                        else np.asarray(metabolite_profiles, dtype=float)[:, finite_mask, :]
+                    )
+                ),
+                metabolite_names=metabolite_names,
+                metabolite_subject_labels=metabolite_subject_labels,
                 title=scatter_title,
                 x_label=x_label,
                 y_label=y_label,
+                z_label=z_label,
                 color_label=f"Gradient {class_component + 1}",
                 cmap=classification_cmap,
                 cmap_name=classification_cmap_name,
                 theme_name=self._theme_name,
                 rotation_preset=scatter_rotation,
-                use_triangular_rgb=use_triangular_rgb,
+                use_triangular_rgb=effective_use_triangular_rgb,
                 rgb_fit_mode=classification_fit_mode,
                 triangular_color_order=triangular_color_order,
-                edge_pairs=edge_pairs,
+                rgb_scalar_mode=rgb_scalar_mode,
+                edge_pairs=None if is_3d_embedding else edge_pairs,
                 point_group_codes=scatter_hemisphere_codes,
                 hemisphere_mode=hemisphere_mode,
                 show_proximity_circles=False,
                 initial_proximity_slider_value=1000,
-                use_line_proximity_energy=False,
-                project_paths_callback=_project_paths_callback,
+                auto_preload_matching_paths=preload_matching_paths,
+                project_paths_callback=None if is_3d_embedding else _project_paths_callback,
                 export_metadata=scatter_export_metadata,
                 parent=self,
             )
-            self._gradient_scatter_dialog.resize(860, 760)
+            self._gradient_scatter_dialog.resize(960 if is_3d_embedding else 860, 780 if is_3d_embedding else 760)
             self._gradient_scatter_dialog.show()
         except Exception as exc:
             scatter_error = str(exc)
@@ -2814,21 +4207,51 @@ class GradientDialogController:
                     y_volume = np.asarray(y_volume, dtype=float).copy()
                     x_volume[ignored_voxels] = np.nan
                     y_volume[ignored_voxels] = np.nan
+                    if is_3d_embedding:
+                        z_volume = np.asarray(z_volume, dtype=float).copy()
+                        z_volume[ignored_voxels] = np.nan
                     if support_mask_data is not None:
                         support_mask_data = np.asarray(support_mask_data, dtype=float).copy()
                         support_mask_data[ignored_voxels] = 0.0
 
-            if use_triangular_rgb:
+            if projected_data.ndim == 4:
+                classification_projection = np.asarray(projected_data[..., class_component], dtype=float)
+            else:
+                classification_projection = np.asarray(projected_data, dtype=float)
+            if np.any(ignore_mask):
+                ignored_labels = np.asarray(projection_labels[ignore_mask], dtype=int)
+                if ignored_labels.size > 0:
+                    _template_img, template_data = self._gradient_template_img_and_data()
+                    ignored_voxels = np.isin(np.asarray(template_data, dtype=int), ignored_labels)
+                    classification_projection = np.asarray(classification_projection, dtype=float).copy()
+                    classification_projection[ignored_voxels] = np.nan
+
+            if effective_use_triangular_rgb:
                 self._gradient_classification_dialog = GradientClassificationDialog.from_array(
                     x_volume,
                     y_volume,
+                    z_volume_data=z_volume if is_3d_embedding else None,
                     affine=self._last_gradients.get("affine"),
                     x_values=x_values[finite_mask],
                     y_values=y_values[finite_mask],
+                    z_values=z_values[finite_mask] if is_3d_embedding else None,
                     support_mask_data=support_mask_data,
-                    title=f"{y_label} vs {x_label} Classification - {source_name}",
+                    coverage_mask_data=classification_projection,
+                    coverage_threshold_multiplier=rgb_mask_strictness,
+                    rgb_x_volume_data=rgb_x_volume if use_own_rgb_source else None,
+                    rgb_y_volume_data=rgb_y_volume if use_own_rgb_source else None,
+                    rgb_z_volume_data=rgb_z_volume if use_own_rgb_source and is_3d_embedding else None,
+                    rgb_x_values=rgb_x_values[finite_mask] if use_own_rgb_source else None,
+                    rgb_y_values=rgb_y_values[finite_mask] if use_own_rgb_source else None,
+                    rgb_z_values=rgb_z_values[finite_mask] if use_own_rgb_source and is_3d_embedding else None,
+                    title=(
+                        f"{z_label} vs {y_label} vs {x_label} Classification - {source_name}"
+                        if is_3d_embedding
+                        else f"{y_label} vs {x_label} Classification - {source_name}"
+                    ),
                     x_label=x_label,
                     y_label=y_label,
+                    z_label=z_label,
                     theme_name=self._theme_name,
                     hemisphere_mode=surface_hemisphere_mode,
                     fsaverage_mesh=surface_mesh,
@@ -2838,17 +4261,6 @@ class GradientDialogController:
                     parent=self,
                 )
             else:
-                if projected_data.ndim == 4:
-                    classification_projection = np.asarray(projected_data[..., class_component], dtype=float)
-                else:
-                    classification_projection = np.asarray(projected_data, dtype=float)
-                if np.any(ignore_mask):
-                    ignored_labels = np.asarray(projection_labels[ignore_mask], dtype=int)
-                    if ignored_labels.size > 0:
-                        _template_img, template_data = self._gradient_template_img_and_data()
-                        ignored_voxels = np.isin(np.asarray(template_data, dtype=int), ignored_labels)
-                        classification_projection = np.asarray(classification_projection, dtype=float).copy()
-                        classification_projection[ignored_voxels] = np.nan
                 self._gradient_classification_dialog = GradientSurfaceDialog.from_array(
                     classification_projection,
                     affine=self._last_gradients.get("affine"),
@@ -2896,7 +4308,7 @@ class GradientDialogController:
                 f"Opened classification scatter, but the fsaverage window failed: {surface_error}{adjacency_suffix}"
             )
             return
-        if use_triangular_rgb:
+        if effective_use_triangular_rgb:
             self.statusBar().showMessage(
                 f"Opened classification scatter and fsaverage viewers.{adjacency_suffix}"
             )
@@ -2904,6 +4316,276 @@ class GradientDialogController:
             self.statusBar().showMessage(
                 f"Opened classification scatter and fsaverage viewers using Gradient {class_component + 1}.{adjacency_suffix}"
             )
+
+    def _project_classification_paths_to_fibrenet(
+        self,
+        project_payload,
+        group_payloads,
+        scatter_projection_labels,
+        scatter_point_labels,
+        point_colors,
+        *,
+        source_name="matrix",
+        x_label="Gradient 2",
+        y_label="Gradient 1",
+    ) -> None:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Polygon
+        from mrsitoolbox.connectomics.netfibre import NetFibre
+
+        scatter_projection_labels = np.asarray(scatter_projection_labels, dtype=int).reshape(-1)
+        scatter_point_labels = np.asarray(scatter_point_labels, dtype=object).reshape(-1)
+        point_colors = np.asarray(point_colors, dtype=float)
+        if point_colors.ndim != 2 or point_colors.shape[0] != scatter_projection_labels.size or point_colors.shape[1] < 3:
+            point_colors = np.full((scatter_projection_labels.size, 3), 0.45, dtype=float)
+        else:
+            point_colors = np.asarray(point_colors[:, :3], dtype=float)
+        point_colors = np.clip(np.nan_to_num(point_colors, nan=0.45, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        layout_name = str(project_payload.get("fibrenet_layout", "diffusion") or "diffusion").strip().lower()
+        if layout_name in {"spiral", "path_spiral", "sequence", "sequence_spiral"}:
+            layout_name = "spiral"
+            layout_label = "Spiral"
+        else:
+            layout_name = "diffusion"
+            layout_label = "Diffusion"
+        edge_pairs = np.asarray(project_payload.get("edge_pairs", []), dtype=int)
+        if (
+            layout_name == "diffusion"
+            and (edge_pairs.ndim != 2 or edge_pairs.shape[1] != 2 or edge_pairs.shape[0] == 0)
+        ):
+            self.statusBar().showMessage("No GM adjacency edge pairs are available for FibreNet projection.")
+            return
+        try:
+            node_count = int(project_payload.get("node_count", scatter_projection_labels.size))
+        except Exception:
+            node_count = int(scatter_projection_labels.size)
+        node_count = max(node_count, int(scatter_projection_labels.size))
+
+        def _group_title(group_name):
+            text = str(group_name or "all").strip().lower()
+            if text == "lh":
+                return "LH"
+            if text == "rh":
+                return "RH"
+            return "All"
+
+        def _coerce_path(path_value):
+            nodes = []
+            for node in list(path_value or []):
+                try:
+                    nodes.append(int(node))
+                except Exception:
+                    continue
+            return nodes
+
+        def _node_label(node_index):
+            label = ""
+            if 0 <= int(node_index) < scatter_point_labels.shape[0]:
+                label = str(scatter_point_labels[int(node_index)]).strip()
+            if label and label.lower() not in {"nan", "none"}:
+                return label
+            if 0 <= int(node_index) < scatter_projection_labels.shape[0]:
+                return f"Parcel {int(scatter_projection_labels[int(node_index)])}"
+            return f"Node {int(node_index)}"
+
+        def _add_rgb_triangle_legend(fig, payload, *, x_caption, y_caption):
+            color_order = str(payload.get("color_order", "RGB") or "RGB").strip().upper()
+            if len(color_order) < 3:
+                color_order = "RGB"
+            color_basis = {
+                "R": np.asarray((1.0, 0.0, 0.0), dtype=float),
+                "G": np.asarray((0.0, 1.0, 0.0), dtype=float),
+                "B": np.asarray((0.0, 0.0, 1.0), dtype=float),
+            }
+            vertices = np.asarray(
+                [
+                    (0.5, np.sqrt(3.0) / 2.0),
+                    (0.0, 0.0),
+                    (1.0, 0.0),
+                ],
+                dtype=float,
+            )
+            vertex_colors = np.asarray([color_basis.get(channel, color_basis["R"]) for channel in color_order[:3]], dtype=float)
+            width = 160
+            height = 140
+            yy, xx = np.mgrid[0:1:complex(height), 0:1:complex(width)]
+            points = np.column_stack((xx.reshape(-1), yy.reshape(-1)))
+            tri = vertices
+            denom = (
+                (tri[1, 1] - tri[2, 1]) * (tri[0, 0] - tri[2, 0])
+                + (tri[2, 0] - tri[1, 0]) * (tri[0, 1] - tri[2, 1])
+            )
+            if abs(float(denom)) <= 1e-12:
+                return
+            w0 = (
+                (tri[1, 1] - tri[2, 1]) * (points[:, 0] - tri[2, 0])
+                + (tri[2, 0] - tri[1, 0]) * (points[:, 1] - tri[2, 1])
+            ) / denom
+            w1 = (
+                (tri[2, 1] - tri[0, 1]) * (points[:, 0] - tri[2, 0])
+                + (tri[0, 0] - tri[2, 0]) * (points[:, 1] - tri[2, 1])
+            ) / denom
+            w2 = 1.0 - w0 - w1
+            weights = np.column_stack((w0, w1, w2))
+            inside = np.all(weights >= -1e-6, axis=1)
+            image = np.ones((points.shape[0], 4), dtype=float)
+            image[:, :3] = 1.0
+            image[:, 3] = 0.0
+            if np.any(inside):
+                rgb = np.clip(weights[inside] @ vertex_colors, 0.0, 1.0)
+                image[inside, :3] = rgb
+                image[inside, 3] = 1.0
+            image = image.reshape(height, width, 4)
+            legend_ax = fig.add_axes([0.915, 0.14, 0.07, 0.20], facecolor="white")
+            legend_ax.imshow(image, origin="lower", extent=(0.0, 1.0, 0.0, 1.0), interpolation="bilinear")
+            outline = Polygon(vertices, closed=True, facecolor="none", edgecolor="black", linewidth=1.0)
+            legend_ax.add_patch(outline)
+            text_offsets = np.asarray(((0.0, 0.05), (-0.05, -0.06), (0.05, -0.06)), dtype=float)
+            for idx, channel in enumerate(color_order[:3]):
+                vx, vy = vertices[idx]
+                ox, oy = text_offsets[idx]
+                legend_ax.text(
+                    float(vx + ox),
+                    float(vy + oy),
+                    str(channel),
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color="black",
+                    weight="bold",
+                )
+            legend_ax.text(0.5, -0.16, str(x_caption), ha="center", va="top", fontsize=8, color="black")
+            legend_ax.text(-0.10, 0.5, str(y_caption), ha="right", va="center", fontsize=8, color="black", rotation=90)
+            legend_ax.set_xlim(-0.12, 1.12)
+            legend_ax.set_ylim(-0.18, 1.02)
+            legend_ax.set_xticks([])
+            legend_ax.set_yticks([])
+            legend_ax.set_frame_on(False)
+
+        def _selected_path_record(group_payload):
+            group = dict(group_payload or {})
+            nodes = _coerce_path(group.get("selected_ctx_path", []))
+            path_kind = "path"
+            subc_nodes = _coerce_path(group.get("subc_optimal_path", []))
+            if len(nodes) < 2:
+                nodes = _coerce_path(group.get("optimal_full_path", []))
+            if len(nodes) < 2:
+                nodes = list(subc_nodes)
+                subc_nodes = []
+                path_kind = "subcortical path"
+            if len(nodes) < 2:
+                return None
+            if any(node < 0 or node >= scatter_projection_labels.size for node in nodes):
+                return None
+            if any(node < 0 or node >= scatter_projection_labels.size for node in subc_nodes):
+                subc_nodes = []
+            try:
+                rank = int(group.get("selected_ctx_path_index", 0))
+            except Exception:
+                rank = 0
+            energy = None
+            try:
+                value = float(group.get("selected_ctx_path_energy"))
+                if np.isfinite(value):
+                    energy = value
+            except Exception:
+                pass
+            if energy is None:
+                try:
+                    value = float(group.get("ctx_optimal_path_energy"))
+                    if np.isfinite(value):
+                        energy = value
+                except Exception:
+                    pass
+            title = f"{_group_title(group.get('group', 'all'))} {path_kind} {rank}"
+            if energy is not None:
+                title += f" | E={energy:.4f}"
+            return {
+                "group": str(group.get("group", "all")),
+                "nodes": nodes,
+                "subc_nodes": subc_nodes if len(subc_nodes) >= 2 else [],
+                "subc_color": group.get("subc_color", []),
+                "title": title,
+            }
+
+        records = []
+        for group_payload in list(group_payloads or []):
+            record = _selected_path_record(group_payload)
+            if record is not None:
+                records.append(record)
+        if not records:
+            record = _selected_path_record(project_payload)
+            if record is not None:
+                records.append(record)
+        if not records:
+            self.statusBar().showMessage("No selected path is available for FibreNet projection.")
+            return
+
+        panel_count = len(records)
+        max_nodes = max(len(record["nodes"]) for record in records)
+        fig_width = max(8.5, min(18.0, 7.2 * panel_count))
+        fig_height = max(8.0, min(13.0, 7.0 + 0.08 * max_nodes))
+        fig = plt.figure(figsize=(fig_width, fig_height), facecolor="white")
+        fig.suptitle(
+            f"FibreNet {layout_label} path projection - {source_name} ({y_label} vs {x_label})",
+            color="black",
+            fontsize=13,
+        )
+
+        for panel_idx, record in enumerate(records, start=1):
+            nodes = [int(node) for node in record["nodes"]]
+            node_names = [_node_label(node) for node in nodes]
+            node_colors = [tuple(point_colors[node, :3].tolist()) for node in nodes]
+            branch_paths = []
+            branch_names = []
+            branch_colors = []
+            subc_nodes = [int(node) for node in list(record.get("subc_nodes", []))]
+            if layout_name == "spiral" and len(subc_nodes) >= 2:
+                branch_paths.append(subc_nodes)
+                branch_names.append([_node_label(node) for node in subc_nodes])
+                branch_colors.append([tuple(point_colors[node, :3].tolist()) for node in subc_nodes])
+            fontsize_names = 7 if len(nodes) > 30 else 8 if len(nodes) > 18 else 9
+            ax = fig.add_subplot(1, panel_count, panel_idx)
+            NetFibre.plot_fibrenet_path(
+                nodes,
+                edge_pairs=edge_pairs,
+                n_nodes=node_count,
+                node_names=node_names,
+                node_colors=node_colors,
+                ax=ax,
+                title=str(record["title"]),
+                components=(2, 3),
+                layout=layout_name,
+                edge_color="black",
+                edge_width=2.4,
+                node_size=260,
+                font_size=fontsize_names,
+                branch_paths=branch_paths,
+                branch_node_names=branch_names,
+                branch_node_colors=branch_colors,
+                branch_edge_color="black",
+                branch_edge_width=1.7,
+                branch_edge_linestyle="--",
+                branch_node_size=150,
+                endpoint_node_size=450 if layout_name == "spiral" else None,
+            )
+
+        _add_rgb_triangle_legend(fig, project_payload, x_caption=x_label, y_caption=y_label)
+        fig.subplots_adjust(left=0.03, right=0.90, top=0.88, bottom=0.04, wspace=0.32)
+        manager = getattr(fig.canvas, "manager", None)
+        if manager is not None and hasattr(manager, "set_window_title"):
+            manager.set_window_title(f"FibreNet paths - {source_name}")
+        fig.canvas.draw_idle()
+        backend_name = str(plt.get_backend()).strip().lower()
+        if backend_name not in {"agg", "pdf", "svg", "ps", "template"}:
+            fig.show()
+            plt.show(block=False)
+        self._gradient_path_fibrenet_figures = getattr(self, "_gradient_path_fibrenet_figures", [])
+        self._gradient_path_fibrenet_figures.append(fig)
+        groups = ", ".join(_group_title(record.get("group")) for record in records)
+        self.statusBar().showMessage(
+            f"Opened FibreNet {layout_label.lower()} path projection for {groups} on {source_name}."
+        )
 
     def _project_classification_paths_to_brain(
         self,
@@ -2917,14 +4599,16 @@ class GradientDialogController:
         y_label="Gradient 1",
     ) -> None:
         project_payload = dict(payload or {})
-        group_payloads = [
-            dict(group_payload)
-            for group_payload in list(project_payload.get("group_paths", []))
-            if (
-                len(list(dict(group_payload).get("optimal_full_path", []))) >= 2
-                or len(list(dict(group_payload).get("subc_optimal_path", []))) >= 2
+        save_three_view_screenshot = bool(project_payload.get("glassbrain_screenshot", False))
+        group_payloads = []
+        for group_payload in list(project_payload.get("group_paths", [])):
+            group_dict = dict(group_payload or {})
+            selected_path = list(
+                group_dict.get("selected_ctx_path", group_dict.get("optimal_full_path", []))
             )
-        ]
+            subc_path = list(group_dict.get("subc_optimal_path", []))
+            if len(selected_path) >= 2 or len(subc_path) >= 2:
+                group_payloads.append(group_dict)
         optimal_full_path = [int(node) for node in list(project_payload.get("optimal_full_path", []))]
         if (
             not group_payloads
@@ -2944,25 +4628,43 @@ class GradientDialogController:
             self.statusBar().showMessage("The selected scatter path is out of range for the current parcels.")
             return
 
+        point_colors = np.asarray(project_payload.get("point_colors", []), dtype=float)
+        if point_colors.ndim != 2 or point_colors.shape[0] != scatter_projection_labels.size or point_colors.shape[1] < 3:
+            point_colors = np.full((scatter_projection_labels.size, 3), 0.35, dtype=float)
+        else:
+            point_colors = np.asarray(point_colors[:, :3], dtype=float)
+        point_colors = np.clip(np.nan_to_num(point_colors, nan=0.35, posinf=1.0, neginf=0.0), 0.0, 1.0)
+
+        if bool(project_payload.get("fibrenet_projection", False)):
+            try:
+                self._project_classification_paths_to_fibrenet(
+                    project_payload,
+                    group_payloads,
+                    scatter_projection_labels,
+                    scatter_point_labels,
+                    point_colors,
+                    source_name=source_name,
+                    x_label=x_label,
+                    y_label=y_label,
+                )
+            except Exception as exc:
+                self.statusBar().showMessage(f"Failed to project the selected path set to FibreNet: {exc}")
+            return
+
         try:
-            template_img, template_data = self._gradient_template_img_and_data()
+            template_img, _template_data = self._gradient_template_img_and_data()
         except Exception as exc:
             self.statusBar().showMessage(f"Failed to load the parcellation template for 3D projection: {exc}")
             return
 
-        try:
-            from dipy.viz import window
-            from mrsitoolbox.graphplot.netplot import NetPlot
-        except Exception as exc:
-            self.statusBar().showMessage(f"Fury path viewer unavailable: {exc}")
-            return
+        from mrsitoolbox.graphplot import glassbrain
 
         try:
             centroids_mni = np.asarray(
                 nettools.compute_centroids(
                     template_img,
                     labels=np.asarray(scatter_projection_labels, dtype=int),
-                    world=False,
+                    world=True,
                 ),
                 dtype=float,
             )
@@ -2973,10 +4675,6 @@ class GradientDialogController:
         if centroids_mni.shape != (scatter_projection_labels.size, 3):
             self.statusBar().showMessage("Centroid count mismatch for 3D path projection.")
             return
-
-        point_colors = np.asarray(project_payload.get("point_colors", []), dtype=float)
-        if point_colors.shape != (scatter_projection_labels.size, 3):
-            point_colors = np.full((scatter_projection_labels.size, 3), 0.35, dtype=float)
 
         def _path_coords(path_nodes):
             node_indices = np.asarray([int(node) for node in list(path_nodes or [])], dtype=int)
@@ -2990,6 +4688,52 @@ class GradientDialogController:
             if not np.all(np.isfinite(coords)):
                 return None
             return coords
+
+        def _dashed_path_segments(path_coords, dash_length=GLASSBRAIN_SUBC_DASH_LENGTH, gap_length=GLASSBRAIN_SUBC_DASH_GAP):
+            coords = np.asarray(path_coords, dtype=float)
+            if coords.ndim != 2 or coords.shape[1] != 3 or coords.shape[0] < 2:
+                return []
+            deltas = np.diff(coords, axis=0)
+            segment_lengths = np.linalg.norm(deltas, axis=1)
+            valid_lengths = np.isfinite(segment_lengths) & (segment_lengths > 1e-9)
+            if not np.any(valid_lengths):
+                return []
+            cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+            total_length = float(cumulative[-1])
+            if not np.isfinite(total_length) or total_length <= 1e-9:
+                return []
+            dash = max(1e-6, float(dash_length))
+            gap = max(0.0, float(gap_length))
+            period = dash + gap if gap > 0.0 else dash
+
+            def _point_at(distance):
+                value = float(np.clip(distance, 0.0, total_length))
+                if value <= 0.0:
+                    return np.asarray(coords[0], dtype=float)
+                if value >= total_length:
+                    return np.asarray(coords[-1], dtype=float)
+                seg_idx = int(np.searchsorted(cumulative, value, side="right") - 1)
+                seg_idx = int(np.clip(seg_idx, 0, segment_lengths.shape[0] - 1))
+                length = float(segment_lengths[seg_idx])
+                if length <= 1e-9:
+                    return np.asarray(coords[seg_idx], dtype=float)
+                frac = (value - float(cumulative[seg_idx])) / length
+                return np.asarray(coords[seg_idx] + frac * (coords[seg_idx + 1] - coords[seg_idx]), dtype=float)
+
+            segments = []
+            start = 0.0
+            while start < total_length - 1e-9:
+                stop = min(start + dash, total_length)
+                points = [_point_at(start)]
+                inner_indices = np.where((cumulative > start + 1e-9) & (cumulative < stop - 1e-9))[0]
+                for idx in inner_indices.tolist():
+                    points.append(np.asarray(coords[int(idx)], dtype=float))
+                points.append(_point_at(stop))
+                segment = np.asarray(points, dtype=float)
+                if segment.shape[0] >= 2 and np.linalg.norm(segment[-1] - segment[0]) > 1e-9:
+                    segments.append(segment)
+                start += period
+            return segments
 
         def _rgb_basis_color(channel):
             mapping = {
@@ -3129,13 +4873,15 @@ class GradientDialogController:
         anchor_node_labels = []
         seen_anchor_indices = set()
         union_nodes = set()
+        endpoint_nodes = set()
+        intermediate_nodes = set()
         show_all_paths = bool(project_payload.get("show_all_ordered_paths"))
         for group_payload in group_payloads:
             seen_paths = set()
             ctx_paths = (
                 list(group_payload.get("all_full_paths", []))
                 if show_all_paths
-                else [group_payload.get("optimal_full_path", [])]
+                else [group_payload.get("selected_ctx_path", group_payload.get("optimal_full_path", []))]
             )
             for path_nodes in ctx_paths:
                 nodes = tuple(int(node) for node in list(path_nodes or []))
@@ -3160,6 +4906,8 @@ class GradientDialogController:
                     draw_colors.append(np.asarray(record.get("color", (0.0, 0.0, 0.0)), dtype=float).reshape(3))
                     draw_widths.append(path_width)
                 union_nodes.update(int(node) for node in nodes)
+                endpoint_nodes.update((int(nodes[0]), int(nodes[-1])))
+                intermediate_nodes.update(int(node) for node in nodes[1:-1])
 
             subc_color = np.asarray(group_payload.get("subc_color", (0.0, 0.0, 0.0)), dtype=float).reshape(-1)
             if subc_color.shape != (3,):
@@ -3173,20 +4921,25 @@ class GradientDialogController:
                 if coords is None:
                     continue
                 seen_paths.add(nodes)
-                draw_paths.append(coords)
-                draw_colors.append(np.asarray(subc_color, dtype=float))
-                draw_widths.append(
-                    _path_width_from_energy(
-                        _lookup_path_energy(
-                            group_payload,
-                            "subc_paths",
-                            nodes,
-                            fallback_key="subc_optimal_path_energy",
-                        ),
-                        "subc",
-                    )
+                subc_width = _path_width_from_energy(
+                    _lookup_path_energy(
+                        group_payload,
+                        "subc_paths",
+                        nodes,
+                        fallback_key="subc_optimal_path_energy",
+                    ),
+                    "subc",
                 )
+                dashed_segments = _dashed_path_segments(coords)
+                if not dashed_segments:
+                    dashed_segments = [coords]
+                for dashed_coords in dashed_segments:
+                    draw_paths.append(dashed_coords)
+                    draw_colors.append(np.asarray(subc_color, dtype=float))
+                    draw_widths.append(subc_width)
                 union_nodes.update(int(node) for node in nodes)
+                endpoint_nodes.update((int(nodes[0]), int(nodes[-1])))
+                intermediate_nodes.update(int(node) for node in nodes[1:-1])
 
             anchors = dict(group_payload.get("anchors", {}))
             for channel in anchor_channels:
@@ -3226,60 +4979,99 @@ class GradientDialogController:
             path_node_indices = path_node_indices[
                 (path_node_indices >= 0) & (path_node_indices < centroids_mni.shape[0])
             ]
-        nonpath_mask = np.ones(centroids_mni.shape[0], dtype=bool)
-        if path_node_indices.size:
-            nonpath_mask[path_node_indices] = False
-        nonpath_indices = np.flatnonzero(nonpath_mask)
-
         try:
-            netplot = NetPlot(window)
-            netplot.scene.background((1, 1, 1))
-            normalized_hemisphere_mode = self._normalize_gradient_hemisphere_mode(hemisphere_mode)
-            brain_hemi = None if normalized_hemisphere_mode in {"both", "separate"} else normalized_hemisphere_mode
-            netplot.add_brain(
-                netplot.mni_template,
-                hemisphere=brain_hemi,
-                label_image=np.asarray(template_data, dtype=int),
-                parcel_labels_list=None,
-                opacity=0.12,
-            )
-            if nonpath_indices.size:
-                netplot.add_nodes(
-                    centroids_mni[nonpath_indices, :],
-                    node_radius=0.95,
-                    node_color=np.tile(np.asarray([[0.6, 0.6, 0.6]], dtype=float), (nonpath_indices.size, 1)),
-                    node_labels=None,
-                    node_opacity=0.22,
-                )
+            node_colors = np.empty((centroids_mni.shape[0], 4), dtype=float)
+            node_colors[:, :3] = np.asarray((0.6, 0.6, 0.6), dtype=float)
+            node_colors[:, 3] = 0.18
+            node_sizes = np.full(centroids_mni.shape[0], 1.45, dtype=float)
             if path_node_indices.size:
-                netplot.add_nodes(
-                    centroids_mni[path_node_indices, :],
-                    node_radius=1.15,
-                    node_color=np.asarray(point_colors[path_node_indices, :], dtype=float),
-                    node_labels=None,
-                    node_opacity=0.95,
-                )
-            netplot.add_paths(
-                draw_paths,
-                path_color=np.asarray(draw_colors, dtype=float),
-                path_width=np.asarray(draw_widths, dtype=float),
-                path_opacity=1.0,
+                node_colors[path_node_indices, :3] = np.asarray(point_colors[path_node_indices, :], dtype=float)
+                node_colors[path_node_indices, 3] = 0.95
+            intermediate_indices = np.asarray(
+                sorted(int(node) for node in (intermediate_nodes - endpoint_nodes)),
+                dtype=int,
             )
-            if anchor_centroids:
-                netplot.add_nodes(
-                    np.asarray(anchor_centroids, dtype=float),
-                    node_radius=2.3,
-                    node_color=np.asarray(anchor_node_colors, dtype=float),
-                    node_labels=anchor_node_labels,
+            intermediate_indices = intermediate_indices[
+                (intermediate_indices >= 0) & (intermediate_indices < centroids_mni.shape[0])
+            ]
+            endpoint_indices = np.asarray(sorted(int(node) for node in endpoint_nodes), dtype=int)
+            endpoint_indices = endpoint_indices[
+                (endpoint_indices >= 0) & (endpoint_indices < centroids_mni.shape[0])
+            ]
+            if intermediate_indices.size:
+                node_sizes[intermediate_indices] = 2.35
+            if endpoint_indices.size:
+                node_sizes[endpoint_indices] = 3.05
+            normalized_hemisphere_mode = self._normalize_gradient_hemisphere_mode(hemisphere_mode)
+            brain_hemi = normalized_hemisphere_mode if normalized_hemisphere_mode in {"lh", "rh"} else "both"
+            viewer = glassbrain.GlassBrainPlotter(
+                brain_opacity=0.12,
+                background="white",
+                window_size=(1200, 900),
+                path_radius_scale=GLASSBRAIN_EDGE_RADIUS_SCALE,
+            )
+            title = f"Gradient paths - {source_name}"
+            glassbrain_path_widths = np.asarray(draw_widths, dtype=float)
+            if glassbrain_path_widths.size:
+                glassbrain_path_widths = np.maximum(
+                    glassbrain_path_widths * float(GLASSBRAIN_EDGE_WIDTH_MULTIPLIER),
+                    float(GLASSBRAIN_EDGE_MIN_WIDTH),
                 )
-            window.show(netplot.scene)
+            glassbrain_path_colors = np.tile(
+                np.asarray(GLASSBRAIN_EDGE_COLOR, dtype=float).reshape(1, 3),
+                (len(draw_paths), 1),
+            )
+            render_kwargs = {
+                "node_coords": centroids_mni,
+                "paths": draw_paths,
+                "path_colors": glassbrain_path_colors,
+                "path_widths": glassbrain_path_widths,
+                "node_colors": node_colors,
+                "node_sizes": node_sizes,
+                "anchor_coords": np.asarray(anchor_centroids, dtype=float) if anchor_centroids else None,
+                "anchor_colors": np.asarray(anchor_node_colors, dtype=float) if anchor_node_colors else None,
+                "anchor_labels": anchor_node_labels,
+                "anchor_size": 3.45,
+                "hemisphere_mode": brain_hemi,
+                "title": title,
+            }
+            if save_three_view_screenshot:
+                safe_source = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(source_name or "gradient_paths")).strip("_")
+                default_name = f"{safe_source or 'gradient_paths'}_glassbrain_three_views.png"
+                output_path, _selected_filter = QFileDialog.getSaveFileName(
+                    self,
+                    "Save glass-brain three-view screenshot",
+                    default_name,
+                    "PNG Image (*.png);;PDF Document (*.pdf);;SVG Vector (*.svg)",
+                )
+                if not output_path:
+                    self.statusBar().showMessage("Glass-brain screenshot cancelled.")
+                    return
+                output_path = str(output_path)
+                if Path(output_path).suffix.lower() not in {".png", ".pdf", ".svg"}:
+                    output_path = str(Path(output_path).with_suffix(".png"))
+                screenshot_kwargs = dict(render_kwargs)
+                screenshot_kwargs["title"] = None
+                screenshot_kwargs["anchor_labels"] = []
+                viewer.save_three_view_panel(
+                    output_path,
+                    views=("dorsal", "coronal", "lateral"),
+                    show_titles=False,
+                    **screenshot_kwargs,
+                )
+                self.statusBar().showMessage(f"Saved glass-brain three-view screenshot to {output_path}.")
+                return
+            viewer.show_paths(
+                **render_kwargs,
+            )
+            self._gradient_path_glassbrain = viewer
         except Exception as exc:
-            self.statusBar().showMessage(f"Failed to project the selected path set to the 3D brain: {exc}")
+            self.statusBar().showMessage(f"Failed to project the selected path set to the PyVista glass brain: {exc}")
             return
 
         path_label = " -> ".join(list(project_payload.get("channel_order", "RBG")))
         self.statusBar().showMessage(
-            f"Opened 3D path projection for {path_label} on {source_name} ({y_label} vs {x_label})."
+            f"Opened PyVista glass-brain path projection for {path_label} on {source_name} ({y_label} vs {x_label})."
         )
 
     @staticmethod

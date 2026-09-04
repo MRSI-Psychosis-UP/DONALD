@@ -58,7 +58,10 @@ class MatrixDataAccess:
         path = Path(path)
         self.covars_cache.pop(path, None)
         self.valid_keys_cache.pop(path, None)
-        self.parcel_metadata_cache.pop(path, None)
+        for cache_key in list(self.parcel_metadata_cache.keys()):
+            cache_path = cache_key[0] if isinstance(cache_key, tuple) else cache_key
+            if cache_path == path:
+                self.parcel_metadata_cache.pop(cache_key, None)
         self.group_values_cache.pop(path, None)
 
     def covars_info(self, path: Path):
@@ -77,11 +80,53 @@ class MatrixDataAccess:
             self.valid_keys_cache[path] = cached
         return cached
 
-    def load_parcel_metadata_cached(self, path: Path):
+    def load_parcel_metadata_cached(self, path: Path, label_key: str = "", name_key: str = ""):
         path = Path(path)
-        if path not in self.parcel_metadata_cache:
-            self.parcel_metadata_cache[path] = self._load_parcel_metadata(path)
-        return self.parcel_metadata_cache[path]
+        cache_key = (
+            path,
+            str(label_key or "").strip(),
+            str(name_key or "").strip(),
+        )
+        if cache_key not in self.parcel_metadata_cache:
+            self.parcel_metadata_cache[cache_key] = self._load_parcel_metadata(
+                path,
+                label_key=cache_key[1],
+                name_key=cache_key[2],
+            )
+        return self.parcel_metadata_cache[cache_key]
+
+    @staticmethod
+    def npz_vector_keys(path: Path, *, expected_len=None):
+        path = Path(path)
+        options = []
+        try:
+            with np.load(path, allow_pickle=True) as npz:
+                for key in npz.files:
+                    try:
+                        values = np.asarray(npz[key])
+                    except Exception:
+                        continue
+                    if values.ndim == 0:
+                        continue
+                    try:
+                        flat_len = int(values.reshape(-1).size)
+                    except Exception:
+                        continue
+                    if flat_len <= 0:
+                        continue
+                    if expected_len is not None and flat_len != int(expected_len):
+                        continue
+                    options.append(
+                        {
+                            "key": str(key),
+                            "shape": tuple(int(dim) for dim in values.shape),
+                            "dtype": str(values.dtype),
+                            "size": flat_len,
+                        }
+                    )
+        except Exception:
+            return []
+        return options
 
     def load_group_value_cached(self, path: Path, index: int):
         path = Path(path)
@@ -140,14 +185,24 @@ class MatrixDataAccess:
             matrix = raw
         return matrix, key
 
-    def entry_parcel_metadata(self, entry, expected_len=None):
+    def entry_parcel_metadata(self, entry, expected_len=None, label_key: str = "", name_key: str = ""):
         labels = entry.get("parcel_labels_group") if entry is not None else None
         names = entry.get("parcel_names_group") if entry is not None else None
+        label_key = str(label_key or "").strip()
+        name_key = str(name_key or "").strip()
+        if label_key:
+            labels = None
+        if name_key:
+            names = None
 
         source_path = self.entry_source_path(entry)
         if (labels is None or names is None) and source_path is not None and source_path.exists():
             try:
-                source_labels, source_names = self.load_parcel_metadata_cached(source_path)
+                source_labels, source_names = self.load_parcel_metadata_cached(
+                    source_path,
+                    label_key=label_key,
+                    name_key=name_key,
+                )
                 if labels is None:
                     labels = source_labels
                 if names is None:

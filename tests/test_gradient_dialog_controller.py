@@ -1,6 +1,8 @@
 import ast
 import inspect
+import os
 from pathlib import Path
+import tempfile
 import textwrap
 import unittest
 from unittest import mock
@@ -9,6 +11,8 @@ import numpy as np
 
 import services.gradient_dialog_controller as gradient_module
 from services.gradient_dialog_controller import GradientDialogController
+from window.gradients_prepare import GradientsPrepareDialog
+from window.plot_msmode import GradientScatterDialog
 
 
 class _StatusBarStub:
@@ -179,9 +183,239 @@ class GradientDialogControllerTests(unittest.TestCase):
         self.assertEqual(keywords["initial_proximity_slider_value"].value, 1000)
         self.assertIs(keywords["use_line_proximity_energy"].value, False)
 
+    def test_classification_scatter_call_passes_matching_path_preload_choice(self):
+        source = textwrap.dedent(inspect.getsource(GradientDialogController._classify_gradients_fsaverage))
+        tree = ast.parse(source)
+        scatter_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "GradientScatterDialog"
+        ]
+        self.assertEqual(len(scatter_calls), 1)
+        keywords = {keyword.arg: keyword.value for keyword in scatter_calls[0].keywords if keyword.arg}
+        self.assertIn("auto_preload_matching_paths", keywords)
+        self.assertIsInstance(keywords["auto_preload_matching_paths"], ast.Name)
+
+    def test_matching_path_preload_control_is_off_by_default(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        setter_source = inspect.getsource(GradientsPrepareDialog.set_triangular_rgb)
+
+        self.assertIn("self.set_preload_matching_paths(False)", init_source)
+        self.assertIn('QCheckBox("Preload matching saved path")', ui_source)
+        self.assertIn("self._refresh_action_state()", setter_source)
+
+    def test_project_paths_callback_receives_selected_path_only(self):
+        dialog = GradientScatterDialog.__new__(GradientScatterDialog)
+        captured = []
+        dialog._project_paths_callback = captured.append
+        dialog._project_paths_payload = {
+            "show_all_ordered_paths": True,
+            "optimal_full_path": [0, 1],
+            "group_paths": [
+                {
+                    "group": "lh",
+                    "all_full_paths": [[0, 1], [0, 2, 1]],
+                    "ctx_path_energies": [0.1, 0.9],
+                    "selected_ctx_path_index": 1,
+                    "selected_ctx_path": [0, 2, 1],
+                    "selected_ctx_path_energy": 0.9,
+                    "optimal_full_path": [0, 1],
+                    "ctx_optimal_path_energy": 0.1,
+                    "subc_optimal_path": [],
+                }
+            ],
+        }
+
+        dialog._on_project_paths_clicked()
+
+        self.assertEqual(len(captured), 1)
+        payload = captured[0]
+        self.assertFalse(payload["show_all_ordered_paths"])
+        self.assertEqual(payload["optimal_full_path"], [0, 2, 1])
+        self.assertEqual(payload["group_paths"][0]["selected_ctx_path"], [0, 2, 1])
+        self.assertEqual(payload["group_paths"][0]["optimal_full_path"], [0, 2, 1])
+        self.assertEqual(payload["group_paths"][0]["all_full_paths"], [[0, 2, 1]])
+        self.assertEqual(payload["group_paths"][0]["ctx_path_energies"], [0.9])
+        self.assertTrue(dialog._project_paths_payload["show_all_ordered_paths"])
+        self.assertEqual(
+            dialog._project_paths_payload["group_paths"][0]["all_full_paths"],
+            [[0, 1], [0, 2, 1]],
+        )
+
+    def test_path_combo_selection_disables_all_path_overlay(self):
+        class _ComboStub:
+            def currentData(self):
+                return 1
+
+        class _CheckStub:
+            def __init__(self):
+                self.checked = True
+
+            def blockSignals(self, _blocked):
+                return None
+
+            def setChecked(self, checked):
+                self.checked = bool(checked)
+
+        dialog = GradientScatterDialog.__new__(GradientScatterDialog)
+        group_payload = {
+            "group": "lh",
+            "all_full_paths": [[0, 1], [0, 2, 1]],
+            "ctx_path_energies": [0.1, 0.9],
+            "selected_ctx_path_index": 0,
+            "selected_ctx_path": [0, 1],
+            "selected_ctx_path_energy": 0.1,
+            "optimal_full_path": [0, 1],
+            "ctx_optimal_path_energy": 0.1,
+        }
+        dialog._project_paths_payload = {
+            "show_all_ordered_paths": True,
+            "group_paths": [group_payload],
+        }
+        dialog._selected_ctx_path_indices = {"lh": 0, "rh": 0, "all": 0}
+        dialog._show_all_ordered_paths = True
+        dialog.all_paths_check = _CheckStub()
+        dialog._path_selection_combo_for_group = lambda _group_name: _ComboStub()
+        dialog._group_payload_for_name = lambda _group_name: group_payload
+        dialog._sync_proximity_controls = lambda: None
+        render_calls = []
+        dialog._render = lambda **kwargs: render_calls.append(dict(kwargs))
+
+        dialog._on_ctx_path_selection_changed("lh")
+
+        self.assertFalse(dialog._show_all_ordered_paths)
+        self.assertFalse(dialog.all_paths_check.checked)
+        self.assertFalse(dialog._project_paths_payload["show_all_ordered_paths"])
+        self.assertEqual(group_payload["selected_ctx_path_index"], 1)
+        self.assertEqual(group_payload["selected_ctx_path"], [0, 2, 1])
+        self.assertEqual(render_calls, [{"preserve_view": True}])
+
     def test_sync_gradients_dialog_state_reuses_precomputed_dialog_rows(self):
         source = textwrap.dedent(inspect.getsource(GradientDialogController._sync_gradients_dialog_state))
         self.assertIn("dialog_covars_rows", source)
+
+
+class GradientSavedPathMatchingTests(unittest.TestCase):
+    @staticmethod
+    def _matching_dialog(search_root):
+        dialog = GradientScatterDialog.__new__(GradientScatterDialog)
+        dialog._export_metadata = {
+            "subject_id": "sub-CHUVA054",
+            "session_id": "ses-V1",
+            "parc_path": "/tmp/chimera-LFMIHIFIS-3/chimera-LFMIHIFIS-3.nii.gz",
+        }
+        dialog._point_ids = np.asarray([1, 2], dtype=object)
+        dialog._point_labels = np.asarray(["ctx-lh-a", "ctx-rh-a"], dtype=object)
+        dialog._free_energy_paths_load_dir = Path(search_root)
+        return dialog
+
+    @staticmethod
+    def _write_path_file(path, *, session="V1", scheme="chimeraLFMIHIFIS_scale3"):
+        np.savez_compressed(
+            path,
+            subject_id=np.asarray("CHUVA054"),
+            session_id=np.asarray(session),
+            parc_scheme=np.asarray(scheme),
+            parc_path=np.asarray(f"/tmp/{scheme}.nii.gz"),
+            parcel_labels=np.asarray([1, 2]),
+            parcel_names=np.asarray(["ctx-lh-a", "ctx-rh-a"]),
+        )
+
+    def test_parcellation_tokens_normalize_scale_and_filename_punctuation(self):
+        hyphenated = GradientScatterDialog._canonical_parcellation_token(
+            "chimera-LFMIHIFIS-3.nii.gz"
+        )
+        compact = GradientScatterDialog._canonical_parcellation_token(
+            "chimeraLFMIHIFIS_scale3"
+        )
+
+        self.assertEqual(hyphenated, compact)
+
+    def test_match_prefers_newest_exact_subject_session_and_parcellation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            older = root / "sub-CHUVA054_ses-V1_run-old_desc-free_energy_paths.npz"
+            newest = root / "sub-CHUVA054_ses-V1_run-new_desc-free_energy_paths.npz"
+            wrong_session = root / "sub-CHUVA054_ses-V2_desc-free_energy_paths.npz"
+            wrong_scheme = root / "sub-CHUVA054_ses-V1_scheme-SF_desc-free_energy_paths.npz"
+            self._write_path_file(older)
+            self._write_path_file(newest)
+            self._write_path_file(wrong_session, session="V2")
+            self._write_path_file(wrong_scheme, scheme="chimeraSFMIHIFIS_scale200")
+            os.utime(older, (100.0, 100.0))
+            os.utime(newest, (200.0, 200.0))
+            os.utime(wrong_session, (300.0, 300.0))
+            os.utime(wrong_scheme, (400.0, 400.0))
+            dialog = self._matching_dialog(root)
+
+            matched_path, note = dialog._find_best_matching_free_energy_path()
+
+            self.assertEqual(matched_path, newest)
+            self.assertIn("2 matching", note)
+
+    def test_match_requires_subject_and_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dialog = self._matching_dialog(tmpdir)
+            dialog._export_metadata = {"subject_id": "CHUVA054"}
+
+            matched_path, note = dialog._find_best_matching_free_energy_path()
+
+            self.assertIsNone(matched_path)
+            self.assertIn("no complete subject/session", note)
+
+    def test_saved_adjacency_is_label_aligned_for_path_generation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            adjacency_path = root / "adjacency.npz"
+            np.savez_compressed(
+                adjacency_path,
+                adjacency_mat=np.asarray(
+                    [
+                        [0.0, 1.0, 0.0],
+                        [1.0, 0.0, 1.0],
+                        [0.0, 1.0, 0.0],
+                    ]
+                ),
+                parcel_labels=np.asarray([30, 10, 20]),
+                parcel_names=np.asarray(["c", "a", "b"]),
+            )
+            free_energy_path = root / "sub-X_ses-Y_desc-free_energy_paths.npz"
+            np.savez_compressed(
+                free_energy_path,
+                adjacency_path=np.asarray(str(adjacency_path)),
+            )
+            dialog = GradientScatterDialog.__new__(GradientScatterDialog)
+            dialog._point_ids = np.asarray([10, 20, 30], dtype=object)
+            dialog._point_labels = np.asarray(["a", "b", "c"], dtype=object)
+            dialog._x = np.asarray([0.0, 1.0, 2.0])
+            dialog._display_coords = np.column_stack((dialog._x, np.zeros(3)))
+            dialog._path_metric_coords = np.asarray(dialog._display_coords, dtype=float)
+            dialog._export_metadata = {}
+
+            loaded_path = dialog._load_saved_adjacency_edges(free_energy_path)
+
+            self.assertEqual(loaded_path, adjacency_path)
+            self.assertEqual(dialog._edge_pairs.tolist(), [[0, 1], [0, 2]])
+            self.assertEqual(dialog._export_metadata["adjacency_path"], str(adjacency_path))
+
+    def test_write_directory_uses_loaded_free_energy_archive_parent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loaded_dir = Path(tmpdir) / "loaded"
+            fallback_dir = Path(tmpdir) / "fallback"
+            loaded_dir.mkdir()
+            fallback_dir.mkdir()
+            loaded_path = loaded_dir / "sub-X_ses-Y_desc-free_energy_paths.npz"
+            loaded_path.touch()
+            dialog = GradientScatterDialog.__new__(GradientScatterDialog)
+            dialog._loaded_fixed_endpoint_file = str(loaded_path)
+            dialog._export_metadata = {"source_dir": str(fallback_dir)}
+
+            start_dir = dialog._free_energy_write_start_dir()
+
+            self.assertEqual(start_dir, loaded_dir)
 
 
 if __name__ == "__main__":

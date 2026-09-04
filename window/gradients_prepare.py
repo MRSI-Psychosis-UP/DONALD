@@ -11,11 +11,14 @@ try:
         QCheckBox,
         QComboBox,
         QDialog,
+        QDoubleSpinBox,
         QGridLayout,
         QGroupBox,
         QHeaderView,
         QHBoxLayout,
         QLabel,
+        QFileDialog,
+        QLineEdit,
         QProgressBar,
         QPushButton,
         QSpinBox,
@@ -31,11 +34,14 @@ except Exception:
         QCheckBox,
         QComboBox,
         QDialog,
+        QDoubleSpinBox,
         QGridLayout,
         QGroupBox,
         QHeaderView,
         QHBoxLayout,
         QLabel,
+        QFileDialog,
+        QLineEdit,
         QProgressBar,
         QPushButton,
         QSpinBox,
@@ -71,6 +77,8 @@ class GradientsPrepareDialog(QDialog):
         classify_callback=None,
         render_network_callback=None,
         matrix_changed_callback=None,
+        parcel_label_key_changed_callback=None,
+        parcel_name_key_changed_callback=None,
         component_changed_callback=None,
         colormap_changed_callback=None,
         hemisphere_changed_callback=None,
@@ -79,14 +87,19 @@ class GradientsPrepareDialog(QDialog):
         surface_procrustes_changed_callback=None,
         scatter_rotation_changed_callback=None,
         triangular_rgb_changed_callback=None,
+        preload_matching_paths_changed_callback=None,
         classification_fit_mode_changed_callback=None,
         triangular_color_order_changed_callback=None,
+        rgb_scalar_mode_changed_callback=None,
+        rgb_mask_strictness_changed_callback=None,
         classification_surface_mesh_changed_callback=None,
         classification_hemisphere_changed_callback=None,
         classification_colormap_changed_callback=None,
         classification_component_changed_callback=None,
         classification_x_axis_changed_callback=None,
         classification_y_axis_changed_callback=None,
+        classification_z_axis_changed_callback=None,
+        classification_ref_matrix_changed_callback=None,
         classification_ignore_lh_changed_callback=None,
         classification_ignore_rh_changed_callback=None,
         open_classification_adjacency_callback=None,
@@ -104,6 +117,8 @@ class GradientsPrepareDialog(QDialog):
         self._classify_callback = classify_callback
         self._render_network_callback = render_network_callback
         self._matrix_changed_callback = matrix_changed_callback
+        self._parcel_label_key_changed_callback = parcel_label_key_changed_callback
+        self._parcel_name_key_changed_callback = parcel_name_key_changed_callback
         self._component_changed_callback = component_changed_callback
         self._colormap_changed_callback = colormap_changed_callback
         self._hemisphere_changed_callback = hemisphere_changed_callback
@@ -112,14 +127,19 @@ class GradientsPrepareDialog(QDialog):
         self._surface_procrustes_changed_callback = surface_procrustes_changed_callback
         self._scatter_rotation_changed_callback = scatter_rotation_changed_callback
         self._triangular_rgb_changed_callback = triangular_rgb_changed_callback
+        self._preload_matching_paths_changed_callback = preload_matching_paths_changed_callback
         self._classification_fit_mode_changed_callback = classification_fit_mode_changed_callback
         self._triangular_color_order_changed_callback = triangular_color_order_changed_callback
+        self._rgb_scalar_mode_changed_callback = rgb_scalar_mode_changed_callback
+        self._rgb_mask_strictness_changed_callback = rgb_mask_strictness_changed_callback
         self._classification_surface_mesh_changed_callback = classification_surface_mesh_changed_callback
         self._classification_hemisphere_changed_callback = classification_hemisphere_changed_callback
         self._classification_colormap_changed_callback = classification_colormap_changed_callback
         self._classification_component_changed_callback = classification_component_changed_callback
         self._classification_x_axis_changed_callback = classification_x_axis_changed_callback
         self._classification_y_axis_changed_callback = classification_y_axis_changed_callback
+        self._classification_z_axis_changed_callback = classification_z_axis_changed_callback
+        self._classification_ref_matrix_changed_callback = classification_ref_matrix_changed_callback
         self._classification_ignore_lh_changed_callback = classification_ignore_lh_changed_callback
         self._classification_ignore_rh_changed_callback = classification_ignore_rh_changed_callback
         self._open_classification_adjacency_callback = open_classification_adjacency_callback
@@ -142,6 +162,7 @@ class GradientsPrepareDialog(QDialog):
         self.resize(580, 560)
         self._build_ui()
         self.set_matrix_source(None)
+        self.set_parcel_key_options([], [])
         self.set_component_count(component_count)
         self.set_colormap_names(colormap_names or [], current_colormap=current_colormap)
         self.set_parcellation_path(parcellation_path)
@@ -153,8 +174,11 @@ class GradientsPrepareDialog(QDialog):
         self.set_surface_procrustes_available(False)
         self.set_scatter_rotation("Default")
         self.set_triangular_rgb(False)
+        self.set_preload_matching_paths(False)
         self.set_classification_fit_mode("triangle")
         self.set_triangular_color_order("RBG")
+        self.set_rgb_scalar_mode("barycentric")
+        self.set_rgb_mask_strictness(1.0)
         self.set_classification_surface_mesh("fsaverage4")
         self.set_classification_hemisphere_mode("separate")
         self.set_classification_component_options(component_count, selected_component="1")
@@ -204,6 +228,42 @@ class GradientsPrepareDialog(QDialog):
         self.parcellation_label = QLabel("Parcellation: none")
         self.parcellation_label.setWordWrap(True)
         options_layout.addWidget(self.parcellation_label, row, 0, 1, 2)
+        row += 1
+
+        options_layout.addWidget(QLabel("Parcel labels key"), row, 0)
+        self.parcel_label_key_combo = QComboBox()
+        self.parcel_label_key_combo.setToolTip(
+            "Vector key containing integer parcel labels in the selected matrix NPZ."
+        )
+        self.parcel_label_key_combo.currentIndexChanged.connect(
+            self._on_parcel_label_key_changed
+        )
+        options_layout.addWidget(self.parcel_label_key_combo, row, 1)
+        row += 1
+
+        options_layout.addWidget(QLabel("Parcel names key"), row, 0)
+        self.parcel_name_key_combo = QComboBox()
+        self.parcel_name_key_combo.setToolTip(
+            "Vector key containing parcel display names in the selected matrix NPZ."
+        )
+        self.parcel_name_key_combo.currentIndexChanged.connect(
+            self._on_parcel_name_key_changed
+        )
+        options_layout.addWidget(self.parcel_name_key_combo, row, 1)
+        row += 1
+
+        options_layout.addWidget(QLabel("Metab profiles"), row, 0)
+        metab_profile_actions = QHBoxLayout()
+        self.metabolite_profiles_path_edit = QLineEdit()
+        self.metabolite_profiles_path_edit.setPlaceholderText("Embedded in selected matrix")
+        metab_profile_actions.addWidget(self.metabolite_profiles_path_edit, 1)
+        self.metabolite_profiles_browse_button = QPushButton("Browse")
+        self.metabolite_profiles_browse_button.clicked.connect(self._choose_metabolite_profiles_path)
+        metab_profile_actions.addWidget(self.metabolite_profiles_browse_button, 0)
+        self.metabolite_profiles_clear_button = QPushButton("Clear")
+        self.metabolite_profiles_clear_button.clicked.connect(self._clear_metabolite_profiles_path)
+        metab_profile_actions.addWidget(self.metabolite_profiles_clear_button, 0)
+        options_layout.addLayout(metab_profile_actions, row, 1)
         row += 1
 
         compute_actions = QHBoxLayout()
@@ -306,7 +366,7 @@ class GradientsPrepareDialog(QDialog):
         classification_layout.addWidget(self.classification_colorbar_combo, row, 1)
         row += 1
 
-        classification_layout.addWidget(QLabel("Gradient mapping"), row, 0)
+        classification_layout.addWidget(QLabel("Surface component"), row, 0)
         self.classification_component_combo = QComboBox()
         self.classification_component_combo.currentIndexChanged.connect(
             self._on_classification_component_changed
@@ -318,6 +378,10 @@ class GradientsPrepareDialog(QDialog):
         self.classification_x_axis_combo = QComboBox()
         self.classification_x_axis_combo.addItem("Gradient 1", "gradient1")
         self.classification_x_axis_combo.addItem("Gradient 2", "gradient2")
+        self.classification_x_axis_combo.addItem("Gradient 3", "gradient3")
+        self.classification_x_axis_combo.addItem("Gradient Ref 1", "gradient_ref1")
+        self.classification_x_axis_combo.addItem("Gradient Ref 2", "gradient_ref2")
+        self.classification_x_axis_combo.addItem("Gradient Ref 3", "gradient_ref3")
         self.classification_x_axis_combo.addItem("Spatial", "spatial")
         self.classification_x_axis_combo.currentIndexChanged.connect(
             self._on_classification_x_axis_changed
@@ -329,11 +393,39 @@ class GradientsPrepareDialog(QDialog):
         self.classification_y_axis_combo = QComboBox()
         self.classification_y_axis_combo.addItem("Gradient 1", "gradient1")
         self.classification_y_axis_combo.addItem("Gradient 2", "gradient2")
+        self.classification_y_axis_combo.addItem("Gradient 3", "gradient3")
+        self.classification_y_axis_combo.addItem("Gradient Ref 1", "gradient_ref1")
+        self.classification_y_axis_combo.addItem("Gradient Ref 2", "gradient_ref2")
+        self.classification_y_axis_combo.addItem("Gradient Ref 3", "gradient_ref3")
         self.classification_y_axis_combo.addItem("Spatial", "spatial")
         self.classification_y_axis_combo.currentIndexChanged.connect(
             self._on_classification_y_axis_changed
         )
         classification_layout.addWidget(self.classification_y_axis_combo, row, 1)
+        row += 1
+
+        classification_layout.addWidget(QLabel("Z axis"), row, 0)
+        self.classification_z_axis_combo = QComboBox()
+        self.classification_z_axis_combo.addItem("None (2D)", "none")
+        self.classification_z_axis_combo.addItem("Gradient 1", "gradient1")
+        self.classification_z_axis_combo.addItem("Gradient 2", "gradient2")
+        self.classification_z_axis_combo.addItem("Gradient 3", "gradient3")
+        self.classification_z_axis_combo.addItem("Gradient Ref 1", "gradient_ref1")
+        self.classification_z_axis_combo.addItem("Gradient Ref 2", "gradient_ref2")
+        self.classification_z_axis_combo.addItem("Gradient Ref 3", "gradient_ref3")
+        self.classification_z_axis_combo.currentIndexChanged.connect(
+            self._on_classification_z_axis_changed
+        )
+        classification_layout.addWidget(self.classification_z_axis_combo, row, 1)
+        row += 1
+
+        self.classification_ref_matrix_label = QLabel("Reference matrix")
+        classification_layout.addWidget(self.classification_ref_matrix_label, row, 0)
+        self.classification_ref_matrix_combo = QComboBox()
+        self.classification_ref_matrix_combo.currentIndexChanged.connect(
+            self._on_classification_ref_matrix_changed
+        )
+        classification_layout.addWidget(self.classification_ref_matrix_combo, row, 1)
         row += 1
 
         classification_layout.addWidget(QLabel("Ignore parcel (LH)"), row, 0)
@@ -385,6 +477,19 @@ class GradientsPrepareDialog(QDialog):
         classification_layout.addWidget(self.triangular_rgb_check, row, 0, 1, 2)
         row += 1
 
+        self.preload_matching_paths_check = QCheckBox("Preload matching saved path")
+        self.preload_matching_paths_check.setObjectName("preloadMatchingPathsCheck")
+        self.preload_matching_paths_check.setToolTip(
+            "When View opens a 2D RGB scatter, find the newest desc-free_energy_paths.npz "
+            "matching its subject, session, and parcellation, then load its endpoints and generate paths. "
+            "If needed, the adjacency referenced by that archive is loaded as well."
+        )
+        self.preload_matching_paths_check.toggled.connect(
+            self._on_preload_matching_paths_changed
+        )
+        classification_layout.addWidget(self.preload_matching_paths_check, row, 0, 1, 2)
+        row += 1
+
         classification_layout.addWidget(QLabel("Fit mode"), row, 0)
         self.classification_fit_mode_combo = QComboBox()
         self.classification_fit_mode_combo.addItem("Triangular", "triangle")
@@ -395,13 +500,34 @@ class GradientsPrepareDialog(QDialog):
         classification_layout.addWidget(self.classification_fit_mode_combo, row, 1)
         row += 1
 
-        classification_layout.addWidget(QLabel("RGB order (top/left/right)"), row, 0)
+        classification_layout.addWidget(QLabel("RGB order (triangle/base)"), row, 0)
         self.triangular_color_order_combo = QComboBox()
         self.triangular_color_order_combo.addItems(["RBG", "RGB", "BRG", "BGR", "GRB", "GBR"])
         self.triangular_color_order_combo.currentTextChanged.connect(
             self._on_triangular_color_order_changed
         )
         classification_layout.addWidget(self.triangular_color_order_combo, row, 1)
+        row += 1
+
+        classification_layout.addWidget(QLabel("RGB scalar"), row, 0)
+        self.rgb_scalar_mode_combo = QComboBox()
+        self.rgb_scalar_mode_combo.addItem("Barycentric", "barycentric")
+        self.rgb_scalar_mode_combo.addItem("Principal curve", "principal_curve")
+        self.rgb_scalar_mode_combo.setToolTip(
+            "Choose how triangular RGB colors are collapsed to a one-dimensional coordinate for ordering and binning."
+        )
+        self.rgb_scalar_mode_combo.currentIndexChanged.connect(self._on_rgb_scalar_mode_changed)
+        classification_layout.addWidget(self.rgb_scalar_mode_combo, row, 1)
+        row += 1
+
+        classification_layout.addWidget(QLabel("RGB mask strictness"), row, 0)
+        self.rgb_mask_strictness_spin = QDoubleSpinBox()
+        self.rgb_mask_strictness_spin.setRange(0.0, 5.0)
+        self.rgb_mask_strictness_spin.setDecimals(2)
+        self.rgb_mask_strictness_spin.setSingleStep(0.10)
+        self.rgb_mask_strictness_spin.setValue(1.0)
+        self.rgb_mask_strictness_spin.valueChanged.connect(self._on_rgb_mask_strictness_changed)
+        classification_layout.addWidget(self.rgb_mask_strictness_spin, row, 1)
         row += 1
 
         classification_layout.addWidget(QLabel("Adjacency"), row, 0)
@@ -424,11 +550,11 @@ class GradientsPrepareDialog(QDialog):
         classification_layout.addWidget(self.classification_adjacency_label, row, 0, 1, 2)
         row += 1
 
-        self.classify_button = QPushButton("View")
+        self.classify_button = QPushButton("View Scatter + Surface")
         self.classify_button.clicked.connect(self._trigger_classify)
         classification_layout.addWidget(self.classify_button, row, 0, 1, 2)
         classification_layout.setRowStretch(row + 1, 1)
-        self.tabs.addTab(classification_tab, "Classification")
+        self.tabs.addTab(classification_tab, "Scatter + Surface")
 
         network_tab = QWidget()
         rotation_layout = QGridLayout(network_tab)
@@ -493,6 +619,20 @@ class GradientsPrepareDialog(QDialog):
             except Exception:
                 pass
 
+    def _on_parcel_label_key_changed(self, _index):
+        if self._parcel_label_key_changed_callback is not None:
+            try:
+                self._parcel_label_key_changed_callback(self.selected_parcel_label_key())
+            except Exception:
+                pass
+
+    def _on_parcel_name_key_changed(self, _index):
+        if self._parcel_name_key_changed_callback is not None:
+            try:
+                self._parcel_name_key_changed_callback(self.selected_parcel_name_key())
+            except Exception:
+                pass
+
     def _on_colormap_changed(self, value):
         if self._colormap_changed_callback is not None:
             try:
@@ -536,10 +676,17 @@ class GradientsPrepareDialog(QDialog):
                 pass
 
     def _on_triangular_rgb_changed(self, checked):
-        self._refresh_action_state()
         if self._triangular_rgb_changed_callback is not None:
             try:
                 self._triangular_rgb_changed_callback(bool(checked))
+            except Exception:
+                pass
+        self._refresh_action_state()
+
+    def _on_preload_matching_paths_changed(self, checked):
+        if self._preload_matching_paths_changed_callback is not None:
+            try:
+                self._preload_matching_paths_changed_callback(bool(checked))
             except Exception:
                 pass
 
@@ -554,6 +701,20 @@ class GradientsPrepareDialog(QDialog):
         if self._triangular_color_order_changed_callback is not None:
             try:
                 self._triangular_color_order_changed_callback(str(value))
+            except Exception:
+                pass
+
+    def _on_rgb_scalar_mode_changed(self, _index):
+        if self._rgb_scalar_mode_changed_callback is not None:
+            try:
+                self._rgb_scalar_mode_changed_callback(self.selected_rgb_scalar_mode())
+            except Exception:
+                pass
+
+    def _on_rgb_mask_strictness_changed(self, value):
+        if self._rgb_mask_strictness_changed_callback is not None:
+            try:
+                self._rgb_mask_strictness_changed_callback(float(value))
             except Exception:
                 pass
 
@@ -588,6 +749,7 @@ class GradientsPrepareDialog(QDialog):
                 pass
 
     def _on_classification_x_axis_changed(self, _index):
+        self._refresh_classification_reference_visibility()
         if self._classification_x_axis_changed_callback is not None:
             try:
                 self._classification_x_axis_changed_callback(self.selected_classification_x_axis())
@@ -595,9 +757,27 @@ class GradientsPrepareDialog(QDialog):
                 pass
 
     def _on_classification_y_axis_changed(self, _index):
+        self._refresh_classification_reference_visibility()
         if self._classification_y_axis_changed_callback is not None:
             try:
                 self._classification_y_axis_changed_callback(self.selected_classification_y_axis())
+            except Exception:
+                pass
+
+    def _on_classification_z_axis_changed(self, _index):
+        self._refresh_classification_reference_visibility()
+        if self._classification_z_axis_changed_callback is not None:
+            try:
+                self._classification_z_axis_changed_callback(self.selected_classification_z_axis())
+            except Exception:
+                pass
+
+    def _on_classification_ref_matrix_changed(self, _index):
+        if self._classification_ref_matrix_changed_callback is not None:
+            try:
+                self._classification_ref_matrix_changed_callback(
+                    self.selected_classification_ref_matrix_entry_id()
+                )
             except Exception:
                 pass
 
@@ -676,11 +856,40 @@ class GradientsPrepareDialog(QDialog):
         if self._render_network_callback is not None:
             self._render_network_callback()
 
+    def _choose_metabolite_profiles_path(self):
+        current = self.metabolite_profiles_path()
+        start_dir = str(Path(current).parent) if current else ""
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select metabolite profiles NPZ",
+            start_dir,
+            "NPZ files (*.npz);;All files (*)",
+        )
+        if path:
+            self.set_metabolite_profiles_path(path)
+
+    def _clear_metabolite_profiles_path(self):
+        self.set_metabolite_profiles_path("")
+
+    def metabolite_profiles_path(self) -> str:
+        return str(self.metabolite_profiles_path_edit.text() or "").strip()
+
+    def set_metabolite_profiles_path(self, path) -> None:
+        self.metabolite_profiles_path_edit.setText(str(path or "").strip())
+
     def component_count(self) -> int:
         return int(self.components_spin.value())
 
     def selected_matrix_entry_id(self):
         return self.matrix_combo.currentData()
+
+    def selected_parcel_label_key(self) -> str:
+        value = self.parcel_label_key_combo.currentData()
+        return str(value or "").strip()
+
+    def selected_parcel_name_key(self) -> str:
+        value = self.parcel_name_key_combo.currentData()
+        return str(value or "").strip()
 
     def selected_colormap(self) -> str:
         return self.colorbar_combo.currentText().strip()
@@ -703,6 +912,9 @@ class GradientsPrepareDialog(QDialog):
     def use_triangular_rgb(self) -> bool:
         return bool(self.triangular_rgb_check.isChecked())
 
+    def preload_matching_paths(self) -> bool:
+        return bool(self.preload_matching_paths_check.isChecked())
+
     def selected_classification_fit_mode(self) -> str:
         value = self.classification_fit_mode_combo.currentData()
         if value is None:
@@ -715,6 +927,17 @@ class GradientsPrepareDialog(QDialog):
 
     def selected_triangular_color_order(self) -> str:
         return self.triangular_color_order_combo.currentText().strip().upper()
+
+    def selected_rgb_scalar_mode(self) -> str:
+        value = self.rgb_scalar_mode_combo.currentData()
+        text = str(value or "barycentric").strip().lower()
+        return text if text in {"barycentric", "principal_curve"} else "barycentric"
+
+    def selected_rgb_mask_strictness(self) -> float:
+        try:
+            return float(self.rgb_mask_strictness_spin.value())
+        except Exception:
+            return 1.0
 
     def selected_classification_surface_mesh(self) -> str:
         return self.classification_surface_mesh_combo.currentText().strip()
@@ -739,6 +962,15 @@ class GradientsPrepareDialog(QDialog):
         if value is None:
             return "gradient1"
         return str(value).strip() or "gradient1"
+
+    def selected_classification_z_axis(self) -> str:
+        value = self.classification_z_axis_combo.currentData()
+        if value is None:
+            return "none"
+        return str(value).strip() or "none"
+
+    def selected_classification_ref_matrix_entry_id(self):
+        return self.classification_ref_matrix_combo.currentData()
 
     def selected_classification_ignore_lh_parcel(self) -> str:
         value = self.classification_ignore_lh_combo.currentData()
@@ -839,6 +1071,89 @@ class GradientsPrepareDialog(QDialog):
         if selected_index >= 0:
             self.matrix_combo.setCurrentIndex(selected_index)
         self.matrix_combo.blockSignals(False)
+
+    def set_parcel_key_options(
+        self,
+        label_options,
+        name_options,
+        *,
+        selected_label_key="",
+        selected_name_key="",
+        auto_label_key="",
+        auto_name_key="",
+    ) -> None:
+        self._set_parcel_key_combo(
+            self.parcel_label_key_combo,
+            label_options,
+            selected_label_key,
+            auto_label_key=auto_label_key,
+        )
+        self._set_parcel_key_combo(
+            self.parcel_name_key_combo,
+            name_options,
+            selected_name_key,
+            auto_label_key=auto_name_key,
+        )
+
+    @staticmethod
+    def _set_parcel_key_combo(combo, options, selected_key, *, auto_label_key="") -> None:
+        selected = str(selected_key or "").strip()
+        auto_key = str(auto_label_key or "").strip()
+        auto_label = f"Auto ({auto_key})" if auto_key else "Auto detect"
+        seen = set()
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(auto_label, "")
+        selected_index = 0
+        for item in list(options or []):
+            if isinstance(item, dict):
+                key = str(item.get("key", "")).strip()
+                label = str(item.get("label", "")).strip() or key
+            else:
+                key = str(item or "").strip()
+                label = key
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            combo.addItem(label, key)
+            if key == selected:
+                selected_index = combo.count() - 1
+        if selected and selected not in seen:
+            combo.addItem(f"{selected} (missing)", selected)
+            selected_index = combo.count() - 1
+        combo.setCurrentIndex(selected_index)
+        combo.blockSignals(False)
+
+    def set_classification_reference_matrix_options(self, options, selected_entry_id=None) -> None:
+        current_data = self.classification_ref_matrix_combo.currentData()
+        target_id = selected_entry_id if selected_entry_id is not None else current_data
+        self.classification_ref_matrix_combo.blockSignals(True)
+        self.classification_ref_matrix_combo.clear()
+        selected_index = -1
+        for idx, item in enumerate(list(options or [])):
+            if isinstance(item, dict):
+                label = str(item.get("label", "")).strip()
+                entry_id = item.get("id")
+            else:
+                try:
+                    label, entry_id = item
+                except Exception:
+                    continue
+                label = str(label).strip()
+            if not label:
+                label = str(entry_id or "matrix")
+            self.classification_ref_matrix_combo.addItem(label, entry_id)
+            if target_id is not None and entry_id == target_id:
+                selected_index = idx
+        if selected_index < 0 and self.classification_ref_matrix_combo.count() > 0:
+            selected_index = 0
+        if selected_index >= 0:
+            self.classification_ref_matrix_combo.setCurrentIndex(selected_index)
+        elif self.classification_ref_matrix_combo.count() == 0:
+            self.classification_ref_matrix_combo.addItem("No workspace matrices available", None)
+        self.classification_ref_matrix_combo.blockSignals(False)
+        self._refresh_classification_reference_visibility()
 
     def set_progress(self, minimum: int, maximum: int, value: int, text: str) -> None:
         self.progress_bar.setRange(int(minimum), int(maximum))
@@ -1016,6 +1331,12 @@ class GradientsPrepareDialog(QDialog):
         self.triangular_rgb_check.blockSignals(True)
         self.triangular_rgb_check.setChecked(bool(enabled))
         self.triangular_rgb_check.blockSignals(False)
+        self._refresh_action_state()
+
+    def set_preload_matching_paths(self, enabled: bool) -> None:
+        self.preload_matching_paths_check.blockSignals(True)
+        self.preload_matching_paths_check.setChecked(bool(enabled))
+        self.preload_matching_paths_check.blockSignals(False)
 
     def set_classification_fit_mode(self, value: str) -> None:
         text = str(value or "triangle").strip().lower()
@@ -1037,6 +1358,28 @@ class GradientsPrepareDialog(QDialog):
         self.triangular_color_order_combo.blockSignals(True)
         self.triangular_color_order_combo.setCurrentText(text)
         self.triangular_color_order_combo.blockSignals(False)
+
+    def set_rgb_scalar_mode(self, value: str) -> None:
+        text = str(value or "barycentric").strip().lower()
+        if text not in {"barycentric", "principal_curve"}:
+            text = "barycentric"
+        index = self.rgb_scalar_mode_combo.findData(text)
+        if index < 0:
+            index = self.rgb_scalar_mode_combo.findData("barycentric")
+        if index < 0:
+            index = 0
+        self.rgb_scalar_mode_combo.blockSignals(True)
+        self.rgb_scalar_mode_combo.setCurrentIndex(index)
+        self.rgb_scalar_mode_combo.blockSignals(False)
+
+    def set_rgb_mask_strictness(self, value: float) -> None:
+        try:
+            number = max(0.0, min(5.0, float(value)))
+        except Exception:
+            number = 1.0
+        self.rgb_mask_strictness_spin.blockSignals(True)
+        self.rgb_mask_strictness_spin.setValue(number)
+        self.rgb_mask_strictness_spin.blockSignals(False)
 
     def set_classification_surface_mesh(self, value: str) -> None:
         text = str(value or "fsaverage4").strip()
@@ -1096,9 +1439,11 @@ class GradientsPrepareDialog(QDialog):
         self.classification_component_combo.setCurrentIndex(selected_index)
         self.classification_component_combo.blockSignals(False)
 
-    def set_classification_axes(self, x_axis="gradient2", y_axis="gradient1") -> None:
+    def set_classification_axes(self, x_axis="gradient2", y_axis="gradient1", z_axis="none") -> None:
         self._set_classification_axis_combo(self.classification_x_axis_combo, x_axis, "gradient2")
         self._set_classification_axis_combo(self.classification_y_axis_combo, y_axis, "gradient1")
+        self._set_classification_axis_combo(self.classification_z_axis_combo, z_axis, "none")
+        self._refresh_classification_reference_visibility()
 
     def set_classification_ignore_parcel_options(self, lh_names, rh_names, *, selected_lh="", selected_rh="") -> None:
         self._set_ignore_parcel_combo(self.classification_ignore_lh_combo, lh_names, selected_lh)
@@ -1187,6 +1532,22 @@ class GradientsPrepareDialog(QDialog):
             label.setVisible(visible)
             combo.setVisible(visible)
 
+    def _refresh_classification_reference_visibility(self) -> None:
+        x_axis = str(self.classification_x_axis_combo.currentData() or "").strip().lower()
+        y_axis = str(self.classification_y_axis_combo.currentData() or "").strip().lower()
+        z_axis = str(self.classification_z_axis_combo.currentData() or "").strip().lower()
+        visible = x_axis in {"gradient_ref1", "gradient_ref2", "gradient_ref3"} or y_axis in {
+            "gradient_ref1",
+            "gradient_ref2",
+            "gradient_ref3",
+        } or z_axis in {
+            "gradient_ref1",
+            "gradient_ref2",
+            "gradient_ref3",
+        }
+        self.classification_ref_matrix_label.setVisible(visible)
+        self.classification_ref_matrix_combo.setVisible(visible)
+
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
         self._refresh_action_state()
@@ -1207,6 +1568,8 @@ class GradientsPrepareDialog(QDialog):
         can_interact = not self._busy
         self.compute_button.setEnabled(self._can_compute and can_interact and not self._precomputed_mode)
         self.matrix_combo.setEnabled(can_interact)
+        self.parcel_label_key_combo.setEnabled(can_interact and not self._precomputed_mode)
+        self.parcel_name_key_combo.setEnabled(can_interact and not self._precomputed_mode)
         self.components_spin.setEnabled(can_interact and not self._precomputed_mode)
         self.parcellation_button.setEnabled(can_interact)
         self.hemisphere_combo.setEnabled(can_interact)
@@ -1215,14 +1578,25 @@ class GradientsPrepareDialog(QDialog):
         self.surface_procrustes_check.setEnabled(can_interact and self._surface_procrustes_available)
         self.scatter_rotation_combo.setEnabled(can_interact)
         self.triangular_rgb_check.setEnabled(can_interact)
+        self.preload_matching_paths_check.setEnabled(
+            can_interact and self.triangular_rgb_check.isChecked()
+        )
         self.classification_fit_mode_combo.setEnabled(can_interact)
         self.triangular_color_order_combo.setEnabled(can_interact)
+        self.rgb_scalar_mode_combo.setEnabled(can_interact)
+        self.rgb_mask_strictness_spin.setEnabled(can_interact)
         self.classification_surface_mesh_combo.setEnabled(can_interact)
         self.classification_hemisphere_combo.setEnabled(can_interact)
         self.classification_colorbar_combo.setEnabled(can_interact)
         self.classification_component_combo.setEnabled(can_interact)
         self.classification_x_axis_combo.setEnabled(can_interact)
         self.classification_y_axis_combo.setEnabled(can_interact)
+        self.classification_z_axis_combo.setEnabled(can_interact)
+        self.classification_ref_matrix_combo.setEnabled(
+            can_interact
+            and self.classification_ref_matrix_combo.count() > 0
+            and self.classification_ref_matrix_combo.currentData() is not None
+        )
         self.classification_ignore_lh_combo.setEnabled(can_interact)
         self.classification_ignore_rh_combo.setEnabled(can_interact)
         self.classification_adjacency_button.setEnabled(can_interact)

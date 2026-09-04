@@ -10,6 +10,8 @@ dependencies:
   - scipy
   - matplotlib
   - nibabel
+  - nilearn
+  - pyvista
   - python-dotenv
   - tqdm
   - rich

@@ -43,6 +43,7 @@ try:
         QProgressBar,
         QPushButton,
         QSplashScreen,
+        QSizePolicy,
         QSplitter,
         QStackedWidget,
         QSpinBox,
@@ -78,6 +79,7 @@ except ImportError:
         QProgressBar,
         QPushButton,
         QSplashScreen,
+        QSizePolicy,
         QSplitter,
         QStackedWidget,
         QSpinBox,
@@ -209,6 +211,10 @@ try:
         compute_correlation_stats as _combine_corr_stats,
         correlation_vectors as _combine_corr_vectors,
         format_p_value as _format_combine_p_value,
+        parcellation_centroids as _combine_parcellation_centroids,
+        pairwise_distance_matrix as _combine_pairwise_distance_matrix,
+        residualize_matrix as _combine_residualize_matrix,
+        spatially_residualize_matrix as _combine_spatially_residualize_matrix,
     )
     from services.data_access import MatrixDataAccess as _MatrixDataAccess
     from services.entry_helpers import (
@@ -232,6 +238,10 @@ except Exception:
         compute_correlation_stats as _combine_corr_stats,
         correlation_vectors as _combine_corr_vectors,
         format_p_value as _format_combine_p_value,
+        parcellation_centroids as _combine_parcellation_centroids,
+        pairwise_distance_matrix as _combine_pairwise_distance_matrix,
+        residualize_matrix as _combine_residualize_matrix,
+        spatially_residualize_matrix as _combine_spatially_residualize_matrix,
     )
     from mrsi_viewer.services.data_access import MatrixDataAccess as _MatrixDataAccess
     from mrsi_viewer.services.entry_helpers import (
@@ -247,10 +257,16 @@ except Exception:
     from mrsi_viewer.services.workspace_matrix_controller import WorkspaceMatrixController as _WorkspaceMatrixController
     from mrsi_viewer.services.workspace import WorkspaceStore as _WorkspaceStore
 
-from mrsitoolbox.graphplot.simmatrix import SimMatrixPlot
-from mrsitoolbox.graphplot.colorbar import ColorBar
-from mrsitoolbox.graphplot import colorbar as colorbar_module
-from mrsitoolbox.connectomics.nettools import NetTools
+try:
+    from mrsitoolbox.graphplot.simmatrix import SimMatrixPlot
+    from mrsitoolbox.graphplot.colorbar import ColorBar
+    from mrsitoolbox.graphplot import colorbar as colorbar_module
+    from mrsitoolbox.connectomics.nettools import NetTools
+except ImportError as exc:
+    raise ImportError(
+        "Donald requires the current mrsitoolbox pip package. "
+        "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+    ) from exc
 
 nettools = NetTools()
 # Ensure Qt can locate platform plugins when installed via pip wheels.
@@ -340,8 +356,32 @@ COLORBAR_BARS = [
     "random9",
 ]
 
-PARCEL_LABEL_KEYS = ("parcel_labels_group", "parcel_labels_group.npy")
-PARCEL_NAME_KEYS = ("parcel_names_group", "parcel_names_group.npy")
+PARCEL_LABEL_KEYS = (
+    "parcel_labels_group",
+    "parcel_label_group",
+    "parcel_labels",
+    "parcel_label",
+    "labels_indices",
+    "parcel_labels_group.npy",
+    "parcel_label_group.npy",
+    "parcel_labels.npy",
+    "parcel_label.npy",
+    "labels_indices.npy",
+)
+PARCEL_NAME_KEYS = (
+    "parcel_names_group",
+    "parcel_name_group",
+    "parcel_names",
+    "parcel_name",
+    "label_names",
+    "labels",
+    "parcel_names_group.npy",
+    "parcel_name_group.npy",
+    "parcel_names.npy",
+    "parcel_name.npy",
+    "label_names.npy",
+    "labels.npy",
+)
 CMAPS_DIR = Path(colorbar_module.__file__).with_name("cmaps")
 ROOTDIR = Path(__file__).resolve().parent
 DEFAULT_PARCELLATION_DIR = ROOTDIR / "data"
@@ -446,26 +486,42 @@ def _load_matrix_from_npz(path: Path, key: str, average: bool = True) -> np.ndar
     return matrix
 
 
-def _load_parcel_metadata(path: Path):
+def _load_parcel_metadata(path: Path, label_key: str = "", name_key: str = ""):
+    label_key = str(label_key or "").strip()
+    name_key = str(name_key or "").strip()
     labels = None
     names = None
     with np.load(path, allow_pickle=True) as npz:
-        for key in PARCEL_LABEL_KEYS:
-            if key in npz:
-                labels = npz[key]
-                break
-        for key in PARCEL_NAME_KEYS:
-            if key in npz:
-                names = npz[key]
-                break
+        if label_key:
+            if label_key in npz:
+                labels = npz[label_key]
+        else:
+            for key in PARCEL_LABEL_KEYS:
+                if key in npz:
+                    labels = npz[key]
+                    break
+        if name_key:
+            if name_key in npz:
+                names = npz[name_key]
+        else:
+            for key in PARCEL_NAME_KEYS:
+                if key in npz:
+                    names = npz[key]
+                    break
     if labels is None:
-        labels_path = path.with_name("parcel_labels_group.npy")
-        if labels_path.exists():
-            labels = np.load(labels_path, allow_pickle=True)
+        label_sidecar_names = (label_key,) if label_key else PARCEL_LABEL_KEYS
+        for sidecar_name in label_sidecar_names:
+            labels_path = path.with_name(sidecar_name)
+            if labels_path.exists():
+                labels = np.load(labels_path, allow_pickle=True)
+                break
     if names is None:
-        names_path = path.with_name("parcel_names_group.npy")
-        if names_path.exists():
-            names = np.load(names_path, allow_pickle=True)
+        name_sidecar_names = (name_key,) if name_key else PARCEL_NAME_KEYS
+        for sidecar_name in name_sidecar_names:
+            names_path = path.with_name(sidecar_name)
+            if names_path.exists():
+                names = np.load(names_path, allow_pickle=True)
+                break
     return labels, names
 
 
@@ -1522,6 +1578,8 @@ class ConnectomeViewer(QMainWindow):
         self._gradient_precomputed_selected_row = None
         self._gradient_use_precomputed_bundle = False
         self._gradient_component_count = 4
+        self._gradient_parcel_label_key = ""
+        self._gradient_parcel_name_key = ""
         self._gradient_hemisphere_mode = "separate"
         self._gradient_surface_mesh = "fsaverage4"
         self._gradient_surface_render_count = 1
@@ -1530,12 +1588,17 @@ class ConnectomeViewer(QMainWindow):
         self._gradient_classification_hemisphere_mode = "separate"
         self._gradient_scatter_rotation = "Default"
         self._gradient_scatter_triangular_rgb = False
+        self._gradient_preload_matching_paths = False
         self._gradient_classification_fit_mode = "triangle"
         self._gradient_triangular_color_order = "RBG"
+        self._gradient_rgb_scalar_mode = "barycentric"
+        self._gradient_rgb_mask_strictness = 1.0
         self._gradient_classification_colormap_name = self._default_gradient_colormap
         self._gradient_classification_component = "1"
         self._gradient_classification_x_axis = "gradient2"
         self._gradient_classification_y_axis = "gradient1"
+        self._gradient_classification_z_axis = "none"
+        self._gradient_classification_ref_entry_id = None
         self._gradient_classification_ignore_lh_parcel = ""
         self._gradient_classification_ignore_rh_parcel = ""
         self._gradient_classification_adjacency_path = ""
@@ -1807,6 +1870,10 @@ class ConnectomeViewer(QMainWindow):
         self.nbs_prepare_action.triggered.connect(self._open_nbs_prepare_dialog)
         analysis_menu.addAction(self.nbs_prepare_action)
 
+        self.connectivity_compute_action = QAction("Compute Connectivity", self)
+        self.connectivity_compute_action.triggered.connect(self._open_connectivity_compute_folder)
+        analysis_menu.addAction(self.connectivity_compute_action)
+
         self.harmonize_prepare_action = QAction("Harmonize Prepare", self)
         self.harmonize_prepare_action.triggered.connect(self._open_harmonize_prepare_dialog)
         analysis_menu.addAction(self.harmonize_prepare_action)
@@ -2046,33 +2113,44 @@ class ConnectomeViewer(QMainWindow):
         self.view_participants_button.setEnabled(False)
         info_layout.addWidget(self.view_participants_button)
 
-        gradients_group = QGroupBox("Gradients")
-        gradients_layout = QVBoxLayout(gradients_group)
-        self.gradients_open_button = QPushButton("Gradients")
+        # Connectivity tile is added to the analysis grid below.
+        try:
+            from window.compute_connectivity import ConnectivityDropButton
+            from window.icon_tile import SquareIconTile
+        except Exception:
+            from mrsi_viewer.window.compute_connectivity import ConnectivityDropButton
+            from mrsi_viewer.window.icon_tile import SquareIconTile
+        self.connectivity_compute_button = ConnectivityDropButton("Connectivity")
+        self.connectivity_compute_button.clicked.connect(self._open_connectivity_compute_folder)
+        self.connectivity_compute_button.folder_dropped.connect(self._open_compute_connectivity_dialog)
+        # Deliberately always enabled: this computes matrices from profiles, so
+        # unlike the analysis buttons it does not need matrices loaded first.
+        self.connectivity_compute_button.setEnabled(True)
+        self._configure_right_panel_icon_button(self.connectivity_compute_button, "Connectivity")
+
+        # Gradients tile is added to the analysis grid below.
+        self.gradients_open_button = SquareIconTile("Gradients")
         self.gradients_open_button.clicked.connect(self._open_gradients_dialog)
         self.gradients_open_button.setEnabled(False)
-        gradients_layout.addWidget(self.gradients_open_button)
+        self._configure_right_panel_icon_button(self.gradients_open_button, "Gradients")
 
-        nbs_group = QGroupBox("NBS")
-        nbs_layout = QVBoxLayout(nbs_group)
-        self.nbs_prepare_button = QPushButton("Prepare")
+        # NBS tile is added to the analysis grid below.
+        self.nbs_prepare_button = SquareIconTile("Prepare")
         self.nbs_prepare_button.clicked.connect(self._open_nbs_prepare_dialog)
         self.nbs_prepare_button.setEnabled(False)
-        nbs_layout.addWidget(self.nbs_prepare_button)
+        self._configure_right_panel_icon_button(self.nbs_prepare_button, "NBS")
 
-        harmonize_group = QGroupBox("Harmonize")
-        harmonize_layout = QVBoxLayout(harmonize_group)
-        self.harmonize_prepare_button = QPushButton("Prepare")
+        # Harmonize tile is added to the analysis grid below.
+        self.harmonize_prepare_button = SquareIconTile("Prepare")
         self.harmonize_prepare_button.clicked.connect(self._open_harmonize_prepare_dialog)
         self.harmonize_prepare_button.setEnabled(False)
-        harmonize_layout.addWidget(self.harmonize_prepare_button)
+        self._configure_right_panel_icon_button(self.harmonize_prepare_button, "Harmonize")
 
-        combine_group = QGroupBox("Combine")
-        combine_layout = QVBoxLayout(combine_group)
-        self.combine_open_button = QPushButton("Combine")
+        # Combine tile is added to the analysis grid below.
+        self.combine_open_button = SquareIconTile("Combine")
         self.combine_open_button.clicked.connect(self._open_combine_dialog)
         self.combine_open_button.setEnabled(False)
-        combine_layout.addWidget(self.combine_open_button)
+        self._configure_right_panel_icon_button(self.combine_open_button, "Combine")
 
         self._reload_colormaps()
 
@@ -2081,10 +2159,8 @@ class ConnectomeViewer(QMainWindow):
             selector_group,
             info_group,
             export_group,
-            gradients_group,
-            nbs_group,
-            harmonize_group,
-            combine_group,
+            # The analysis tiles no longer live in group boxes; they are
+            # styled by the #rightPanelIconButton rule instead.
         ]
 
         controls_layout.addWidget(list_group)
@@ -2180,10 +2256,31 @@ class ConnectomeViewer(QMainWindow):
 
         right_panel = QWidget()
         right_panel_layout = QVBoxLayout(right_panel)
-        right_panel_layout.addWidget(gradients_group)
-        right_panel_layout.addWidget(nbs_group)
-        right_panel_layout.addWidget(harmonize_group)
-        right_panel_layout.addWidget(combine_group)
+        # One grid of square icon tiles instead of a column of full-width
+        # buttons in individual group boxes, following EEG-UP's compute
+        # toolbar. The per-function group titles went with it: they duplicated
+        # the tooltip and forced every tile to span the whole panel width,
+        # which is what made the icons read as small and stranded.
+        analysis_tiles = QWidget()
+        analysis_grid = QGridLayout(analysis_tiles)
+        analysis_grid.setContentsMargins(4, 4, 4, 4)
+        analysis_grid.setSpacing(6)
+        tiles = [
+            (self.connectivity_compute_button, "Connectivity"),
+            (self.gradients_open_button, "Gradients"),
+            (self.nbs_prepare_button, "NBS"),
+            (self.harmonize_prepare_button, "Harmonize"),
+            (self.combine_open_button, "Combine"),
+        ]
+        columns = 2
+        for index, (tile_button, tile_label) in enumerate(tiles):
+            # Already configured as a tile where each button is created; only
+            # the placement is decided here.
+            del tile_label
+            analysis_grid.addWidget(tile_button, index // columns, index % columns)
+        for column in range(columns):
+            analysis_grid.setColumnStretch(column, 1)
+        right_panel_layout.addWidget(analysis_tiles)
         right_panel_layout.addStretch(1)
         left_panel.setMinimumWidth(0)
         right_panel.setMinimumWidth(0)
@@ -2241,6 +2338,29 @@ class ConnectomeViewer(QMainWindow):
         if self._theme_name == "Donald":
             return "#ffffff"
         return "#1f2937"
+
+    def _right_panel_tile_stylesheet(self) -> str:
+        """Card look for the right-panel icon tiles.
+
+        Appended to whichever theme string is active rather than repeated in
+        all four, so a tile tweak is one edit instead of four.
+        """
+        if self._theme_name == "Dark":
+            bg, border, hover = "#2a3140", "#4b5668", "#60a5fa"
+        elif self._theme_name == "Teya":
+            bg, border, hover = "#ffffff", "#bfe9e7", "#0b7f7a"
+        elif self._theme_name == "Donald":
+            bg, border, hover = "#2d2a26", "#6b5c4a", "#ffd19e"
+        else:
+            bg, border, hover = "#ffffff", "#d8dee9", "#2563eb"
+        return (
+            "QPushButton#rightPanelIconButton {"
+            f"background: {bg}; border: 1px solid {border}; border-radius: 10px; padding: 6px;"
+            "}"
+            f"QPushButton#rightPanelIconButton:hover {{ border: 2px solid {hover}; }}"
+            f"QPushButton#rightPanelIconButton:pressed {{ background: {border}; }}"
+            "QPushButton#rightPanelIconButton:disabled { border-style: dashed; }"
+        )
 
     def _base_theme_stylesheet(self) -> str:
         if self._theme_name == "Dark":
@@ -2378,7 +2498,7 @@ class ConnectomeViewer(QMainWindow):
             self.theme_combo.setCurrentText(theme)
             self.theme_combo.blockSignals(False)
 
-        self.setStyleSheet(self._base_theme_stylesheet())
+        self.setStyleSheet(self._base_theme_stylesheet() + self._right_panel_tile_stylesheet())
         self._apply_groupbox_style()
         if hasattr(self, "plot_title_label"):
             if theme == "Dark":
@@ -2526,7 +2646,16 @@ class ConnectomeViewer(QMainWindow):
         return QIcon()
 
     def _apply_button_icons(self, compact_ui: bool = False, color: str = None) -> None:
+        try:
+            from window.icon_tile import SquareIconTile
+        except Exception:
+            from mrsi_viewer.window.icon_tile import SquareIconTile
         icon_size = QSize(16, 16) if compact_ui else QSize(18, 18)
+        right_panel_icon_size = (
+            QSize(self._TILE_ICON_SIZE_COMPACT, self._TILE_ICON_SIZE_COMPACT)
+            if compact_ui
+            else QSize(self._TILE_ICON_SIZE, self._TILE_ICON_SIZE)
+        )
         mapping = [
             (getattr(self, "add_button", None), "folder_plus.svg"),
             (getattr(self, "add_batch_button", None), "folder_plus.svg"),
@@ -2539,10 +2668,11 @@ class ConnectomeViewer(QMainWindow):
             (getattr(self, "write_matrix_button", None), "save_disk.svg"),
             (getattr(self, "move_up_button", None), "arrow_up.svg"),
             (getattr(self, "move_down_button", None), "arrow_down.svg"),
-            (getattr(self, "gradients_open_button", None), "cube_3d.svg"),
-            (getattr(self, "nbs_prepare_button", None), "wrench_prepare.svg"),
-            (getattr(self, "harmonize_prepare_button", None), "wrench_prepare.svg"),
-            (getattr(self, "combine_open_button", None), "play_circle_compute.svg"),
+            (getattr(self, "connectivity_compute_button", None), "connectivity.svg"),
+            (getattr(self, "gradients_open_button", None), "gradient.png"),
+            (getattr(self, "nbs_prepare_button", None), "nbs.svg"),
+            (getattr(self, "harmonize_prepare_button", None), "harmonize.svg"),
+            (getattr(self, "combine_open_button", None), "combine.svg"),
             (getattr(self, "selector_prepare_button", None), "filter_threshold.svg"),
             (getattr(self, "sample_add_button", None), "folder_plus.svg"),
         ]
@@ -2553,7 +2683,45 @@ class ConnectomeViewer(QMainWindow):
             if icon.isNull():
                 continue
             button.setIcon(icon)
-            button.setIconSize(icon_size)
+            if isinstance(button, SquareIconTile):
+                continue  # the tile rescales its own icon from its width
+            if button.objectName() == "rightPanelIconButton":
+                button.setIconSize(right_panel_icon_size)
+            else:
+                button.setIconSize(icon_size)
+
+    #: Square icon tiles, following EEG-UP's compute toolbar
+    #: (ui/pages/workflow_page.py). The icon carries the meaning, so the tile
+    #: is sized from the icon rather than from text metrics, and the label
+    #: survives only as a tooltip.
+    _TILE_ICON_SIZE = 72
+    _TILE_ICON_SIZE_COMPACT = 56
+    _TILE_MIN_SIZE = 104
+    _TILE_MIN_SIZE_COMPACT = 84
+
+    def _configure_right_panel_icon_button(self, button, label: str) -> None:
+        try:
+            from window.icon_tile import SquareIconTile
+        except Exception:
+            from mrsi_viewer.window.icon_tile import SquareIconTile
+        button.setText("")
+        button.setObjectName("rightPanelIconButton")
+        if not str(button.toolTip() or "").strip():
+            button.setToolTip(label)
+        button.setStatusTip(label)
+        try:
+            button.setAccessibleName(label)
+        except Exception:
+            pass
+        # Size is the tile's own business: SquareIconTile keeps itself square
+        # and derives its icon size from its width, so the tiles track the side
+        # panel as it is dragged. Only the floor is set from here.
+        side = self._TILE_MIN_SIZE_COMPACT if self._compact_ui else self._TILE_MIN_SIZE
+        if isinstance(button, SquareIconTile):
+            button.MIN_SIDE = side
+            button.setMinimumSize(QSize(side, side))
+        else:
+            button.setFixedSize(QSize(side, side))
 
     def _file_entry_id(self, path: Path) -> str:
         return self._workspace.file_entry_id(path)
@@ -2885,6 +3053,15 @@ class ConnectomeViewer(QMainWindow):
     def _open_nbs_prepare_dialog(self) -> None:
         self._prepare_dialog_controller.open_nbs_prepare_dialog()
 
+    def _current_gradient_rgb_payload(self):
+        dialog = getattr(self, "_gradient_scatter_dialog", None)
+        if dialog is None or not hasattr(dialog, "triangular_rgb_model_payload"):
+            return None
+        try:
+            return dialog.triangular_rgb_model_payload()
+        except Exception:
+            return None
+
     def _open_selector_prepare_dialog(self) -> None:
         self._prepare_dialog_controller.open_selector_prepare_dialog()
 
@@ -2959,13 +3136,19 @@ class ConnectomeViewer(QMainWindow):
         self._combine_pending_result = None
         if dialog is not None:
             dialog.set_can_confirm(False)
+        operation_name = str(operation or "").strip().lower()
         first_entry = self._entries.get(first_entry_id)
-        second_entry = self._entries.get(second_entry_id)
-        if first_entry is None or second_entry is None:
+        second_entry = self._entries.get(second_entry_id) if second_entry_id is not None else None
+        if first_entry is None or (operation_name != "spatial_correction" and second_entry is None):
             message = "Select two valid workspace matrices."
+            if operation_name == "spatial_correction":
+                message = "Select a valid workspace matrix."
             if dialog is not None:
                 dialog.set_status(message)
             self.statusBar().showMessage(message)
+            return
+        if operation_name == "spatial_correction":
+            self._process_combine_spatial_correction(first_entry_id)
             return
 
         first_label = self._gradient_matrix_label_for_entry(first_entry)
@@ -3014,7 +3197,18 @@ class ConnectomeViewer(QMainWindow):
                     "Intersect requires square matrices with valid parcel_labels_group in both inputs."
                 )
 
-            result_matrix = self._combine_apply_matrix_operation(first_matrix, second_matrix, operation)
+            correction_summary = ""
+            if operation_name == "correct":
+                correction_stats = self._combine_residualize_matrix(first_matrix, second_matrix)
+                result_matrix = np.asarray(correction_stats.residual_matrix, dtype=float)
+                correction_summary = (
+                    f"regressed Matrix A on Matrix B using {correction_stats.mode_text}; "
+                    f"n={correction_stats.first_values.size}; "
+                    f"beta={float(correction_stats.slope):.4g}; "
+                    f"intercept={float(correction_stats.intercept):.4g}"
+                )
+            else:
+                result_matrix = self._combine_apply_matrix_operation(first_matrix, second_matrix, operation)
             finite_values = np.asarray(result_matrix, dtype=float)
             finite_values = finite_values[np.isfinite(finite_values)]
             if finite_values.size:
@@ -3025,6 +3219,8 @@ class ConnectomeViewer(QMainWindow):
                 max_text = "n/a"
             if operation_name == "intersect":
                 result_label = f"intersect({first_label}, {second_label})"
+            elif operation_name == "correct":
+                result_label = f"correct({first_label}, {second_label})"
             else:
                 result_label = f"{first_label} {self._combine_operation_symbol(operation)} {second_label}"
             result_labels = aligned_labels
@@ -3038,6 +3234,7 @@ class ConnectomeViewer(QMainWindow):
             result_summary = (
                 f"{operation_label} result | shape={tuple(result_matrix.shape)} | "
                 f"{alignment_summary} | "
+                f"{correction_summary + ' | ' if correction_summary else ''}"
                 f"min={min_text} | max={max_text}"
             )
             source_path = first_entry.get("source_path", first_entry.get("path"))
@@ -3069,6 +3266,316 @@ class ConnectomeViewer(QMainWindow):
                 dialog.set_status(message)
             self.statusBar().showMessage(message)
 
+    def _process_combine_spatial_correction(self, first_entry_id) -> None:
+        dialog = getattr(self, "_combine_dialog", None)
+        self._combine_pending_result = None
+        if dialog is not None and hasattr(dialog, "clear_progress"):
+            dialog.clear_progress()
+        first_entry = self._entries.get(first_entry_id)
+        if first_entry is None:
+            message = "Select a valid workspace matrix."
+            if dialog is not None:
+                dialog.set_status(message)
+                dialog.set_can_confirm(False)
+            self.statusBar().showMessage(message)
+            return
+
+        operation = "spatial_correction"
+        operation_label = self._combine_operation_label(operation)
+        first_label = self._gradient_matrix_label_for_entry(first_entry)
+        try:
+            selected_key, source_payload, selected_matrix = self._combine_source_npz_payload(first_entry)
+            selected_matrix = np.asarray(selected_matrix)
+            selected_node_count = self._combine_matrix_node_count(selected_matrix)
+            if selected_node_count is None:
+                raise ValueError("Spatial correction requires a square matrix or a 3D stack of square matrices.")
+            result_labels, result_names = self._entry_parcel_metadata(
+                first_entry,
+                expected_len=selected_node_count,
+            )
+            template_img, template_data, template_path = self._combine_spatial_parcellation_img_and_data()
+            result_labels = self._combine_spatial_correction_labels(
+                result_labels,
+                template_data,
+                selected_node_count,
+            )
+            parcel_coordinates, spatial_labels = _combine_parcellation_centroids(
+                template_data,
+                result_labels,
+                affine=np.asarray(template_img.affine, dtype=float),
+            )
+            distance_matrix = _combine_pairwise_distance_matrix(parcel_coordinates)
+            compatible_keys = self._combine_spatial_compatible_matrix_keys(source_payload, selected_node_count)
+            if selected_key not in compatible_keys:
+                compatible_keys.insert(0, selected_key)
+            total_matrices = sum(
+                self._combine_matrix_slice_count(np.asarray(source_payload[key]))
+                for key in compatible_keys
+            )
+            if total_matrices <= 0:
+                raise ValueError("No matrix slices were available for spatial correction.")
+            corrected_payload = {
+                key: np.array(value, copy=True)
+                for key, value in source_payload.items()
+            }
+            progress_value = 0
+            beta_values = []
+            intercept_values = []
+            first_value_count = 0
+
+            def _advance_progress():
+                nonlocal progress_value
+                progress_value += 1
+                if dialog is not None and hasattr(dialog, "set_progress"):
+                    dialog.set_progress(
+                        0,
+                        total_matrices,
+                        progress_value,
+                        f"{progress_value}/{total_matrices} matrices",
+                    )
+                try:
+                    QApplication.processEvents()
+                except Exception:
+                    pass
+
+            for key in compatible_keys:
+                corrected_array, key_stats = self._combine_spatial_correct_matrix_array(
+                    source_payload[key],
+                    distance_matrix,
+                    progress_callback=_advance_progress,
+                )
+                corrected_payload[key] = corrected_array
+                beta_values.extend(key_stats.get("slopes", []))
+                intercept_values.extend(key_stats.get("intercepts", []))
+                first_value_count += int(key_stats.get("n_values", 0))
+
+            result_matrix = np.asarray(corrected_payload[selected_key], dtype=float)
+        except Exception as exc:
+            message = f"{operation_label} failed: {exc}"
+            if dialog is not None:
+                dialog.set_status(message)
+                dialog.set_can_confirm(False)
+                if hasattr(dialog, "clear_progress"):
+                    dialog.clear_progress()
+            self.statusBar().showMessage(message)
+            return
+
+        display_matrix = _average_to_square(result_matrix) if result_matrix.ndim == 3 else result_matrix
+        finite_values = np.asarray(display_matrix, dtype=float)
+        finite_values = finite_values[np.isfinite(finite_values)]
+        min_text = f"{float(np.min(finite_values)):.4g}" if finite_values.size else "n/a"
+        max_text = f"{float(np.max(finite_values)):.4g}" if finite_values.size else "n/a"
+        result_label = f"spatial_correct({first_label})"
+        template_name = Path(template_path).name if template_path is not None else "active parcellation"
+        beta_text = (
+            f"{float(np.mean(beta_values)):.4g}"
+            if beta_values
+            else "n/a"
+        )
+        intercept_text = (
+            f"{float(np.mean(intercept_values)):.4g}"
+            if intercept_values
+            else "n/a"
+        )
+        result_summary = (
+            f"{operation_label} result | shape={tuple(result_matrix.shape)} | "
+            f"parcellation={template_name} | "
+            f"corrected {len(compatible_keys)} matrix key(s), {total_matrices} matrix slice(s); "
+            f"regressed each matrix on parcel centroid distance using upper triangle excluding diagonal; "
+            f"n={first_value_count}; "
+            f"mean beta={beta_text}; "
+            f"mean intercept={intercept_text} | "
+            f"min={min_text} | max={max_text}"
+        )
+        source_path = first_entry.get("source_path", first_entry.get("path"))
+        self._combine_pending_result = {
+            "matrix": result_matrix,
+            "label": result_label,
+            "summary_text": result_summary,
+            "source_path": source_path,
+            "operation": operation,
+            "first_entry_id": first_entry_id,
+            "second_entry_id": None,
+            "selected_key": selected_key,
+            "sample_index": first_entry.get("sample_index", -1) if result_matrix.ndim == 3 else None,
+            "stack_axis": _stack_axis(result_matrix.shape) if result_matrix.ndim == 3 else None,
+            "stack_len": (
+                result_matrix.shape[_stack_axis(result_matrix.shape)]
+                if result_matrix.ndim == 3 and _stack_axis(result_matrix.shape) is not None
+                else None
+            ),
+            "parcel_labels_group": np.asarray(spatial_labels),
+            "parcel_names_group": np.asarray(result_names, dtype=object) if result_names is not None else None,
+            "spatial_correction_parcellation": str(template_path) if template_path is not None else "",
+            "spatial_correction_keys": np.asarray(compatible_keys, dtype=object),
+            "npz_payload": corrected_payload,
+        }
+
+        if dialog is not None:
+            dialog.show_matrix_result(
+                display_matrix,
+                title=result_label,
+                summary_text=result_summary,
+            )
+            dialog.set_status("Processed spatial correction. Click Add to Workspace to confirm.")
+        self.statusBar().showMessage(
+            f"{operation_label} complete. Preview ready; confirm to add it to the workspace."
+        )
+
+    def _combine_source_npz_payload(self, entry):
+        if entry.get("kind") == "file":
+            selected_key = self._ensure_entry_key(entry)
+            if not selected_key:
+                raise KeyError("No valid matrix key selected.")
+            source_path = Path(entry["path"])
+            payload = {}
+            with np.load(source_path, allow_pickle=True) as npz:
+                if selected_key not in npz:
+                    raise KeyError(f"Key '{selected_key}' not found.")
+                for key in npz.files:
+                    payload[key] = np.array(npz[key], copy=True)
+            return selected_key, payload, payload[selected_key]
+
+        selected_key = str(entry.get("selected_key") or "").strip() or "matrix"
+        matrix = np.asarray(entry.get("matrix"))
+        payload = {}
+        stored_payload = entry.get("npz_payload")
+        if isinstance(stored_payload, dict):
+            for key, value in stored_payload.items():
+                payload[str(key)] = np.array(value, copy=True)
+        if selected_key not in payload:
+            payload[selected_key] = np.array(matrix, copy=True)
+        return selected_key, payload, payload[selected_key]
+
+    @staticmethod
+    def _combine_matrix_node_count(matrix_array):
+        array = np.asarray(matrix_array)
+        if array.ndim == 2 and array.shape[0] == array.shape[1]:
+            return int(array.shape[0])
+        if array.ndim == 3:
+            axis = _stack_axis(array.shape)
+            if axis is None:
+                return None
+            dims = [int(array.shape[idx]) for idx in range(3) if idx != axis]
+            if len(dims) == 2 and dims[0] == dims[1]:
+                return int(dims[0])
+        return None
+
+    @staticmethod
+    def _combine_matrix_slice_count(matrix_array):
+        array = np.asarray(matrix_array)
+        if array.ndim == 2 and array.shape[0] == array.shape[1]:
+            return 1
+        if array.ndim == 3:
+            axis = _stack_axis(array.shape)
+            if axis is not None:
+                return int(array.shape[axis])
+        return 0
+
+    def _combine_spatial_compatible_matrix_keys(self, payload, node_count):
+        compatible = []
+        for key, value in dict(payload or {}).items():
+            try:
+                if self._combine_matrix_node_count(np.asarray(value)) == int(node_count):
+                    compatible.append(str(key))
+            except Exception:
+                continue
+        return compatible
+
+    @staticmethod
+    def _combine_assign_stack_slice(output, axis, index, matrix):
+        if axis == 0:
+            output[index, :, :] = matrix
+        elif axis == 1:
+            output[:, index, :] = matrix
+        else:
+            output[:, :, index] = matrix
+
+    def _combine_spatial_correct_matrix_array(self, matrix_array, distance_matrix, *, progress_callback=None):
+        array = np.asarray(matrix_array, dtype=float)
+        stats = {"slopes": [], "intercepts": [], "n_values": 0}
+        if array.ndim == 2:
+            residual_stats = self._combine_residualize_matrix(array, distance_matrix)
+            stats["slopes"].append(float(residual_stats.slope))
+            stats["intercepts"].append(float(residual_stats.intercept))
+            stats["n_values"] += int(residual_stats.first_values.size)
+            if progress_callback is not None:
+                progress_callback()
+            return np.asarray(residual_stats.residual_matrix, dtype=float), stats
+
+        axis = _stack_axis(array.shape)
+        if axis is None:
+            raise ValueError(f"Cannot identify matrix stack axis for shape {array.shape}.")
+        corrected = np.empty(array.shape, dtype=float)
+        for idx in range(int(array.shape[axis])):
+            matrix = _select_stack_slice(array, axis, idx)
+            residual_stats = self._combine_residualize_matrix(matrix, distance_matrix)
+            self._combine_assign_stack_slice(corrected, axis, idx, residual_stats.residual_matrix)
+            stats["slopes"].append(float(residual_stats.slope))
+            stats["intercepts"].append(float(residual_stats.intercept))
+            stats["n_values"] += int(residual_stats.first_values.size)
+            if progress_callback is not None:
+                progress_callback()
+        return corrected, stats
+
+    def _combine_spatial_parcellation_img_and_data(self):
+        template_img = getattr(self, "_active_parcellation_img", None)
+        template_data = getattr(self, "_active_parcellation_data", None)
+        template_path = getattr(self, "_active_parcellation_path", None)
+        if template_img is not None and template_data is not None:
+            return template_img, np.asarray(template_data, dtype=int), template_path
+
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select parcellation NIfTI for spatial correction",
+            str(self._default_parcellation_dir()),
+            "NIfTI files (*.nii *.nii.gz);;All files (*)",
+        )
+        if not selected:
+            raise RuntimeError("No parcellation NIfTI selected.")
+        try:
+            import nibabel as nib
+        except Exception as exc:
+            raise RuntimeError(f"nibabel not available: {exc}") from exc
+        try:
+            template_img = nib.load(str(selected))
+            template_data = np.asarray(template_img.get_fdata(), dtype=int)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load parcellation NIfTI: {exc}") from exc
+        if template_data.ndim != 3:
+            raise RuntimeError("Parcellation NIfTI must be a 3D image.")
+
+        self._active_parcellation_path = Path(selected)
+        self._active_parcellation_img = template_img
+        self._active_parcellation_data = template_data
+        self._update_parcellation_label()
+        return template_img, template_data, self._active_parcellation_path
+
+    @staticmethod
+    def _combine_spatial_correction_labels(parcel_labels, template_data, matrix_size):
+        matrix_size = int(matrix_size)
+        if parcel_labels is not None:
+            labels = np.asarray(parcel_labels).reshape(-1)
+            if labels.size == matrix_size:
+                try:
+                    labels = np.asarray([int(label) for label in labels.tolist()], dtype=int)
+                except Exception as exc:
+                    raise ValueError("Matrix parcel_labels_group must be integer-valued.") from exc
+                if len(set(labels.tolist())) != labels.size:
+                    raise ValueError("Matrix parcel_labels_group must be unique.")
+                return labels
+
+        image_labels = np.unique(np.asarray(template_data, dtype=int))
+        image_labels = image_labels[image_labels != 0]
+        image_labels = np.asarray(sorted(int(label) for label in image_labels.tolist()), dtype=int)
+        if image_labels.size == matrix_size:
+            return image_labels
+        raise ValueError(
+            "Spatial correction requires matrix parcel_labels_group matching the matrix size. "
+            f"No valid labels were found, and the parcellation has {image_labels.size} non-zero labels "
+            f"for a {matrix_size}x{matrix_size} matrix."
+        )
+
     def _confirm_combine_result(self) -> None:
         dialog = getattr(self, "_combine_dialog", None)
         payload = self._combine_pending_result
@@ -3084,12 +3591,17 @@ class ConnectomeViewer(QMainWindow):
             np.asarray(payload["matrix"], dtype=float),
             label=str(payload.get("label") or "combine_result"),
             source_path=payload.get("source_path"),
-            selected_key=None,
-            sample_index=None,
+            selected_key=payload.get("selected_key"),
+            sample_index=payload.get("sample_index"),
             extra_fields={
                 "combine_operation": str(payload.get("operation") or ""),
                 "combine_source_a": payload.get("first_entry_id"),
                 "combine_source_b": payload.get("second_entry_id"),
+                "spatial_correction_parcellation": payload.get("spatial_correction_parcellation"),
+                "spatial_correction_keys": payload.get("spatial_correction_keys"),
+                "npz_payload": payload.get("npz_payload"),
+                "stack_axis": payload.get("stack_axis"),
+                "stack_len": payload.get("stack_len"),
                 "parcel_labels_group": (
                     np.asarray(payload["parcel_labels_group"])
                     if payload.get("parcel_labels_group") is not None
@@ -3116,6 +3628,17 @@ class ConnectomeViewer(QMainWindow):
 
     def _combine_vectors_for_correlation(self, first_matrix, second_matrix):
         return _combine_corr_vectors(first_matrix, second_matrix)
+
+    def _combine_residualize_matrix(self, first_matrix, second_matrix):
+        return _combine_residualize_matrix(first_matrix, second_matrix)
+
+    def _combine_spatially_residualize_matrix(self, matrix, parcellation_data, parcel_labels, affine=None):
+        return _combine_spatially_residualize_matrix(
+            matrix,
+            parcellation_data,
+            parcel_labels,
+            affine=affine,
+        )
 
     def _show_combine_correlation(
         self,
@@ -3162,8 +3685,12 @@ class ConnectomeViewer(QMainWindow):
     def _invalidate_path_caches(self, path: Path) -> None:
         self._data_access.invalidate_path(path)
 
-    def _load_parcel_metadata_cached(self, path: Path):
-        return self._data_access.load_parcel_metadata_cached(path)
+    def _load_parcel_metadata_cached(self, path: Path, label_key: str = "", name_key: str = ""):
+        return self._data_access.load_parcel_metadata_cached(
+            path,
+            label_key=label_key,
+            name_key=name_key,
+        )
 
     def _load_group_value_cached(self, path: Path, index: int):
         return self._data_access.load_group_value_cached(path, index)

@@ -123,10 +123,10 @@ class WorkspaceMatrixController:
     def on_sample_changed(self, value: int) -> None:
         viewer = self._viewer
         entry = viewer._current_entry()
-        if entry is None or entry.get("kind") != "file":
+        if entry is None or entry.get("kind") not in {"file", "derived"}:
             return
         entry["sample_index"] = value
-        if entry.get("auto_title", True):
+        if entry.get("kind") == "file" and entry.get("auto_title", True):
             self.apply_title_for_entry(entry, force=True)
         viewer._plot_selected()
 
@@ -299,6 +299,30 @@ class WorkspaceMatrixController:
             viewer.statusBar().showMessage("No matrix selected.")
             return
 
+        full_payload = entry.get("npz_payload")
+        if isinstance(full_payload, dict) and full_payload:
+            selected_key = str(entry.get("selected_key") or "matrix").strip() or "matrix"
+            default_name = default_matrix_export_name(entry, selected_key=selected_key)
+            start_dir = viewer._default_results_dir()
+            save_path, _selected_filter = file_dialog_class.getSaveFileName(
+                viewer,
+                "Write corrected NPZ",
+                str(start_dir / default_name),
+                "NumPy archive (*.npz);;All files (*)",
+            )
+            if not save_path:
+                return
+            output_path = Path(save_path)
+            if output_path.suffix.lower() != ".npz":
+                output_path = output_path.with_suffix(".npz")
+            try:
+                np.savez(output_path, **{str(key): value for key, value in full_payload.items()})
+            except Exception as exc:
+                viewer.statusBar().showMessage(f"Failed to write NPZ: {exc}")
+                return
+            viewer.statusBar().showMessage(f"Wrote corrected NPZ to {output_path.name}.")
+            return
+
         try:
             matrix, selected_key = viewer._matrix_for_entry(entry)
         except Exception as exc:
@@ -401,11 +425,14 @@ class WorkspaceMatrixController:
         cols = min(viewer._export_grid_columns, len(plot_items))
         rows = int(math.ceil(len(plot_items) / cols))
         export_figure = figure_class(figsize=(4 * cols, 4 * rows))
+        export_figure.patch.set_facecolor("white")
         axes = export_figure.subplots(rows, cols)
         if isinstance(axes, np.ndarray):
             flat_axes = axes.flatten()
         else:
             flat_axes = [axes]
+        for ax in flat_axes:
+            ax.set_facecolor("white")
 
         rotate = viewer._export_grid_rotate
         for idx, plot_item in enumerate(plot_items):
@@ -428,7 +455,16 @@ class WorkspaceMatrixController:
             ax.axis("off")
 
         export_figure.tight_layout()
-        export_figure.savefig(str(output_path))
+        output_format = (output_path.suffix or ".pdf").lstrip(".").lower() or "pdf"
+        export_figure.savefig(
+            str(output_path),
+            format=output_format,
+            bbox_inches="tight",
+            dpi=600,
+            facecolor="white",
+            edgecolor="none",
+            transparent=False,
+        )
 
         if skipped:
             viewer.statusBar().showMessage(

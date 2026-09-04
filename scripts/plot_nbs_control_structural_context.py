@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import inspect
 import json
 import os
 import re
-import site
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +41,8 @@ SHOW_FIGURES_REQUESTED = "--show_figures" in sys.argv
 if not SHOW_FIGURES_REQUESTED:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
 from nilearn import plotting
@@ -52,100 +52,6 @@ from scipy import stats
 ########## LOCAL HELPERS ##########
 RICHCLUB_DENSITIES = [0.01, 0.05, 0.10, 0.20]
 
-
-def _candidate_toolbox_roots() -> list[Path]:
-    candidates: list[Path] = []
-    seen: set[str] = set()
-
-    def add_candidate(root: Path | None) -> None:
-        if root is None:
-            return
-        try:
-            resolved = root.expanduser().resolve()
-        except Exception:
-            resolved = root.expanduser()
-        key = str(resolved)
-        if key in seen:
-            return
-        seen.add(key)
-        candidates.append(resolved)
-
-    add_candidate(VIEWER_ROOT / "mrsitoolbox")
-    add_candidate(VIEWER_ROOT.parent / "mrsitoolbox")
-    add_candidate(VIEWER_ROOT)
-    add_candidate(Path.cwd())
-    add_candidate(Path.cwd() / "mrsitoolbox")
-
-    for env_name in ("MRSITOOLBOX_ROOT", "DEVANALYSEPATH"):
-        env_value = str(os.getenv(env_name) or "").strip()
-        if not env_value:
-            continue
-        env_root = Path(env_value)
-        add_candidate(env_root / "mrsitoolbox")
-        add_candidate(env_root)
-
-    search_paths: list[str] = [entry for entry in sys.path if entry]
-    try:
-        search_paths.extend(site.getsitepackages())
-    except Exception:
-        pass
-    try:
-        user_site = site.getusersitepackages()
-    except Exception:
-        user_site = ""
-    if user_site:
-        search_paths.append(user_site)
-
-    for entry in search_paths:
-        path_entry = Path(entry).expanduser()
-        add_candidate(path_entry)
-        if path_entry.name == "connectomics":
-            add_candidate(path_entry.parent)
-
-    try:
-        import connectomics as connectomics_pkg  # type: ignore
-    except Exception:
-        pass
-    else:
-        module_path = Path(getattr(connectomics_pkg, "__file__", "")).resolve()
-        add_candidate(module_path.parent.parent)
-
-    try:
-        import mrsitoolbox as mrsitoolbox_pkg  # type: ignore
-    except Exception:
-        pass
-    else:
-        module_path = Path(getattr(mrsitoolbox_pkg, "__file__", "")).resolve()
-        add_candidate(module_path.parent)
-        add_candidate(module_path.parent.parent)
-
-    return candidates
-
-
-def _fallback_random_graph_richclub(args: tuple[np.ndarray, np.ndarray, int]) -> list[float]:
-    import networkx as nx
-
-    adj_matrix, degrees, nswap = args
-    graph = nx.from_numpy_array(np.asarray(adj_matrix, dtype=int))
-    if graph.number_of_edges() > 1:
-        swaps = max(int(nswap) * max(graph.number_of_edges(), 1), 1)
-        max_tries = max(swaps * 10, 100)
-        try:
-            nx.double_edge_swap(graph, nswap=swaps, max_tries=max_tries)
-        except Exception:
-            pass
-
-    rc_dict = nx.rich_club_coefficient(graph, normalized=False)
-    degree_dict = dict(graph.degree())
-    rc_rand: list[float] = []
-    for k in np.asarray(degrees, dtype=int).tolist():
-        if sum(1 for degree in degree_dict.values() if degree >= int(k)) < 2:
-            rc_rand.append(np.nan)
-        else:
-            rc_rand.append(float(rc_dict.get(int(k), np.nan)))
-    return rc_rand
-
-
 def _get_degree_per_node(adjacency_matrix: np.ndarray) -> np.ndarray:
     adjacency = np.asarray(adjacency_matrix)
     if adjacency.ndim != 2 or adjacency.shape[0] != adjacency.shape[1]:
@@ -153,209 +59,27 @@ def _get_degree_per_node(adjacency_matrix: np.ndarray) -> np.ndarray:
     return np.asarray(np.count_nonzero(adjacency, axis=1), dtype=int)
 
 
-class _FallbackNetBasedAnalysis:
-    @staticmethod
-    def threshold_density(matrix: np.ndarray, density: float) -> float:
-        if density < 0 or density > 1:
-            raise ValueError("Density must be a value between 0 and 1.")
-        flattened = np.asarray(matrix, dtype=float).flatten()
-        flattened = flattened[np.isfinite(flattened)]
-        if flattened.size == 0:
-            return np.inf
-        num_elements = max(1, int(np.ceil(float(density) * len(flattened))))
-        return float(np.partition(flattened, -num_elements)[-num_elements])
-
-    def binarize(
-        self,
-        simmatrix: np.ndarray,
-        threshold: float,
-        mode: str = "abs",
-        threshold_mode: str = "value",
-        binarize: bool = True,
-    ) -> np.ndarray:
-        binarized = np.zeros(simmatrix.shape, dtype=float)
-
-        if threshold_mode == "density":
-            threshold = self.threshold_density(simmatrix, threshold)
-
-        if mode == "posneg":
-            valid = np.abs(simmatrix) >= threshold
-            if binarize:
-                binarized[valid] = np.sign(simmatrix[valid])
-            else:
-                binarized[valid] = simmatrix[valid]
-        elif mode == "abs":
-            valid = np.abs(simmatrix) > threshold
-            if binarize:
-                binarized[valid] = 1
-            else:
-                binarized[valid] = simmatrix[valid]
-        elif mode == "pos":
-            valid = simmatrix >= threshold
-            if binarize:
-                binarized[valid] = 1
-            else:
-                binarized[valid] = simmatrix[valid]
-        elif mode == "neg":
-            valid = simmatrix <= threshold
-            if binarize:
-                binarized[valid] = 1
-            else:
-                binarized[valid] = simmatrix[valid]
-        else:
-            raise ValueError(f"Unsupported binarization mode: {mode}")
-
-        return binarized
-
-    def get_degree_per_node(self, adjacency_matrix: np.ndarray) -> list[int]:
-        return _get_degree_per_node(adjacency_matrix).tolist()
-
-    def compute_richclub_stats(
-        self,
-        adj_matrix: np.ndarray,
-        num_random: int = 100,
-        alpha: float = 0.05,
-        nswap: int = 15,
-        null_model: str = "random",
-        node_centroids=None,
-        node_weights=None,
-        edge_density=None,
-        n_jobs: int = 16,
-    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-        import networkx as nx
-        from multiprocessing import Pool, cpu_count
-
-        if null_model != "random":
-            print(
-                "Warning: bundled NetBasedAnalysis fallback only supports the random null model; using random.",
-                flush=True,
-            )
-
-        adj_matrix = np.asarray(adj_matrix > 0, dtype=int)
-        graph_obs = nx.from_numpy_array(adj_matrix)
-        rc_obs_dict = nx.rich_club_coefficient(graph_obs, normalized=False)
-        degree_dict = dict(graph_obs.degree())
-
-        valid_thresholds: list[int] = []
-        obs_rc: list[float] = []
-        for k in sorted(rc_obs_dict.keys()):
-            if sum(1 for degree in degree_dict.values() if degree >= k) < 2:
-                continue
-            valid_thresholds.append(int(k))
-            obs_rc.append(float(rc_obs_dict[k]))
-
-        degrees = np.asarray(valid_thresholds, dtype=int)
-        rc_coefficients = np.asarray(obs_rc, dtype=float)
-        if degrees.size == 0:
-            empty = np.empty((0, int(num_random)), dtype=float)
-            return degrees, rc_coefficients, {
-                "null_dist": empty,
-                "median": np.empty(0, dtype=float),
-                "lower": np.empty(0, dtype=float),
-                "upper": np.empty(0, dtype=float),
-                "pvalue": np.empty(0, dtype=float),
-            }
-
-        args_list = [(adj_matrix, degrees, int(nswap)) for _ in range(int(num_random))]
-        if n_jobs is None:
-            n_workers = cpu_count()
-        else:
-            n_workers = max(1, min(int(n_jobs), cpu_count()))
-
-        if n_workers == 1 or int(num_random) <= 1:
-            rand_rc_list = [_fallback_random_graph_richclub(args) for args in args_list]
-        else:
-            with Pool(processes=n_workers) as pool:
-                rand_rc_list = pool.map(_fallback_random_graph_richclub, args_list)
-
-        rand_rc_all = np.asarray(rand_rc_list, dtype=float).T
-        median_random_rc = np.asarray([np.nanmedian(np.unique(row)) for row in rand_rc_all], dtype=float)
-        lower_bound = np.asarray([np.nanpercentile(np.unique(row), (float(alpha) / 2.0) * 100.0) for row in rand_rc_all], dtype=float)
-        upper_bound = np.asarray([np.nanpercentile(np.unique(row), (1.0 - float(alpha) / 2.0) * 100.0) for row in rand_rc_all], dtype=float)
-
-        p_values = np.zeros(len(degrees), dtype=float)
-        for idx in range(len(degrees)):
-            valid_samples = ~np.isnan(rand_rc_all[idx, :])
-            if np.any(valid_samples):
-                count_ge = np.sum(rand_rc_all[idx, valid_samples] >= rc_coefficients[idx])
-                p_values[idx] = (count_ge + 1) / (np.sum(valid_samples) + 1)
-            else:
-                p_values[idx] = np.nan
-
-        return degrees, rc_coefficients, {
-            "null_dist": rand_rc_all,
-            "median": median_random_rc,
-            "lower": lower_bound,
-            "upper": upper_bound,
-            "pvalue": p_values,
-        }
-
-
-def _load_netbasedanalysis() -> tuple[type, Path | None]:
-    import_errors: list[str] = []
-
-    try:
-        from connectomics.network import NetBasedAnalysis as imported_nba  # type: ignore
-        import connectomics.network as network_module  # type: ignore
-    except Exception as exc:
-        import_errors.append(f"import connectomics.network failed: {exc}")
-    else:
-        module_path = Path(getattr(network_module, "__file__", "")).resolve()
-        return imported_nba, module_path.parent.parent
-
+def _load_netbasedanalysis() -> type:
     try:
         from mrsitoolbox.connectomics.network import NetBasedAnalysis as imported_nba  # type: ignore
-        import mrsitoolbox.connectomics.network as network_module  # type: ignore
-    except Exception as exc:
-        import_errors.append(f"import mrsitoolbox.connectomics.network failed: {exc}")
-    else:
-        module_path = Path(getattr(network_module, "__file__", "")).resolve()
-        return imported_nba, module_path.parent.parent.parent
-
-    roots = _candidate_toolbox_roots()
-    searched: list[str] = []
-    load_errors: list[str] = []
-    for toolbox_root in roots:
-        candidate_paths = (
-            toolbox_root / "connectomics" / "network.py",
-            toolbox_root / "mrsitoolbox" / "connectomics" / "network.py",
+    except ImportError as exc:
+        raise ImportError(
+            "Structural context analysis requires the current mrsitoolbox pip package "
+            "with mrsitoolbox.connectomics.network.NetBasedAnalysis. "
+            "Install or upgrade it with: pip install --upgrade mrsitoolbox"
+        ) from exc
+    required_methods = ("binarize", "compute_richclub_stats")
+    missing_methods = [name for name in required_methods if not hasattr(imported_nba, name)]
+    if missing_methods:
+        raise ImportError(
+            "Structural context analysis requires a newer mrsitoolbox pip package. "
+            f"NetBasedAnalysis is missing: {', '.join(missing_methods)}. "
+            "Install or upgrade it with: pip install --upgrade mrsitoolbox"
         )
-        for network_path in candidate_paths:
-            searched.append(str(network_path))
-            if not network_path.exists():
-                continue
-            module_root = network_path.parent.parent
-            if network_path.parent.parent.name == "mrsitoolbox":
-                module_root = network_path.parent.parent.parent
-            if str(module_root) not in sys.path:
-                sys.path.insert(0, str(module_root))
-            spec = importlib.util.spec_from_file_location("mrsi_local_network", network_path)
-            if spec is None or spec.loader is None:
-                load_errors.append(f"{network_path}: could not build import spec")
-                continue
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            try:
-                spec.loader.exec_module(module)
-            except Exception as exc:
-                load_errors.append(f"{network_path}: {exc}")
-                continue
-            return module.NetBasedAnalysis, module_root
+    return imported_nba
 
-    details: list[str] = []
-    details.extend(import_errors)
-    if searched:
-        details.append("Tried:\n" + "\n".join(searched))
-    if load_errors:
-        details.append("Load errors:\n" + "\n".join(load_errors))
-    if details:
-        print("Warning: could not load NetBasedAnalysis from mrsitoolbox; using bundled fallback.", flush=True)
-        print("Warning details:\n" + "\n".join(details), flush=True)
-    return _FallbackNetBasedAnalysis, None
 
-NetBasedAnalysis, MRSITOOLBOX_ROOT = _load_netbasedanalysis()
-if MRSITOOLBOX_ROOT is not None and str(MRSITOOLBOX_ROOT) not in sys.path:
-    sys.path.insert(0, str(MRSITOOLBOX_ROOT))
+NetBasedAnalysis = _load_netbasedanalysis()
 
 
 @dataclass
@@ -949,6 +673,7 @@ EDGE_CLASS_THRESHOLDS = [2, 5, 10, 20]
 MAIN_HUB_THRESHOLD = 10
 CONTROL_VALUE = 0
 DEFAULT_RICHCLUB_DENSITY = float(RICHCLUB_DENSITIES[min(2, len(RICHCLUB_DENSITIES) - 1)]) if len(RICHCLUB_DENSITIES) else 0.10
+RICHCLUB_OVERLAY_REFERENCE_DENSITIES = [0.02, 0.05, 0.20]
 RICHCLUB_NUM_RANDOM = 100
 RICHCLUB_ALPHA = 0.05
 RICHCLUB_N_JOBS = 16
@@ -960,6 +685,12 @@ BRAIN_NODE_COLOR = "#d95f02"
 SCATTER_COLOR = "#2c7fb8"
 SCATTER_LINE_COLOR = "#253494"
 NULL_BAND_COLOR = "#bdbdbd"
+RICHCLUB_DENSITY_COLORS = {
+    0.02: "#1b9e77",
+    0.05: "#377eb8",
+    0.10: "#d95f02",
+    0.20: "#7570b3",
+}
 NBS_GROUP_COLORS = {
     "NBS nodes": "#c44e52",
     "Non-NBS nodes": "#4c72b0",
@@ -1028,11 +759,10 @@ def _compose_subplot_panel_figure(
     panel_specs = [
         ("A", "metabolic_nbs_subnetwork", "Metabolic NBS subnetwork", (0, slice(0, 3))),
         ("B", "control_structural_strength", "Control structural node strength", (0, slice(3, 6))),
-        ("C", "control_richclub_curve", "Control rich-club curve", (1, slice(0, 4))),
-        ("", "reference_matrix", "Reference matrix", (1, slice(4, 6))),
-        ("D", "strength_violin", "Structural strength in NBS vs non-NBS nodes", (2, slice(0, 2))),
-        ("E", "hub_enrichment", "Hub enrichment across thresholds", (2, slice(2, 4))),
-        ("F", "edge_class_enrichment", "Structural class of NBS edges", (2, slice(4, 6))),
+        ("", "reference_matrix", "Reference matrix", (1, slice(0, 2))),
+        ("D", "strength_violin", "Structural strength in NBS vs non-NBS nodes", (1, slice(2, 4))),
+        ("E", "hub_enrichment", "Hub enrichment across thresholds", (1, slice(4, 6))),
+        ("F", "edge_class_enrichment", "Structural class of NBS edges", (2, slice(1, 5))),
     ]
 
     def _draw_panel_figure(fig: plt.Figure) -> None:
@@ -1050,11 +780,11 @@ def _compose_subplot_panel_figure(
             ax.set_title(title_text, fontsize=FONTSIZE, pad=10)
             ax.axis("off")
 
-    fig = plt.figure(figsize=(24, 18))
+    fig = plt.figure(figsize=(24, 16))
     _draw_panel_figure(fig)
     output_paths = _save_matplotlib_figure(fig, output_stem)
     if show:
-        fig_show = plt.figure(figsize=(24, 18))
+        fig_show = plt.figure(figsize=(24, 16))
         _draw_panel_figure(fig_show)
         plt.show()
         plt.close(fig_show)
@@ -1393,6 +1123,7 @@ def compute_control_richclub_curve(
     nba = NetBasedAnalysis()
     matrix = _symmetrize_matrix(control_average_matrix)
     density = float(density)
+    weight_threshold = float(nba.threshold_density(matrix, density))
     adj = nba.binarize(
         matrix,
         threshold=density,
@@ -1420,9 +1151,11 @@ def compute_control_richclub_curve(
 
     n_possible_edges = adj.shape[0] * max(adj.shape[0] - 1, 0) / 2.0
     actual_density = float(np.triu(adj, k=1).sum() / n_possible_edges) if n_possible_edges > 0 else np.nan
+    n_nodes = int(adj.shape[0])
     records: list[dict[str, object]] = []
     for idx, k in enumerate(degrees.tolist()):
         hub_node_count = int(np.sum(node_degree >= int(k)))
+        hub_node_fraction = float(hub_node_count / n_nodes) if n_nodes > 0 else np.nan
         p_value = float(p_values[idx]) if idx < len(p_values) and np.isfinite(p_values[idx]) else np.nan
         records.append(
             {
@@ -1433,15 +1166,62 @@ def compute_control_richclub_curve(
                 "upper_random_rc": float(upper_rand_rc[idx]) if idx < len(upper_rand_rc) and np.isfinite(upper_rand_rc[idx]) else np.nan,
                 "p_value": p_value,
                 "is_significant_k": int(np.isfinite(p_value) and p_value <= float(alpha)),
+                "n_nodes": n_nodes,
                 "hub_node_count": hub_node_count,
+                "hub_node_fraction": hub_node_fraction,
+                "hub_node_fraction_percent": float(100.0 * hub_node_fraction) if np.isfinite(hub_node_fraction) else np.nan,
                 "requested_density": density,
                 "requested_density_percent": float(100.0 * density),
                 "actual_density": actual_density,
                 "actual_density_percent": float(100.0 * actual_density) if np.isfinite(actual_density) else np.nan,
+                "binarization_weight_threshold": weight_threshold,
             }
         )
 
     return pd.DataFrame.from_records(records)
+
+
+def compute_control_richclub_curves(
+    control_average_matrix: np.ndarray,
+    densities: list[float],
+    num_random: int,
+    alpha: float,
+    n_jobs: int,
+) -> pd.DataFrame:
+    density_values = sorted({float(val) for val in densities})
+    density_frames = []
+    for density in density_values:
+        density_frames.append(
+            compute_control_richclub_curve(
+                control_average_matrix=control_average_matrix,
+                density=density,
+                num_random=int(num_random),
+                alpha=float(alpha),
+                n_jobs=int(n_jobs),
+            )
+        )
+    if not density_frames:
+        return pd.DataFrame()
+    return pd.concat(density_frames, ignore_index=True)
+
+
+def _format_richclub_curve_note(richclub_curve_df: pd.DataFrame) -> str:
+    plot_df = richclub_curve_df.sort_values("k").reset_index(drop=True)
+    if plot_df.empty:
+        return "No rich-club data"
+    density_pct = float(plot_df["requested_density_percent"].iloc[0])
+    actual_pct = float(plot_df["actual_density_percent"].iloc[0])
+    cutoff = float(plot_df["binarization_weight_threshold"].iloc[0])
+    significant_df = plot_df.loc[plot_df["is_significant_k"].astype(int) > 0]
+    if significant_df.empty:
+        sig_text = "No RC-significant k"
+    else:
+        sig_text = f"RC-significant k={int(significant_df['k'].min())}-{int(significant_df['k'].max())}"
+    return (
+        f"density={density_pct:.1f}% (actual {actual_pct:.1f}%)\n"
+        f"|w|>{cutoff:.3g}\n"
+        f"{sig_text}"
+    )
 
 
 ########## PLOTTING ##########
@@ -1528,56 +1308,68 @@ def plot_control_richclub_curve(
     richclub_curve_df: pd.DataFrame,
     output_stem: Path,
 ) -> dict[str, str]:
-    fig, ax = plt.subplots(figsize=(18.0, 4.8))
-    plot_df = richclub_curve_df.sort_values("k").reset_index(drop=True)
-    x = plot_df["k"].to_numpy(dtype=float)
-    y = plot_df["richclub_coefficient"].to_numpy(dtype=float)
-    null_low = plot_df["lower_random_rc"].to_numpy(dtype=float)
-    null_med = plot_df["median_random_rc"].to_numpy(dtype=float)
-    null_high = plot_df["upper_random_rc"].to_numpy(dtype=float)
-    significant_mask = plot_df["is_significant_k"].to_numpy(dtype=int) > 0
+    plot_df = richclub_curve_df.sort_values(["requested_density", "k"]).reset_index(drop=True)
+    density_values = sorted(np.unique(plot_df["requested_density"].to_numpy(dtype=float)).tolist())
+    fig, axes = plt.subplots(2, 2, figsize=(18.0, 12.5), sharey=True)
+    axes = np.asarray(axes).reshape(-1)
+    legend_handles = [
+        Patch(facecolor=NULL_BAND_COLOR, edgecolor=NULL_BAND_COLOR, alpha=0.25, label="Null 95% interval"),
+        Line2D([0], [0], linestyle="--", color="black", linewidth=1.6, label="Null median"),
+        Line2D([0], [0], linestyle="-", color="black", linewidth=LINEWIDTH, label="Control network"),
+        Line2D([0], [0], marker="o", linestyle="None", color="black", markersize=8, label="RC-significant k"),
+    ]
 
-    ax.fill_between(
-        x,
-        null_low,
-        null_high,
-        color=NULL_BAND_COLOR,
-        alpha=0.45,
-        label="Null 95% interval",
-    )
-    ax.plot(
-        x,
-        null_med,
-        linestyle="--",
-        color="black",
-        linewidth=1.8,
-        label="Null median",
-    )
-    ax.plot(
-        x,
-        y,
-        color=SCATTER_LINE_COLOR,
-        linewidth=LINEWIDTH,
-        label="Control network",
-    )
-    if np.any(significant_mask):
-        ax.scatter(
-            x[significant_mask],
-            y[significant_mask],
-            color=SCATTER_LINE_COLOR,
-            s=100,
-            zorder=3,
-            label="RC-significant k",
+    for ax, density in zip(axes, density_values):
+        density_df = plot_df.loc[np.isclose(plot_df["requested_density"].to_numpy(dtype=float), density)].sort_values("k").reset_index(drop=True)
+        x = density_df["k"].to_numpy(dtype=float)
+        y = density_df["richclub_coefficient"].to_numpy(dtype=float)
+        null_low = density_df["lower_random_rc"].to_numpy(dtype=float)
+        null_med = density_df["median_random_rc"].to_numpy(dtype=float)
+        null_high = density_df["upper_random_rc"].to_numpy(dtype=float)
+        significant_mask = density_df["is_significant_k"].to_numpy(dtype=int) > 0
+        color = RICHCLUB_DENSITY_COLORS.get(round(float(density), 4), SCATTER_LINE_COLOR)
+
+        ax.fill_between(x, null_low, null_high, color=color, alpha=0.25, zorder=1)
+        ax.plot(x, null_med, linestyle="--", color=color, linewidth=1.4, alpha=0.7, zorder=2)
+        ax.plot(x, y, color=color, linewidth=LINEWIDTH, alpha=0.95, zorder=3)
+        if np.any(significant_mask):
+            ax.scatter(x[significant_mask], y[significant_mask], color=color, s=85, zorder=4)
+
+        tick_values = _sparse_integer_ticks(np.rint(x).astype(int), step=RICHCLUB_K_TICK_STEP)
+        ax.set_xticks(tick_values)
+        if x.size > 0:
+            ax.set_xlim(float(np.nanmin(x)), float(np.nanmax(x)))
+        ax.set_ylim(bottom=0)
+        ax.set_title(f"{100.0 * float(density):.0f}% density", fontsize=FONTSIZE)
+        ax.set_xlabel("k", fontsize=FONTSIZE)
+        ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
+        ax.text(
+            0.02,
+            0.98,
+            _format_richclub_curve_note(density_df),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=TICK_FONTSIZE - 3,
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#d9d9d9", "alpha": 0.9},
         )
-    ax.set_xlabel("k", fontsize=FONTSIZE)
-    ax.set_ylabel("Rich-club coefficient", fontsize=FONTSIZE)
-    ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
-    tick_values = _sparse_integer_ticks(np.rint(x).astype(int), step=RICHCLUB_K_TICK_STEP)
-    ax.set_xticks(tick_values)
-    ax.set_xlim(float(np.nanmin(x)), float(np.nanmax(x)))
-    ax.set_ylim(bottom=0)
-    ax.legend(fontsize=TICK_FONTSIZE)
-    fig.tight_layout()
+
+    for idx, ax in enumerate(axes):
+        if idx >= len(density_values):
+            ax.axis("off")
+            continue
+        if idx % 2 == 0:
+            ax.set_ylabel("Rich-club coefficient", fontsize=FONTSIZE)
+
+    fig.suptitle("C. Control rich-club curves across densities", fontsize=FONTSIZE + 2, y=0.98)
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.93),
+        ncol=4,
+        fontsize=TICK_FONTSIZE,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
     return _save_matplotlib_figure(fig, output_stem)
 
 
@@ -1991,9 +1783,15 @@ def main() -> None:
 
     ########## COMPUTE CONTROL RICH-CLUB CURVE ##########
     print_section("COMPUTE CONTROL RICH-CLUB CURVE")
-    control_richclub_curve_df = compute_control_richclub_curve(
+    richclub_overlay_densities = sorted(
+        {
+            float(args.richclub_density),
+            *[float(val) for val in RICHCLUB_OVERLAY_REFERENCE_DENSITIES],
+        }
+    )
+    control_richclub_curve_df = compute_control_richclub_curves(
         control_average_matrix=control_average_matrix,
-        density=float(args.richclub_density),
+        densities=richclub_overlay_densities,
         num_random=int(args.richclub_num_random),
         alpha=float(args.richclub_alpha),
         n_jobs=int(args.richclub_n_jobs),
@@ -2087,7 +1885,7 @@ def main() -> None:
     )
     figure_outputs["control_richclub_curve"] = plot_control_richclub_curve(
         richclub_curve_df=control_richclub_curve_df,
-        output_stem=output_dir / "figure_3_control_structural_richclub_by_k",
+        output_stem=output_dir / "richlcub_curve",
     )
     figure_outputs["reference_matrix"] = plot_reference_matrix(
         reference_matrix=control_average_matrix,
