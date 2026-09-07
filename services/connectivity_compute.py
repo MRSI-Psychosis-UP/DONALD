@@ -96,6 +96,10 @@ class ComputeParams:
     overwrite: bool = False
     ignore_parcels: tuple = field(default_factory=tuple)
     engine: str = ENGINE_FAST
+    #: Metabolite names to drop before correlating. Matched case-insensitively
+    #: against each profile's own ``metabolites`` list, so a name absent from a
+    #: given file is simply a no-op for it rather than an error.
+    exclude_metabolites: tuple = field(default_factory=tuple)
 
 
 def _entity(name: str, key: str) -> str:
@@ -228,17 +232,34 @@ def _concentrations(block: np.ndarray, parcel_ids) -> dict:
     return {int(pid): np.asarray(block[i], dtype=float) for i, pid in enumerate(parcel_ids)}
 
 
-def compute_matrix(features, parcel_ids, params: ComputeParams, npert: int = 0, n_metabolites: int = 0, progress=None):
+def _excluded_metabolite_mask(metabolites, exclude_metabolites) -> np.ndarray:
+    """Boolean mask over ``metabolites``, True where the name is excluded.
+
+    Matching is case-insensitive and silently ignores names absent from this
+    particular profile, since different profiles can carry different
+    metabolite sets.
+    """
+    excluded = {str(name).strip().lower() for name in (exclude_metabolites or ())}
+    return np.array([str(m).strip().lower() in excluded for m in metabolites], dtype=bool)
+
+
+def compute_matrix(features, parcel_ids, params: ComputeParams, npert: int = 0, n_metabolites: int = 0, metabolites=None, progress=None):
     """Similarity matrix (and, in perturbation mode, its spread).
 
     ``progress`` is called as ``progress(done, total)`` so a caller can drive a
     bar; perturbation mode reports per perturbation, augmented mode is a single
     step because it is one correlation pass over the full feature vector.
 
+    ``metabolites`` (one name per feature-block column, before any npert
+    tiling) is used together with ``params.exclude_metabolites`` to drop
+    excluded metabolites' columns before correlating.
+
     Returns ``(matrix, pvalues, std)`` with ``std`` None outside perturbation
     mode.
     """
     features = np.asarray(features, dtype=float)
+    metabolites = list(metabolites or [])
+    keep_metabolite = ~_excluded_metabolite_mask(metabolites, params.exclude_metabolites) if metabolites else None
 
     if params.mode == MODE_PER_PERTURBATION:
         if npert <= 1 or n_metabolites <= 0:
@@ -252,6 +273,8 @@ def compute_matrix(features, parcel_ids, params: ComputeParams, npert: int = 0, 
         pvalue_stack = []
         for k in range(npert):
             block = features[:, k * n_metabolites : (k + 1) * n_metabolites]
+            if keep_metabolite is not None:
+                block = block[:, keep_metabolite]
             matrix, pvalues = _matrix_from_concentrations(
                 _concentrations(block, parcel_ids), params.correlation, params.ignore_parcels, params.engine
             )
@@ -265,8 +288,14 @@ def compute_matrix(features, parcel_ids, params: ComputeParams, npert: int = 0, 
         # it cannot be recovered from the mean alone.
         return stacked.mean(axis=0), np.stack(pvalue_stack).mean(axis=0), stacked.std(axis=0)
 
+    block = features
+    if keep_metabolite is not None and len(metabolites) > 0 and features.shape[1] % len(metabolites) == 0:
+        # Augmented mode: the same metabolite order repeats once per perturbation
+        # tile (npert==1 for files without perturbation), so tile the mask to match.
+        tiles = features.shape[1] // len(metabolites)
+        block = features[:, np.tile(keep_metabolite, tiles)]
     matrix, pvalues = _matrix_from_concentrations(
-        _concentrations(features, parcel_ids), params.correlation, params.ignore_parcels, params.engine
+        _concentrations(block, parcel_ids), params.correlation, params.ignore_parcels, params.engine
     )
     if progress:
         progress(1, 1)
@@ -303,15 +332,20 @@ def compute_profile(path: Path, params: ComputeParams, progress=None) -> dict:
         parcel_concentrations = data["parcel_concentrations"] if "parcel_concentrations" in data.files else None
 
     matrix, pvalues, std = compute_matrix(
-        features, parcel_ids, params, npert=npert, n_metabolites=len(metabolites), progress=progress
+        features, parcel_ids, params, npert=npert, n_metabolites=len(metabolites), metabolites=metabolites, progress=progress
     )
+
+    excluded_mask = _excluded_metabolite_mask(metabolites, params.exclude_metabolites) if metabolites else np.array([], dtype=bool)
+    kept_metabolites = [m for m, excluded in zip(metabolites, excluded_mask) if not excluded]
+    excluded_metabolites = [m for m, excluded in zip(metabolites, excluded_mask) if excluded]
 
     payload = {
         "matrix": matrix,
         "pvalues": pvalues,
         "labels_indices": np.asarray(parcel_ids),
         "parcel_names": parcel_names,
-        "metabolites": np.array(metabolites),
+        "metabolites": np.array(kept_metabolites or metabolites),
+        "excluded_metabolites": np.array(excluded_metabolites),
         "method": params.correlation,
         "engine": params.engine,
         "compute_mode": params.mode,
@@ -321,7 +355,10 @@ def compute_profile(path: Path, params: ComputeParams, progress=None) -> dict:
     if std is not None:
         payload["matrix_std"] = std
     if parcel_concentrations is not None:
-        payload["parcel_concentrations"] = parcel_concentrations
+        if excluded_metabolites and np.asarray(parcel_concentrations).shape[0] == len(metabolites):
+            payload["parcel_concentrations"] = np.asarray(parcel_concentrations)[~excluded_mask]
+        else:
+            payload["parcel_concentrations"] = parcel_concentrations
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out_path, **payload)

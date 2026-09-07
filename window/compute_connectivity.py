@@ -24,6 +24,7 @@ try:
         QDialog,
         QDialogButtonBox,
         QFormLayout,
+        QGridLayout,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -46,6 +47,7 @@ except Exception:  # PyQt5 fallback, matching the rest of the app
         QDialog,
         QDialogButtonBox,
         QFormLayout,
+        QGridLayout,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -212,6 +214,51 @@ class _ProfileRow(QWidget):
         self.status_label.setText(text)
 
 
+class _MetaboliteToggle(QWidget):
+    """One metabolite: a checkbox plus a red indicator lit while it is excluded.
+
+    The checkbox alone would make "included" the visually blank state, which
+    reads as "nothing decided yet" rather than "kept". The red box gives
+    exclusion a distinct, unmissable signal instead of relying on the user to
+    notice an unchecked box among checked ones.
+    """
+
+    toggled = pyqtSignal()
+
+    def __init__(self, name: str, parent=None):
+        super().__init__(parent)
+        self.name = name
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(6)
+        self.indicator = QLabel()
+        self.indicator.setFixedSize(12, 12)
+        self.check = QCheckBox(name)
+        self.check.setChecked(True)
+        self.check.toggled.connect(self._on_toggled)
+        layout.addWidget(self.indicator)
+        layout.addWidget(self.check)
+        layout.addStretch(1)
+        self._refresh_indicator()
+
+    def _on_toggled(self, _checked: bool) -> None:
+        self._refresh_indicator()
+        self.toggled.emit()
+
+    def _refresh_indicator(self) -> None:
+        excluded = not self.check.isChecked()
+        color = "#e63946" if excluded else "transparent"
+        border = "#e63946" if excluded else "#888888"
+        self.indicator.setStyleSheet(
+            f"background-color: {color}; border: 1px solid {border}; border-radius: 2px;"
+        )
+        self.indicator.setToolTip("Excluded from correlation" if excluded else "Included in correlation")
+
+    @property
+    def excluded(self) -> bool:
+        return not self.check.isChecked()
+
+
 class ComputeConnectivityDialog(QDialog):
     """Select metabolic profiles, set parameters, compute one matrix each."""
 
@@ -230,6 +277,7 @@ class ComputeConnectivityDialog(QDialog):
         self.resize(1000, 700)
         self._build_ui()
         self._populate()
+        self._populate_metabolites()
         self._apply_filters()
         self.set_theme(getattr(parent, "_theme_name", "Dark"))
 
@@ -275,6 +323,24 @@ class ComputeConnectivityDialog(QDialog):
 
         self.summary_label = QLabel("")
         layout.addWidget(self.summary_label)
+
+        self.metabolites_box = QGroupBox("Metabolites")
+        metabolites_outer = QVBoxLayout(self.metabolites_box)
+        metabolites_header = QHBoxLayout()
+        metabolites_header.addWidget(QLabel("Detected across the profiles above. Unchecked (red) metabolites are excluded from every computed matrix."))
+        metabolites_header.addStretch(1)
+        include_all_button = QPushButton("Include all")
+        include_all_button.clicked.connect(lambda: self._set_all_metabolites(True))
+        exclude_all_button = QPushButton("Exclude all")
+        exclude_all_button.clicked.connect(lambda: self._set_all_metabolites(False))
+        metabolites_header.addWidget(include_all_button)
+        metabolites_header.addWidget(exclude_all_button)
+        metabolites_outer.addLayout(metabolites_header)
+        self.metabolites_grid = QGridLayout()
+        self.metabolites_grid.setHorizontalSpacing(16)
+        metabolites_outer.addLayout(self.metabolites_grid)
+        self._metabolite_toggles = {}
+        layout.addWidget(self.metabolites_box)
 
         params_box = QGroupBox("Computation")
         form = QFormLayout(params_box)
@@ -358,6 +424,38 @@ class ComputeConnectivityDialog(QDialog):
             self.file_list.addItem(item)
         self.file_list.blockSignals(False)
 
+    def _populate_metabolites(self) -> None:
+        """Build one toggle per metabolite name seen across all candidate profiles.
+
+        Uses every candidate rather than just the currently-checked ones so
+        toggling file selection doesn't reshuffle or hide exclusion choices
+        already made; a name simply has no effect on a profile that lacks it.
+        """
+        while self.metabolites_grid.count():
+            item = self.metabolites_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._metabolite_toggles = {}
+
+        names = sorted({m for info in self._infos if info.ok for m in info.metabolites})
+        if not names:
+            self.metabolites_box.setVisible(False)
+            return
+        self.metabolites_box.setVisible(True)
+        columns = 4
+        for index, name in enumerate(names):
+            toggle = _MetaboliteToggle(name)
+            self._metabolite_toggles[name] = toggle
+            self.metabolites_grid.addWidget(toggle, index // columns, index % columns)
+
+    def _set_all_metabolites(self, included: bool) -> None:
+        for toggle in self._metabolite_toggles.values():
+            toggle.check.setChecked(included)
+
+    def excluded_metabolites(self):
+        return tuple(name for name, toggle in self._metabolite_toggles.items() if toggle.excluded)
+
     def _filter_tokens(self):
         return [t.strip().lower() for t in self.filter_edit.text().split(",") if t.strip()]
 
@@ -430,6 +528,7 @@ class ComputeConnectivityDialog(QDialog):
             mode=str(self.mode_combo.currentData()),
             n_parallel=int(self.nproc_spin.value()),
             overwrite=bool(self.overwrite_check.isChecked()),
+            exclude_metabolites=self.excluded_metabolites(),
         )
 
     def _start(self) -> None:

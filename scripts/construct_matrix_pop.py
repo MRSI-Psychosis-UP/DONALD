@@ -637,9 +637,19 @@ def main(con_path_list,covar_df,modality,matrix_outpath,
                     matrix = _collapse_square_matrix_entry(matrix_entry, selected_matrix_key, prefix)
                 parcel_concentrations = np.asarray(con_data["parcel_concentrations"])
                 profile = parcel_concentrations
-                metabolite_list = list(np.asarray(con_data["metabolites_leaveout"]).reshape(-1))
+                if "metabolites_leaveout" in con_data:
+                    metabolites_key = "metabolites_leaveout"
+                elif "metabolites" in con_data:
+                    metabolites_key = "metabolites"
+                else:
+                    raise ValueError(
+                        f"{prefix} has neither 'metabolites_leaveout' nor 'metabolites' key."
+                    )
+                metabolite_list = list(np.asarray(con_data[metabolites_key]).reshape(-1))
                 parcel_labels = np.asarray(con_data.get("labels_indices"))
-                parcel_names = np.asarray(con_data.get("labels"))
+                parcel_names = np.asarray(
+                    con_data["labels"] if "labels" in con_data else con_data.get("parcel_names")
+                )
                 npert = max(
                     npert,
                     extract_npert_from_shape(

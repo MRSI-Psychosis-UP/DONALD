@@ -15,24 +15,22 @@ if [[ ! -f "${SCRIPT_DIR}/${ENV_FILE}" ]]; then
     exit 1
 fi
 
-run_conda_classic() {
-    CONDA_SOLVER=classic CONDA_CHANNEL_PRIORITY=strict conda "$@"
+run_conda() {
+    CONDA_SOLVER=libmamba CONDA_CHANNEL_PRIORITY=strict conda "$@"
 }
 
 create_or_update_env() {
     cd "$SCRIPT_DIR"
-    if run_conda_classic env list | grep -qE "^\s*${ENV_NAME}\s"; then
+    if run_conda env list | grep -qE "^\s*${ENV_NAME}\s"; then
         echo "Updating '${ENV_NAME}' from ${ENV_FILE}..."
-        if ! run_conda_classic env update -n "${ENV_NAME}" -f "${ENV_FILE}" --prune --solver classic; then
+        if ! run_conda env update -n "${ENV_NAME}" -f "${ENV_FILE}" --prune --solver libmamba; then
             echo "Conda update failed."
-            echo "If you still see libmamba errors, run: conda config --set solver classic"
             exit 1
         fi
     else
         echo "Creating '${ENV_NAME}' from ${ENV_FILE}..."
-        if ! run_conda_classic env create -n "${ENV_NAME}" -f "${ENV_FILE}" --solver classic; then
+        if ! run_conda env create -n "${ENV_NAME}" -f "${ENV_FILE}" --solver libmamba; then
             echo "Conda create failed."
-            echo "If you still see libmamba errors, run: conda config --set solver classic"
             exit 1
         fi
     fi

@@ -81,23 +81,31 @@ def build_design_matrix(participants_df: pd.DataFrame,
     for cov in covariate_order:
         if cov in {"participant_id", "session_id"}:
             continue
-        if cov in available_cols:
-            df[cov] = pd.to_numeric(df[cov], errors="coerce")
-            numeric_covs.append(cov)
-        else:
+        if cov not in available_cols:
             raise ValueError(f"Covariate `{cov}` not found in participants dataframe.")
+        numeric_col = pd.to_numeric(df[cov], errors="coerce")
+        if numeric_col.notna().any() or df[cov].isna().all():
+            df[cov] = numeric_col
+        else:
+            # Non-numeric covariate (e.g. "Male"/"Female"): label-encode into stable
+            # numeric codes instead of silently coercing every value to NaN.
+            categories = sorted(df[cov].dropna().astype(str).str.strip().unique())
+            code_map = {label: float(i) for i, label in enumerate(categories)}
+            debug.info(f"Encoding categorical covariate `{cov}`: {code_map}")
+            df[cov] = df[cov].astype(str).str.strip().map(code_map)
+        numeric_covs.append(cov)
     subset_cols = ["participant_id", "session_id"] + numeric_covs
     df_valid = df.dropna(subset=subset_cols)
     if df_valid.empty:
         raise ValueError("No valid participant rows with requested covariates.")
     cov_lookup: dict[tuple[str, str], dict[str, float | str]] = {}
-    for row in df_valid.itertuples(index=False):
-        key = (row.participant_id, row.session_id)
-        entry = {"participant_id": row.participant_id}
+    for record in df_valid.to_dict("records"):
+        key = (record["participant_id"], record["session_id"])
+        entry = {"participant_id": record["participant_id"]}
         for cov in covariate_order:
             if cov in {"participant_id", "session_id"}:
                 continue
-            entry[cov] = getattr(row, cov, np.nan)
+            entry[cov] = record.get(cov, np.nan)
         cov_lookup[key] = entry
     cov_values: dict[str, list[float]] = {
         cov: [] for cov in covariate_order if cov not in {"participant_id", "session_id"}
