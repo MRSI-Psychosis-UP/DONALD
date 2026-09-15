@@ -5,7 +5,7 @@ from os.path import isfile, join
 import numpy as np
 import pandas as pd
 import nibabel as nib
-from nilearn import datasets
+from nilearn import datasets, plotting
 import re
 from collections import OrderedDict
 from glob import glob
@@ -45,6 +45,7 @@ console = Console()
 FONTSIZE = 22
 MAXLEN_NODE_NAME = 20
 SIMILARITY_PATH_RADII = {"left": 10.6, "right": 10.2}
+_OPEN_NILEARN_DISPLAYS = []
 
 
 def _combine_signed(values):
@@ -810,6 +811,141 @@ def _infer_component_side(mask: np.ndarray, t_matrix: np.ndarray) -> str:
         return "n/a"
 
 
+def _hemi_side(name: str) -> str:
+    lowered = str(name).lower()
+    tokens = [token for token in re.split(r"[^a-z0-9]+", lowered) if token]
+    if "lh" in tokens or "left" in tokens:
+        return "left"
+    if "rh" in tokens or "right" in tokens:
+        return "right"
+    return "unknown"
+
+
+def _filter_intrahemispheric_edges(edge_matrix, parcel_names):
+    matrix = np.asarray(edge_matrix, dtype=float).copy()
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        return matrix, 0, 0, 0
+    hemis = np.asarray([_hemi_side(name) for name in parcel_names], dtype=object)
+    same_hemi = (
+        (hemis[:, None] == hemis[None, :])
+        & np.isin(hemis[:, None], ["left", "right"])
+        & np.isin(hemis[None, :], ["left", "right"])
+    )
+    before = int(np.count_nonzero(np.triu(np.abs(matrix) > 0, k=1)))
+    matrix[~same_hemi] = 0.0
+    np.fill_diagonal(matrix, 0.0)
+    after = int(np.count_nonzero(np.triu(np.abs(matrix) > 0, k=1)))
+    unknown_nodes = int(np.count_nonzero(hemis == "unknown"))
+    return matrix, before - after, after, unknown_nodes
+
+
+def _plot_name_coords(plot_names, source_names, source_coords):
+    """Resolve displayed parcel names to MNI coordinates, averaging split parcels."""
+    source_names = [str(name) for name in source_names]
+    source_coords = np.asarray(source_coords, dtype=float)
+    exact_groups = {}
+    base_groups = {}
+    for idx, name in enumerate(source_names):
+        coord = source_coords[idx]
+        exact_groups.setdefault(name.lower(), []).append(coord)
+        base = re.sub(r"_(\d+)$", "", name)
+        base_groups.setdefault(base.lower(), []).append(coord)
+
+    coords = np.full((len(plot_names), 3), np.nan, dtype=float)
+    for idx, name in enumerate(plot_names):
+        key = str(name).lower()
+        values = exact_groups.get(key)
+        if values is None:
+            values = base_groups.get(key)
+        if values:
+            with np.errstate(invalid="ignore"):
+                coords[idx] = np.nanmean(np.asarray(values, dtype=float), axis=0)
+    return coords
+
+
+def _glassbrain_path_for_circle(circle_path):
+    root, ext = os.path.splitext(circle_path)
+    if root.endswith("_circle"):
+        root = root[: -len("_circle")] + "_glassbrain"
+    else:
+        root = root + "_glassbrain"
+    return root + ext
+
+
+def _save_nbs_glassbrain(
+    edge_matrix,
+    node_coords,
+    output_path,
+    theme="dark",
+    title=None,
+    keep_open=False,
+):
+    """Save a Nilearn glass-brain connectome for non-zero NBS edges."""
+    try:
+        matrix = np.asarray(edge_matrix, dtype=float)
+        coords = np.asarray(node_coords, dtype=float)
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            debug.warning("Glass brain skipped: edge matrix is not square.")
+            return False
+        if coords.ndim != 2 or coords.shape[0] != matrix.shape[0] or coords.shape[1] != 3:
+            debug.warning("Glass brain skipped: node coordinates do not match edge matrix.")
+            return False
+
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+        np.fill_diagonal(matrix, 0.0)
+        upper = np.triu(matrix, k=1)
+        lower_as_upper = np.triu(matrix.T, k=1)
+        upper = np.where(np.abs(upper) >= np.abs(lower_as_upper), upper, lower_as_upper)
+        matrix = upper + upper.T
+
+        finite_coords = np.all(np.isfinite(coords), axis=1)
+        if not np.all(finite_coords):
+            matrix[~finite_coords, :] = 0.0
+            matrix[:, ~finite_coords] = 0.0
+        edge_present = np.abs(matrix) > 0
+        degree = edge_present.sum(axis=0)
+        keep = finite_coords & (degree > 0)
+        if not np.any(keep):
+            debug.warning("Glass brain skipped: no NBS edges with valid MNI coordinates.")
+            return False
+
+        matrix = matrix[np.ix_(keep, keep)]
+        coords = coords[keep]
+        edge_abs_max = float(np.nanmax(np.abs(matrix))) if matrix.size else 0.0
+        if not np.isfinite(edge_abs_max) or edge_abs_max <= 0:
+            debug.warning("Glass brain skipped: NBS edge weights are all zero.")
+            return False
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        display = plotting.plot_connectome(
+            matrix,
+            coords,
+            node_color="#f2c14e" if theme == "dark" else "#1f77b4",
+            node_size=45,
+            edge_cmap="PiYG",
+            edge_vmin=-edge_abs_max,
+            edge_vmax=edge_abs_max,
+            display_mode="ortho",
+            title=title,
+            annotate=True,
+            black_bg=(theme == "dark"),
+            alpha=0.85,
+            colorbar=True,
+            edge_kwargs={"linewidth": 1.4},
+        )
+        display.savefig(output_path, dpi=300)
+        if keep_open:
+            _OPEN_NILEARN_DISPLAYS.append(display)
+        else:
+            display.close()
+        edge_count = int(np.count_nonzero(np.triu(np.abs(matrix) > 0, k=1)))
+        debug.success(f"Saved NBS glass brain ({edge_count} edges) to", output_path)
+        return True
+    except Exception as err:
+        debug.warning(f"Glass brain export failed: {err}")
+        return False
+
+
 # def main() -> None:
 parser = argparse.ArgumentParser(
     description="Inspect previously saved NBS component results and reload group connectivity data."
@@ -942,6 +1078,13 @@ parser.add_argument(
     "--collapse-parcels",
     action="store_true",
     help="Collapse parcel names ending with _<int> into base parcels before plotting.",
+)
+parser.add_argument(
+    "--intra-hemisphere-only",
+    "--intrahemispheric-only",
+    "--intrahemisphere-only",
+    action="store_true",
+    help="Show only intra-hemisphere edges (LH-LH and RH-RH) in exported NBS plots.",
 )
 parser.add_argument(
     "--exclude-parcel-substring",
@@ -1801,13 +1944,6 @@ if t_mat is not None and comp_mask is not None:
             f"Excluded {len(excluded_parcel_names)} circular-plot parcels by substring: "
             + ", ".join(excluded_parcel_names)
         )
-    def _hemi_side(name: str) -> str:
-        lowered = name.lower()
-        if "lh" in lowered or "left" in lowered: 
-            return "left"
-        if "rh" in lowered or "right" in lowered:
-            return "right"
-        return "unknown"
 
     left_idx = [i for i, name in enumerate(collapsed_names) if _hemi_side(name) == "left"]
     right_idx = [i for i, name in enumerate(collapsed_names) if _hemi_side(name) == "right"]
@@ -1837,6 +1973,23 @@ if t_mat is not None and comp_mask is not None:
             f"Replaced the NBS edge network with {matched_gm_edges} GM-adjacency "
             "edges among selected path parcels."
         )
+    if args.intra_hemisphere_only:
+        (
+            collapsed_matrix,
+            removed_inter_edges,
+            kept_intra_edges,
+            unknown_hemi_nodes,
+        ) = _filter_intrahemispheric_edges(collapsed_matrix, collapsed_names)
+        debug.info(
+            "Applied intra-hemisphere edge filter: "
+            f"kept {kept_intra_edges} LH-LH/RH-RH edges, "
+            f"removed {removed_inter_edges} inter/unknown-hemisphere edges."
+        )
+        has_edges = kept_intra_edges > 0
+        if unknown_hemi_nodes:
+            debug.warning(
+                f"{unknown_hemi_nodes} nodes had unknown hemisphere labels; their edges were hidden."
+            )
     edge_weight_matrix = np.array(collapsed_matrix, copy=True)
     cmap_nodes = color_loader.load_fsl_cmap(map="spectrum_iso", plotly=False)
     norm_nodes = plt.Normalize(
@@ -2018,9 +2171,33 @@ if t_mat is not None and comp_mask is not None:
         os.makedirs(os.path.dirname(os.path.abspath(plot_path_circle)), exist_ok=True)
         fig_circle.savefig(plot_path_circle, bbox_inches="tight", dpi=300)
         debug.success("Saved circular plot to", plot_path_circle)
+        glassbrain_path = _glassbrain_path_for_circle(plot_path_circle)
+        glassbrain_coords = _plot_name_coords(collapsed_names, parcel_names, centroids_world)
+        glassbrain_title = (
+            "Selected path GM-adjacency edges"
+            if path_edge_mode
+            else f"NBS component {component_idx} edges"
+        )
+        _save_nbs_glassbrain(
+            mat,
+            glassbrain_coords,
+            glassbrain_path,
+            theme=args.theme,
+            title=glassbrain_title,
+            keep_open=not args.no_show,
+        )
     show_figures = True
 else:
     debug.warning("Missing t-matrix or component mask; skipping connectivity circle plot.")
 
 if show_figures and not args.no_show:
-    plt.show()
+    debug.info("Displaying NBS circular plot and glass brain.")
+    try:
+        plt.show()
+    finally:
+        for display in _OPEN_NILEARN_DISPLAYS:
+            try:
+                display.close()
+            except Exception:
+                pass
+        _OPEN_NILEARN_DISPLAYS.clear()

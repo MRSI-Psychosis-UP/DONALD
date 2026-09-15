@@ -1015,6 +1015,12 @@ class NBSPrepareDialog(QDialog):
         self.display_collapse_check = QCheckBox("Collapse parcels")
         self.display_collapse_check.setChecked(False)
         output_grid.addWidget(self.display_collapse_check, 4, 0, 1, 2)
+        self.display_intra_hemi_check = QCheckBox("Intra-hemisphere edges only")
+        self.display_intra_hemi_check.setChecked(False)
+        self.display_intra_hemi_check.setToolTip(
+            "When exporting NBS plots, hide inter-hemisphere edges and show only LH-LH/RH-RH connections."
+        )
+        output_grid.addWidget(self.display_intra_hemi_check, 4, 2, 1, 2)
         layout.addWidget(output_group)
 
         run_group = QGroupBox("Run controls")
@@ -1802,6 +1808,7 @@ class NBSPrepareDialog(QDialog):
             ),
             "display_no_show": (not bool(self.display_results_check.isChecked())),
             "display_collapse_parcels": bool(self.display_collapse_check.isChecked()),
+            "display_intra_hemisphere_only": bool(self.display_intra_hemi_check.isChecked()),
             "display_regressor_type": self._selected_export_regressor_type(),
             "export_on_finish": bool(self.export_on_finish_check.isChecked()),
             "output_folder": self.output_dir_edit.text().strip(),
@@ -2052,8 +2059,10 @@ class NBSPrepareDialog(QDialog):
         prepend_paths = [viewer_root]
         toolbox_script_path = _find_covariate_balance_script(viewer_root_path)
         if toolbox_script_path is not None:
-            toolbox_import_root = str(toolbox_script_path.parents[1].parent)
-            prepend_paths.append(toolbox_import_root)
+            toolbox_package_root = toolbox_script_path.parents[1]
+            toolbox_import_root = toolbox_package_root.parent
+            prepend_paths.append(str(toolbox_package_root))
+            prepend_paths.append(str(toolbox_import_root))
         for candidate in reversed(prepend_paths):
             if candidate and candidate not in pythonpath_parts and Path(candidate).exists():
                 pythonpath_parts.insert(0, candidate)
@@ -2743,6 +2752,8 @@ class NBSPrepareDialog(QDialog):
             command.append("--no-show")
         if self.display_collapse_check.isChecked():
             command.append("--collapse-parcels")
+        if self.display_intra_hemi_check.isChecked():
+            command.append("--intra-hemisphere-only")
         regressor_name = (self._regressor_name() or "").strip()
         if regressor_name:
             regressor_spec = regressor_name
