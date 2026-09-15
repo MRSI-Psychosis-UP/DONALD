@@ -11,6 +11,7 @@ import numpy as np
 
 import services.gradient_dialog_controller as gradient_module
 from services.gradient_dialog_controller import GradientDialogController
+from window.gradient_surface import GradientSurfaceDialog
 from window.gradients_prepare import GradientsPrepareDialog
 from window.plot_msmode import GradientScatterDialog
 
@@ -66,6 +67,7 @@ class _ViewerStub:
         self._gradient_precomputed_bundle = None
         self._gradient_precomputed_selected_row = None
         self._gradient_use_precomputed_bundle = False
+        self._gradient_surface_style = "smooth"
         self._active_parcellation_path = Path("/tmp/template.nii.gz")
         self._active_parcellation_img = _TemplateImageStub()
         self._active_parcellation_data = np.asarray(
@@ -162,6 +164,7 @@ class GradientDialogControllerTests(unittest.TestCase):
 
         self.assertIs(viewer._open_gradients_dialog.__self__, viewer)
         self.assertEqual(viewer._normalize_gradient_surface_mesh("bad-mesh"), "fsaverage4")
+        self.assertEqual(viewer._normalize_gradient_surface_style("parcel boundary"), "parcel_outlines")
 
     def test_classification_scatter_call_sets_default_proximity_keywords(self):
         source = textwrap.dedent(inspect.getsource(GradientDialogController._classify_gradients_fsaverage))
@@ -206,6 +209,86 @@ class GradientDialogControllerTests(unittest.TestCase):
         self.assertIn("self.set_preload_matching_paths(False)", init_source)
         self.assertIn('QCheckBox("Preload matching saved path")', ui_source)
         self.assertIn("self._refresh_action_state()", setter_source)
+
+    def test_surface_style_control_exposes_parcel_outlines(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        callback_source = inspect.getsource(GradientsPrepareDialog._on_surface_style_changed)
+
+        self.assertIn("surface_style_changed_callback", init_source)
+        self.assertIn('"Parcel outlines"', ui_source)
+        self.assertIn("selected_surface_style", callback_source)
+
+    def test_surface_style_normalizes_parcel_outline_aliases(self):
+        self.assertEqual(
+            GradientSurfaceDialog._normalize_surface_style("parcel boundary"),
+            "parcel_outlines",
+        )
+        self.assertEqual(
+            GradientSurfaceDialog._normalize_surface_style("bad-style"),
+            "smooth",
+        )
+
+    def test_boundary_segments_use_unique_edges_between_different_labels(self):
+        coords = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            dtype=float,
+        )
+        faces = np.asarray([[0, 1, 2], [2, 1, 3]], dtype=int)
+        labels = np.asarray([1, 2, 1, 2], dtype=float)
+
+        segments = GradientSurfaceDialog._boundary_segments_from_labels((coords, faces), labels)
+
+        self.assertEqual(segments.shape, (3, 2, 3))
+        edge_keys = {
+            tuple(sorted(tuple(point) for point in segment.tolist()))
+            for segment in segments
+        }
+        self.assertEqual(len(edge_keys), 3)
+
+    def test_filled_label_texture_replaces_empty_vertices_with_nearest_label(self):
+        coords = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        )
+        faces = np.asarray([[0, 1, 2], [1, 2, 3]], dtype=int)
+        labels = np.asarray([1.0, 0.0, 2.0, np.nan], dtype=float)
+
+        filled = GradientSurfaceDialog._filled_label_texture((coords, faces), labels)
+
+        np.testing.assert_array_equal(filled, np.asarray([1.0, 1.0, 2.0, 2.0]))
+
+    def test_filled_surface_texture_prefers_same_parcel_values(self):
+        coords = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        )
+        faces = np.asarray([[0, 1, 2], [1, 2, 3]], dtype=int)
+        values = np.asarray([10.0, np.nan, 20.0, np.nan], dtype=float)
+        labels = np.asarray([1.0, 1.0, 2.0, 2.0], dtype=float)
+
+        filled = GradientSurfaceDialog._filled_surface_texture(
+            (coords, faces),
+            values,
+            label_texture=labels,
+        )
+
+        np.testing.assert_array_equal(filled, np.asarray([10.0, 10.0, 20.0, 20.0]))
 
     def test_project_paths_callback_receives_selected_path_only(self):
         dialog = GradientScatterDialog.__new__(GradientScatterDialog)

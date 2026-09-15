@@ -51,6 +51,7 @@ class GradientDialogController:
         '_current_gradient_component_count',
         '_normalize_gradient_hemisphere_mode',
         '_normalize_gradient_surface_mesh',
+        '_normalize_gradient_surface_style',
         '_normalize_gradient_surface_render_count',
         '_normalize_gradient_surface_procrustes',
         '_normalize_gradient_classification_component',
@@ -67,6 +68,7 @@ class GradientDialogController:
         '_gradient_surface_procrustes_available',
         '_selected_gradient_hemisphere_mode',
         '_selected_gradient_surface_mesh',
+        '_selected_gradient_surface_style',
         '_selected_gradient_surface_render_count',
         '_selected_gradient_surface_procrustes',
         '_selected_gradient_classification_surface_mesh',
@@ -105,6 +107,7 @@ class GradientDialogController:
         '_on_gradient_colormap_changed',
         '_on_gradient_hemisphere_changed',
         '_on_gradient_surface_mesh_changed',
+        '_on_gradient_surface_style_changed',
         '_on_gradient_surface_render_count_changed',
         '_on_gradient_surface_procrustes_changed',
         '_on_gradient_classification_surface_mesh_changed',
@@ -302,6 +305,13 @@ class GradientDialogController:
         if text not in valid:
             text = "fsaverage4"
         return text
+
+    @staticmethod
+    def _normalize_gradient_surface_style(value: str) -> str:
+        text = str(value or "smooth").strip().lower().replace("-", "_").replace(" ", "_")
+        if text in {"parcel", "parcels", "parcel_boundaries", "parcel_boundary", "parcel_outline", "parcel_outlines"}:
+            return "parcel_outlines"
+        return "smooth"
 
     @staticmethod
     def _normalize_gradient_surface_render_count(value, max_components=None) -> int:
@@ -547,6 +557,20 @@ class GradientDialogController:
                 pass
         self._gradient_surface_mesh = self._normalize_gradient_surface_mesh(self._gradient_surface_mesh)
         return self._gradient_surface_mesh
+
+    def _selected_gradient_surface_style(self) -> str:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_style"):
+            try:
+                self._gradient_surface_style = self._normalize_gradient_surface_style(
+                    dialog.selected_surface_style()
+                )
+            except Exception:
+                pass
+        self._gradient_surface_style = self._normalize_gradient_surface_style(
+            getattr(self, "_gradient_surface_style", "smooth")
+        )
+        return self._gradient_surface_style
 
     def _selected_gradient_surface_render_count(self) -> int:
         dialog = getattr(self, "_gradients_dialog", None)
@@ -1184,6 +1208,9 @@ class GradientDialogController:
 
     def _on_gradient_surface_mesh_changed(self, value: str) -> None:
         self._gradient_surface_mesh = self._normalize_gradient_surface_mesh(value)
+
+    def _on_gradient_surface_style_changed(self, value: str) -> None:
+        self._gradient_surface_style = self._normalize_gradient_surface_style(value)
 
     def _on_gradient_surface_render_count_changed(self, value: int) -> None:
         self._gradient_surface_render_count = self._normalize_gradient_surface_render_count(
@@ -2750,6 +2777,8 @@ class GradientDialogController:
         dialog.set_parcellation_path(self._active_parcellation_path)
         dialog.set_hemisphere_mode(self._selected_gradient_hemisphere_mode())
         dialog.set_surface_mesh(self._selected_gradient_surface_mesh())
+        if hasattr(dialog, "set_surface_style"):
+            dialog.set_surface_style(self._selected_gradient_surface_style())
         dialog.set_classification_surface_mesh(self._selected_gradient_classification_surface_mesh())
         dialog.set_classification_hemisphere_mode(self._selected_gradient_classification_hemisphere_mode())
         dialog.set_scatter_rotation(self._selected_gradient_scatter_rotation())
@@ -2848,6 +2877,7 @@ class GradientDialogController:
                 colormap_changed_callback=self._on_gradient_colormap_changed,
                 hemisphere_changed_callback=self._on_gradient_hemisphere_changed,
                 surface_mesh_changed_callback=self._on_gradient_surface_mesh_changed,
+                surface_style_changed_callback=self._on_gradient_surface_style_changed,
                 surface_render_count_changed_callback=self._on_gradient_surface_render_count_changed,
                 surface_procrustes_changed_callback=self._on_gradient_surface_procrustes_changed,
                 classification_surface_mesh_changed_callback=self._on_gradient_classification_surface_mesh_changed,
@@ -3722,6 +3752,7 @@ class GradientDialogController:
             cmap = self._selected_surface_colormap()
             hemisphere_mode = self._selected_gradient_hemisphere_mode()
             surface_mesh = self._selected_gradient_surface_mesh()
+            surface_style = self._selected_gradient_surface_style()
             title = (
                 f"Gradient 1 - {source_name}"
                 if render_count == 1
@@ -3729,6 +3760,20 @@ class GradientDialogController:
             )
             if use_procrustes:
                 title += " | Procrustes to gradients_avg"
+            support_mask_img = None
+            support_mask_data = self._last_gradients.get("support_mask")
+            if support_mask_data is not None:
+                try:
+                    import nibabel as nib
+
+                    support_mask_array = np.asarray(support_mask_data, dtype=float)
+                    if support_mask_array.shape == np.asarray(render_data).shape[:3]:
+                        affine = self._last_gradients.get("affine")
+                        if affine is None:
+                            affine = np.eye(4)
+                        support_mask_img = nib.Nifti1Image(support_mask_array, affine)
+                except Exception:
+                    support_mask_img = None
             self._surface_dialog = GradientSurfaceDialog.from_array(
                 render_data,
                 affine=self._last_gradients.get("affine"),
@@ -3738,6 +3783,9 @@ class GradientDialogController:
                 theme_name=self._theme_name,
                 hemisphere_mode=hemisphere_mode,
                 fsaverage_mesh=surface_mesh,
+                surface_style=surface_style,
+                parcellation_img=getattr(self, "_active_parcellation_img", None),
+                support_mask_img=support_mask_img,
                 parent=self,
             )
             screen = QApplication.primaryScreen()

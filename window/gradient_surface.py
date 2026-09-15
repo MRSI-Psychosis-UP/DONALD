@@ -5,6 +5,7 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
@@ -48,6 +49,11 @@ class GradientSurfaceDialog(QDialog):
         theme_name="Dark",
         hemisphere_mode="both",
         fsaverage_mesh="fsaverage4",
+        surface_style="smooth",
+        parcellation_img=None,
+        support_mask_img=None,
+        parcel_boundary_color="black",
+        parcel_boundary_linewidth=0.45,
     ):
         super().__init__(parent)
         self._img = nib.as_closest_canonical(volume_img)
@@ -64,6 +70,15 @@ class GradientSurfaceDialog(QDialog):
         self._theme_name = "Dark"
         self._hemisphere_mode = self._normalize_hemisphere_mode(hemisphere_mode)
         self._fsaverage_mesh = self._normalize_fsaverage_mesh(fsaverage_mesh)
+        self._surface_style = self._normalize_surface_style(surface_style)
+        self._parcellation_img = self._coerce_parcellation_img(parcellation_img)
+        self._parcellation_data = self._parcellation_data_array(self._parcellation_img)
+        self._support_img = self._coerce_parcellation_img(support_mask_img)
+        self._parcel_boundary_color = str(parcel_boundary_color or "black")
+        try:
+            self._parcel_boundary_linewidth = max(0.05, float(parcel_boundary_linewidth))
+        except Exception:
+            self._parcel_boundary_linewidth = 0.45
         self.setWindowTitle(title)
 
         self.figure = Figure(
@@ -77,6 +92,7 @@ class GradientSurfaceDialog(QDialog):
             "Views per component: "
             + self._hemisphere_label_text()
             + f" | Mesh: {self._fsaverage_mesh}"
+            + f" | Style: {self._surface_style_label()}"
             + f" | Cmap: {self._cmap_name}"
         )
         self.save_button = QPushButton("Save Figure")
@@ -135,6 +151,11 @@ class GradientSurfaceDialog(QDialog):
         theme_name="Dark",
         hemisphere_mode="both",
         fsaverage_mesh="fsaverage4",
+        surface_style="smooth",
+        parcellation_img=None,
+        support_mask_img=None,
+        parcel_boundary_color="black",
+        parcel_boundary_linewidth=0.45,
     ):
         """Create dialog from ndarray + affine."""
         arr = np.asarray(volume_data, dtype=float)
@@ -152,6 +173,11 @@ class GradientSurfaceDialog(QDialog):
             theme_name=theme_name,
             hemisphere_mode=hemisphere_mode,
             fsaverage_mesh=fsaverage_mesh,
+            surface_style=surface_style,
+            parcellation_img=parcellation_img,
+            support_mask_img=support_mask_img,
+            parcel_boundary_color=parcel_boundary_color,
+            parcel_boundary_linewidth=parcel_boundary_linewidth,
         )
 
     @staticmethod
@@ -168,6 +194,41 @@ class GradientSurfaceDialog(QDialog):
         if text not in valid:
             text = "fsaverage4"
         return text
+
+    @staticmethod
+    def _normalize_surface_style(value):
+        text = str(value or "smooth").strip().lower().replace("-", "_").replace(" ", "_")
+        if text in {"parcel", "parcels", "parcel_boundaries", "parcel_boundary", "parcel_outline", "parcel_outlines"}:
+            return "parcel_outlines"
+        return "smooth"
+
+    def _surface_style_label(self):
+        if self._surface_style == "parcel_outlines":
+            return "Parcel outlines"
+        return "Smooth"
+
+    @staticmethod
+    def _coerce_parcellation_img(parcellation_img):
+        if parcellation_img is None:
+            return None
+        try:
+            if isinstance(parcellation_img, (str, Path)):
+                parcellation_img = nib.load(str(parcellation_img))
+            return nib.as_closest_canonical(parcellation_img)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parcellation_data_array(parcellation_img):
+        if parcellation_img is None:
+            return None
+        try:
+            data = np.asarray(parcellation_img.get_fdata(), dtype=float)
+        except Exception:
+            return None
+        if data.ndim != 3:
+            return None
+        return data
 
     def _hemisphere_label_text(self):
         if self._hemisphere_mode == "lh":
@@ -197,12 +258,20 @@ class GradientSurfaceDialog(QDialog):
 
         mesh_left = surface.load_surf_mesh(fsaverage.pial_left)
         mesh_right = surface.load_surf_mesh(fsaverage.pial_right)
+        try:
+            white_left = surface.load_surf_mesh(fsaverage.white_left)
+            white_right = surface.load_surf_mesh(fsaverage.white_right)
+        except Exception:
+            white_left = mesh_left
+            white_right = mesh_right
         sulc_left = surface.load_surf_data(fsaverage.sulc_left)
         sulc_right = surface.load_surf_data(fsaverage.sulc_right)
 
         cls._surface_assets_cache[mesh_name] = {
             "mesh_left": mesh_left,
             "mesh_right": mesh_right,
+            "white_left": white_left,
+            "white_right": white_right,
             "sulc_left": sulc_left,
             "sulc_right": sulc_right,
         }
@@ -230,11 +299,268 @@ class GradientSurfaceDialog(QDialog):
                 threshold = thr
         return vmin, vmax, threshold
 
+    @staticmethod
+    def _mesh_arrays(mesh):
+        if hasattr(mesh, "coordinates") and hasattr(mesh, "faces"):
+            return np.asarray(mesh.coordinates, dtype=float), np.asarray(mesh.faces, dtype=int)
+        if isinstance(mesh, (tuple, list)) and len(mesh) >= 2:
+            return np.asarray(mesh[0], dtype=float), np.asarray(mesh[1], dtype=int)
+        raise ValueError("Unsupported fsaverage surface mesh format.")
+
+    @staticmethod
+    def _vol_to_surf_robust(img, mesh, *, radius, interpolation, inner_mesh=None):
+        methods = (interpolation, "nearest_most_frequent", "linear")
+        seen_methods = set()
+        for method in methods:
+            if method in seen_methods:
+                continue
+            seen_methods.add(method)
+            if inner_mesh is not None:
+                try:
+                    return surface.vol_to_surf(
+                        img,
+                        mesh,
+                        inner_mesh=inner_mesh,
+                        interpolation=method,
+                    )
+                except Exception:
+                    pass
+            try:
+                return surface.vol_to_surf(
+                    img,
+                    mesh,
+                    radius=radius,
+                    interpolation=method,
+                )
+            except Exception:
+                continue
+        return surface.vol_to_surf(img, mesh, radius=radius)
+
+    @classmethod
+    def _nearest_source_indices(cls, source_coords, target_coords):
+        source = np.asarray(source_coords, dtype=float)
+        target = np.asarray(target_coords, dtype=float)
+        if source.ndim != 2 or target.ndim != 2 or source.shape[1] != target.shape[1]:
+            return np.zeros(target.shape[0], dtype=int)
+        if source.shape[0] == 0 or target.shape[0] == 0:
+            return np.zeros(target.shape[0], dtype=int)
+        try:
+            from scipy.spatial import cKDTree
+
+            _dist, indices = cKDTree(source).query(target, k=1)
+            return np.asarray(indices, dtype=int)
+        except Exception:
+            max_pairs = 2_000_000
+            chunk = max(1, int(max_pairs // max(source.shape[0], 1)))
+            nearest = np.zeros(target.shape[0], dtype=int)
+            for start in range(0, target.shape[0], chunk):
+                stop = min(target.shape[0], start + chunk)
+                diff = target[start:stop, np.newaxis, :] - source[np.newaxis, :, :]
+                dist_sq = np.einsum("ijk,ijk->ij", diff, diff)
+                nearest[start:stop] = np.argmin(dist_sq, axis=1)
+            return nearest
+
+    @classmethod
+    def _filled_label_texture(cls, mesh, label_texture):
+        if label_texture is None:
+            return None
+        coords, _faces = cls._mesh_arrays(mesh)
+        labels = np.asarray(label_texture, dtype=float).reshape(-1)
+        if labels.shape[0] != coords.shape[0]:
+            return labels
+        finite_labels = np.isfinite(labels)
+        label_values = np.zeros(labels.shape, dtype=np.int64)
+        label_values[finite_labels] = np.rint(labels[finite_labels]).astype(np.int64, copy=False)
+        source_mask = finite_labels & (label_values > 0)
+        target_mask = ~source_mask
+        if not np.any(source_mask) or not np.any(target_mask):
+            return labels
+        filled = np.asarray(label_values, dtype=float)
+        nearest = cls._nearest_source_indices(coords[source_mask], coords[target_mask])
+        filled[target_mask] = label_values[source_mask][nearest]
+        return filled
+
+    @classmethod
+    def _filled_surface_texture(cls, mesh, texture, *, label_texture=None, fill_mask=None):
+        coords, _faces = cls._mesh_arrays(mesh)
+        values = np.asarray(texture, dtype=float).reshape(-1)
+        if values.shape[0] != coords.shape[0]:
+            return values
+
+        if fill_mask is None:
+            eligible = np.ones(values.shape, dtype=bool)
+        else:
+            eligible = np.asarray(fill_mask, dtype=bool).reshape(-1)
+            if eligible.shape != values.shape:
+                eligible = np.ones(values.shape, dtype=bool)
+
+        filled = np.asarray(values, dtype=float).copy()
+        finite_values = np.isfinite(filled)
+        if label_texture is not None:
+            labels = np.asarray(label_texture, dtype=float).reshape(-1)
+            if labels.shape == values.shape:
+                finite_labels = np.isfinite(labels)
+                label_values = np.zeros(labels.shape, dtype=np.int64)
+                label_values[finite_labels] = np.rint(labels[finite_labels]).astype(np.int64, copy=False)
+                valid_labels = finite_labels & (label_values > 0)
+                for label in np.unique(label_values[eligible & valid_labels]):
+                    same_label = label_values == int(label)
+                    source_mask = eligible & same_label & finite_values
+                    target_mask = eligible & same_label & ~np.isfinite(filled)
+                    if not np.any(source_mask) or not np.any(target_mask):
+                        continue
+                    nearest = cls._nearest_source_indices(coords[source_mask], coords[target_mask])
+                    filled[target_mask] = filled[source_mask][nearest]
+
+        source_mask = eligible & np.isfinite(filled)
+        target_mask = eligible & ~np.isfinite(filled)
+        if np.any(source_mask) and np.any(target_mask):
+            nearest = cls._nearest_source_indices(coords[source_mask], coords[target_mask])
+            filled[target_mask] = filled[source_mask][nearest]
+        return filled
+
+    @classmethod
+    def _boundary_segments_from_labels(cls, mesh, vertex_labels):
+        coords, faces = cls._mesh_arrays(mesh)
+        labels = np.asarray(vertex_labels, dtype=float).reshape(-1)
+        if coords.ndim != 2 or coords.shape[1] != 3 or faces.ndim != 2 or faces.shape[1] != 3:
+            return np.zeros((0, 2, 3), dtype=float)
+        if labels.shape[0] != coords.shape[0]:
+            return np.zeros((0, 2, 3), dtype=float)
+
+        finite_labels = np.isfinite(labels)
+        label_values = np.zeros(labels.shape, dtype=np.int64)
+        label_values[finite_labels] = np.rint(labels[finite_labels]).astype(np.int64, copy=False)
+        valid = finite_labels & (label_values > 0)
+        edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]])).astype(np.int64, copy=False)
+        in_bounds = np.all((edges >= 0) & (edges < coords.shape[0]), axis=1)
+        edges = edges[in_bounds]
+        if edges.size == 0:
+            return np.zeros((0, 2, 3), dtype=float)
+
+        keep = valid[edges[:, 0]] & valid[edges[:, 1]] & (label_values[edges[:, 0]] != label_values[edges[:, 1]])
+        edges = edges[keep]
+        if edges.size == 0:
+            return np.zeros((0, 2, 3), dtype=float)
+        edges = np.unique(np.sort(edges, axis=1), axis=0)
+        return np.asarray(coords[edges], dtype=float)
+
+    def _parcel_value_texture_from_labels(self, comp_img, label_texture):
+        if self._parcellation_data is None or label_texture is None:
+            return None
+        try:
+            comp_data = np.asarray(comp_img.get_fdata(), dtype=float)
+        except Exception:
+            return None
+        if comp_data.shape != self._parcellation_data.shape:
+            return None
+
+        surface_labels = np.asarray(label_texture, dtype=float).reshape(-1)
+        finite_surface = np.isfinite(surface_labels)
+        surface_label_values = np.zeros(surface_labels.shape, dtype=np.int64)
+        surface_label_values[finite_surface] = np.rint(surface_labels[finite_surface]).astype(np.int64, copy=False)
+        valid_surface = finite_surface & (surface_label_values > 0)
+        texture = np.full(surface_labels.shape, np.nan, dtype=float)
+        if not np.any(valid_surface):
+            return texture
+
+        finite_parcels = np.isfinite(self._parcellation_data)
+        parcel_labels = np.zeros(self._parcellation_data.shape, dtype=np.int64)
+        parcel_labels[finite_parcels] = np.rint(
+            self._parcellation_data[finite_parcels]
+        ).astype(np.int64, copy=False)
+        for label in np.unique(surface_label_values[valid_surface]):
+            voxel_values = comp_data[parcel_labels == int(label)]
+            voxel_values = voxel_values[np.isfinite(voxel_values)]
+            if voxel_values.size == 0:
+                continue
+            texture[surface_label_values == int(label)] = float(np.nanmedian(voxel_values))
+        return texture
+
+    @staticmethod
+    def _support_mask_from_texture(support_texture, label_texture=None):
+        if support_texture is not None:
+            support = np.asarray(support_texture, dtype=float).reshape(-1)
+            return np.isfinite(support) & (support > 0.0)
+        if label_texture is not None:
+            labels = np.asarray(label_texture, dtype=float).reshape(-1)
+            return np.isfinite(labels) & (np.rint(labels) > 0)
+        return None
+
+    def _surface_texture(self, comp_img, mesh, inner_mesh=None, label_texture=None, support_texture=None):
+        if self._surface_style == "parcel_outlines":
+            parcel_texture = self._parcel_value_texture_from_labels(comp_img, label_texture)
+            if parcel_texture is not None:
+                fill_mask = self._support_mask_from_texture(support_texture, label_texture)
+                return self._filled_surface_texture(
+                    mesh,
+                    parcel_texture,
+                    label_texture=label_texture,
+                    fill_mask=fill_mask,
+                )
+        interpolation = "linear" if self._surface_style == "smooth" else "nearest_most_frequent"
+        texture = self._vol_to_surf_robust(
+            comp_img,
+            mesh,
+            radius=3.0,
+            interpolation=interpolation,
+            inner_mesh=inner_mesh,
+        )
+        fill_mask = self._support_mask_from_texture(support_texture, label_texture)
+        if fill_mask is not None:
+            texture = np.asarray(texture, dtype=float).copy()
+            if texture.shape == fill_mask.shape:
+                texture[~fill_mask] = np.nan
+        return self._filled_surface_texture(
+            mesh,
+            texture,
+            label_texture=label_texture,
+            fill_mask=fill_mask,
+        )
+
+    def _surface_label_texture(self, mesh, inner_mesh=None):
+        if self._surface_style != "parcel_outlines" or self._parcellation_img is None:
+            return None
+        texture = self._vol_to_surf_robust(
+            self._parcellation_img,
+            mesh,
+            radius=3.0,
+            interpolation="nearest_most_frequent",
+            inner_mesh=inner_mesh,
+        )
+        return self._filled_label_texture(mesh, texture)
+
+    def _surface_support_texture(self, mesh, inner_mesh=None):
+        if self._support_img is None:
+            return None
+        texture = self._vol_to_surf_robust(
+            self._support_img,
+            mesh,
+            radius=3.0,
+            interpolation="nearest_most_frequent",
+            inner_mesh=inner_mesh,
+        )
+        return self._filled_label_texture(mesh, texture)
+
+    def _add_parcel_boundaries(self, ax, mesh, label_texture):
+        if label_texture is None:
+            return
+        segments = self._boundary_segments_from_labels(mesh, label_texture)
+        if segments.size == 0:
+            return
+        collection = Line3DCollection(
+            segments,
+            colors=self._parcel_boundary_color,
+            linewidths=self._parcel_boundary_linewidth,
+            alpha=0.95,
+        )
+        ax.add_collection3d(collection)
+
     def _render(self):
         self.figure.clear()
         assets = self._get_surface_assets(self._fsaverage_mesh)
 
-        vmin, vmax, threshold = self._compute_display_range(self._data)
+        vmin, vmax, _threshold = self._compute_display_range(self._data)
         row_norm = Normalize(vmin=vmin, vmax=vmax)
 
         if self._hemisphere_mode == "lh":
@@ -264,19 +590,29 @@ class GradientSurfaceDialog(QDialog):
         )
 
         row_axes_all = []
+        label_textures = {
+            "left": self._surface_label_texture(assets["mesh_left"], assets.get("white_left")),
+            "right": self._surface_label_texture(assets["mesh_right"], assets.get("white_right")),
+        }
+        support_textures = {
+            "left": self._surface_support_texture(assets["mesh_left"], assets.get("white_left")),
+            "right": self._surface_support_texture(assets["mesh_right"], assets.get("white_right")),
+        }
         for comp_idx in range(self._n_components):
             comp_img = nib.Nifti1Image(self._data[..., comp_idx], self._img.affine)
-            texture_left = surface.vol_to_surf(
+            texture_left = self._surface_texture(
                 comp_img,
                 assets["mesh_left"],
-                radius=0.5,
-                interpolation="linear",
+                assets.get("white_left"),
+                label_textures.get("left"),
+                support_textures.get("left"),
             )
-            texture_right = surface.vol_to_surf(
+            texture_right = self._surface_texture(
                 comp_img,
                 assets["mesh_right"],
-                radius=0.5,
-                interpolation="linear",
+                assets.get("white_right"),
+                label_textures.get("right"),
+                support_textures.get("right"),
             )
             textures = {"left": texture_left, "right": texture_right}
             row_axes = []
@@ -293,9 +629,10 @@ class GradientSurfaceDialog(QDialog):
                     colorbar=False,
                     vmin=vmin,
                     vmax=vmax,
-                    threshold=threshold,
+                    threshold=None,
                     axes=ax,
                 )
+                self._add_parcel_boundaries(ax, mesh, label_textures.get(hemi))
                 ax.set_title(view_label, fontsize=9, pad=2)
                 row_axes.append(ax)
             row_axes_all.append(row_axes)

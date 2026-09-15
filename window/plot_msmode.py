@@ -98,6 +98,8 @@ nettools = NetTools()
 
 FREE_ENERGY_PATHS_DEFAULT_DIR = Path("/home/ecelereau/Connectome/Dev/mrsitoolbox/results")
 FREE_ENERGY_PATHS_SUFFIX = "desc-free_energy_paths.npz"
+DEFAULT_MAX_FULL_PATHS = 256
+MAX_FULL_PATHS_UI_LIMIT = 1_000_000
 
 
 def _mrsitoolbox_root():
@@ -1087,6 +1089,7 @@ class GradientScatterDialog(QDialog):
         self._use_edge_bundling = False
         self._edge_bundling_note = ""
         self._normalize_free_energy_by_segments = True
+        self._max_full_paths = DEFAULT_MAX_FULL_PATHS
         display_x, display_y = self._rotate_points(self._x, self._y, self._rotation_preset)
         if self._is_3d:
             self._display_coords = np.column_stack((display_x, display_y, self._z))
@@ -1244,6 +1247,15 @@ class GradientScatterDialog(QDialog):
         self.free_energy_lambda_spin.setValue(1.0)
         self.free_energy_lambda_spin.setToolTip("Temperature parameter for free energy: larger values make high-energy paths contribute less.")
         self.free_energy_lambda_spin.valueChanged.connect(self._on_free_energy_lambda_changed)
+        self.max_full_paths_label = QLabel("Max full paths")
+        self.max_full_paths_spin = QSpinBox()
+        self.max_full_paths_spin.setRange(1, MAX_FULL_PATHS_UI_LIMIT)
+        self.max_full_paths_spin.setSingleStep(256)
+        self.max_full_paths_spin.setValue(int(self._max_full_paths))
+        self.max_full_paths_spin.setToolTip(
+            "Maximum number of complete cortical paths generated per hemisphere; equivalent to --max-full-paths."
+        )
+        self.max_full_paths_spin.valueChanged.connect(self._on_max_full_paths_changed)
         self.generate_paths_button = QPushButton("Generate paths")
         self.generate_paths_button.clicked.connect(self._on_generate_paths_clicked)
         self.compute_free_energy_button = QPushButton("Compute free energy")
@@ -1350,6 +1362,7 @@ class GradientScatterDialog(QDialog):
         rgb_form.addRow("RGB first", self.path_order_first_combo)
         rgb_form.addRow("RGB second", self.path_order_second_combo)
         rgb_form.addRow("RGB third", self.path_order_third_combo)
+        rgb_form.addRow(self.max_full_paths_label, self.max_full_paths_spin)
         path_section.addLayout(rgb_form)
         endpoint_form = QFormLayout()
         endpoint_form.addRow("Endpoints", self.endpoint_mode_combo)
@@ -1510,6 +1523,10 @@ class GradientScatterDialog(QDialog):
             parts.append("No paths loaded")
         try:
             parts.append(f"lambda={float(self.free_energy_lambda_spin.value()):.3g}")
+        except Exception:
+            pass
+        try:
+            parts.append(f"max paths={self._selected_max_full_paths()}")
         except Exception:
             pass
         parts.append(f"mode={self.interface_mode_combo.currentText()}")
@@ -2215,6 +2232,7 @@ class GradientScatterDialog(QDialog):
                 self.load_free_energy_endpoints_button,
                 self.clear_manual_endpoints_button,
                 self.free_energy_lambda_spin,
+                self.max_full_paths_spin,
                 self.project_paths_button,
                 self.fibrenet_paths_button,
                 self.fibrenet_layout_combo,
@@ -2294,6 +2312,7 @@ class GradientScatterDialog(QDialog):
         self.load_free_energy_endpoints_button.setEnabled(self._use_triangular_rgb)
         self.clear_manual_endpoints_button.setEnabled(self._use_triangular_rgb and self._endpoint_selection_mode == "manual")
         self.free_energy_lambda_spin.setEnabled(self._use_triangular_rgb)
+        self.max_full_paths_spin.setEnabled(self._use_triangular_rgb and self._edge_pairs.shape[0] > 0)
         projectable = False
         exportable = False
         if isinstance(self._project_paths_payload, dict):
@@ -2784,6 +2803,14 @@ class GradientScatterDialog(QDialog):
             fallback=self._triangular_color_order,
         )
         if payload_order != current_order:
+            return False
+        try:
+            payload_max_full_paths = int(
+                self._project_paths_payload.get("max_full_paths", DEFAULT_MAX_FULL_PATHS)
+            )
+        except Exception:
+            payload_max_full_paths = DEFAULT_MAX_FULL_PATHS
+        if payload_max_full_paths != self._selected_max_full_paths():
             return False
         return (
             self._payload_endpoint_anchor_signature(self._project_paths_payload)
@@ -3581,6 +3608,23 @@ class GradientScatterDialog(QDialog):
             pass
         return str(value)
 
+    def _max_full_paths_from_free_energy_npz(self, npz):
+        value = None
+        if "max_full_paths" in npz.files:
+            value = self._npz_scalar_text(npz["max_full_paths"])
+        elif "summary_json" in npz.files:
+            try:
+                summary = json.loads(self._npz_scalar_text(npz["summary_json"]))
+                value = summary.get("max_full_paths") if isinstance(summary, dict) else None
+            except Exception:
+                value = None
+        if value is None:
+            return None
+        try:
+            return max(1, int(value))
+        except Exception:
+            return None
+
     @staticmethod
     def _npz_python_object(value):
         try:
@@ -3751,6 +3795,7 @@ class GradientScatterDialog(QDialog):
             raise ValueError(f"Endpoint file does not exist: {input_path}")
         with np.load(str(input_path), allow_pickle=True) as npz:
             endpoint_groups, global_path_order = self._endpoint_groups_from_free_energy_npz(npz)
+            loaded_max_full_paths = self._max_full_paths_from_free_energy_npz(npz)
         if not endpoint_groups:
             raise ValueError("No fixed endpoint anchors were found in this NPZ.")
 
@@ -3812,6 +3857,7 @@ class GradientScatterDialog(QDialog):
             self._coerce_path_channel_order(path_order, fallback=self._path_channel_order),
             matched_count,
             unresolved,
+            loaded_max_full_paths,
         )
 
     def _on_load_free_energy_endpoints_clicked(self):
@@ -3847,7 +3893,7 @@ class GradientScatterDialog(QDialog):
     def _apply_free_energy_endpoints_path(self, input_path, *, source):
         input_path = Path(input_path).expanduser()
         self._free_energy_paths_load_dir = input_path.parent
-        overrides, subc_overrides, path_order, matched_count, unresolved = (
+        overrides, subc_overrides, path_order, matched_count, unresolved, loaded_max_full_paths = (
             self._load_free_energy_endpoint_overrides(input_path)
         )
         self._manual_anchor_overrides = overrides
@@ -3862,6 +3908,11 @@ class GradientScatterDialog(QDialog):
             self.endpoint_mode_combo.blockSignals(False)
         self._path_channel_order = path_order
         self._populate_path_order_combos()
+        if loaded_max_full_paths is not None:
+            self.max_full_paths_spin.blockSignals(True)
+            self.max_full_paths_spin.setValue(int(loaded_max_full_paths))
+            self.max_full_paths_spin.blockSignals(False)
+            self._max_full_paths = int(self.max_full_paths_spin.value())
         self._selected_ctx_path_indices = {"lh": 0, "rh": 0, "all": 0}
         self._invalidate_generated_paths()
         if self._edge_pairs.shape[0] == 0:
@@ -4345,9 +4396,14 @@ class GradientScatterDialog(QDialog):
         visible_edge_distances,
         anchor_x_plot=None,
         anchor_y_plot=None,
+        max_full_paths=DEFAULT_MAX_FULL_PATHS,
     ):
         if visible_edge_pairs.shape[0] == 0:
             return None
+        try:
+            max_full_paths = max(1, int(max_full_paths))
+        except Exception:
+            max_full_paths = DEFAULT_MAX_FULL_PATHS
         scatter_coords = np.column_stack((np.asarray(x_plot, dtype=float), np.asarray(y_plot, dtype=float)))
         anchor_x_plot = np.asarray(x_plot if anchor_x_plot is None else anchor_x_plot, dtype=float)
         anchor_y_plot = np.asarray(y_plot if anchor_y_plot is None else anchor_y_plot, dtype=float)
@@ -4467,7 +4523,10 @@ class GradientScatterDialog(QDialog):
                     continue
                 valid_ordered_segments.append((first, second, [int(node) for node in list(path)]))
 
-            all_full_paths = self._combine_ordered_path_records(valid_pair_records, max_full_paths=256)
+            all_full_paths = self._combine_ordered_path_records(
+                valid_pair_records,
+                max_full_paths=max_full_paths,
+            )
             ctx_path_energies = []
             for path_nodes in list(all_full_paths):
                 energy = self._ctx_full_path_energy(
@@ -4578,6 +4637,7 @@ class GradientScatterDialog(QDialog):
             "show_all_ordered_paths": bool(self._show_all_ordered_paths),
             "rotation_preset": str(self._rotation_preset),
             "radius": float(self._proximity_radius),
+            "max_full_paths": int(max_full_paths),
         }
 
     def _draw_triangular_anchor_paths(self, ax, x_plot, y_plot, point_colors, path_payload, group_name=None):
@@ -6161,6 +6221,20 @@ class GradientScatterDialog(QDialog):
         self._sync_proximity_controls()
         self._render()
 
+    def _selected_max_full_paths(self):
+        try:
+            value = int(self.max_full_paths_spin.value())
+        except Exception:
+            value = int(getattr(self, "_max_full_paths", DEFAULT_MAX_FULL_PATHS))
+        self._max_full_paths = max(1, value)
+        return int(self._max_full_paths)
+
+    def _on_max_full_paths_changed(self, value):
+        self._max_full_paths = max(1, int(value))
+        self._invalidate_generated_paths()
+        self._sync_proximity_controls()
+        self._render(preserve_view=True)
+
     def _on_generate_paths_clicked(self):
         if self._is_3d or not self._use_triangular_rgb:
             return
@@ -6186,6 +6260,7 @@ class GradientScatterDialog(QDialog):
             path_edge_distances,
             anchor_x_plot=rgb_x_plot,
             anchor_y_plot=rgb_y_plot,
+            max_full_paths=self._selected_max_full_paths(),
         )
         if isinstance(payload, dict):
             payload["point_colors"] = np.asarray(point_colors, dtype=float).tolist()
@@ -6746,6 +6821,10 @@ class GradientScatterDialog(QDialog):
         gradient1_values, gradient2_values = self._gradient_component_arrays_for_export()
         channel_order = str(self._project_paths_payload.get("channel_order", self._triangular_color_order or "")).strip()
         color_order = str(self._project_paths_payload.get("color_order", self._triangular_color_order or "")).strip()
+        max_full_paths = max(
+            1,
+            int(self._project_paths_payload.get("max_full_paths", self._selected_max_full_paths())),
+        )
         normalize_by_segments = bool(free_energy_payload.get("normalize_energy_by_segments", False))
         path_group_lookup = {
             str(group.get("group", "all")).strip().lower(): dict(group)
@@ -6980,6 +7059,7 @@ class GradientScatterDialog(QDialog):
             "lambda_value": float(free_energy_payload.get("lambda", self.free_energy_lambda_spin.value())),
             "color_order": str(color_order),
             "path_order_override": str(channel_order),
+            "max_full_paths": int(max_full_paths),
             "axes": {
                 "x": str(free_energy_payload.get("x_axis_label", self._x_label)),
                 "y": str(free_energy_payload.get("y_axis_label", self._y_label)),
@@ -7014,6 +7094,7 @@ class GradientScatterDialog(QDialog):
             "lambda_value": float(free_energy_payload.get("lambda", self.free_energy_lambda_spin.value())),
             "color_order": str(color_order),
             "path_order_override": str(channel_order),
+            "max_full_paths": int(max_full_paths),
             "x_axis_label": str(free_energy_payload.get("x_axis_label", self._x_label)),
             "y_axis_label": str(free_energy_payload.get("y_axis_label", self._y_label)),
             "normalize_energy_by_segments": bool(normalize_by_segments),
@@ -7091,6 +7172,10 @@ class GradientScatterDialog(QDialog):
                 lambda_value=np.asarray(float(export_payload.get("lambda_value", 1.0))),
                 color_order=np.asarray(str(export_payload.get("color_order", ""))),
                 path_order_override=np.asarray(str(export_payload.get("path_order_override", ""))),
+                max_full_paths=np.asarray(
+                    int(export_payload.get("max_full_paths", DEFAULT_MAX_FULL_PATHS)),
+                    dtype=int,
+                ),
                 x_axis_label=np.asarray(str(export_payload.get("x_axis_label", ""))),
                 y_axis_label=np.asarray(str(export_payload.get("y_axis_label", ""))),
                 normalize_energy_by_segments=np.asarray(bool(export_payload.get("normalize_energy_by_segments", False))),
@@ -7348,6 +7433,9 @@ class GradientScatterDialog(QDialog):
             "radius": float(self._proximity_radius),
             "fit_mode": self._rgb_fit_mode,
             "color_order": self._triangular_color_order,
+            "max_full_paths": int(
+                self._project_paths_payload.get("max_full_paths", self._selected_max_full_paths())
+            ),
             "groups": groups,
         }
 

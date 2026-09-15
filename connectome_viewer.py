@@ -1582,6 +1582,7 @@ class ConnectomeViewer(QMainWindow):
         self._gradient_parcel_name_key = ""
         self._gradient_hemisphere_mode = "separate"
         self._gradient_surface_mesh = "fsaverage4"
+        self._gradient_surface_style = "smooth"
         self._gradient_surface_render_count = 1
         self._gradient_surface_procrustes = False
         self._gradient_classification_surface_mesh = self._gradient_surface_mesh

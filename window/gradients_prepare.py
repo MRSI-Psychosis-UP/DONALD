@@ -83,6 +83,7 @@ class GradientsPrepareDialog(QDialog):
         colormap_changed_callback=None,
         hemisphere_changed_callback=None,
         surface_mesh_changed_callback=None,
+        surface_style_changed_callback=None,
         surface_render_count_changed_callback=None,
         surface_procrustes_changed_callback=None,
         scatter_rotation_changed_callback=None,
@@ -123,6 +124,7 @@ class GradientsPrepareDialog(QDialog):
         self._colormap_changed_callback = colormap_changed_callback
         self._hemisphere_changed_callback = hemisphere_changed_callback
         self._surface_mesh_changed_callback = surface_mesh_changed_callback
+        self._surface_style_changed_callback = surface_style_changed_callback
         self._surface_render_count_changed_callback = surface_render_count_changed_callback
         self._surface_procrustes_changed_callback = surface_procrustes_changed_callback
         self._scatter_rotation_changed_callback = scatter_rotation_changed_callback
@@ -168,6 +170,7 @@ class GradientsPrepareDialog(QDialog):
         self.set_parcellation_path(parcellation_path)
         self.set_hemisphere_mode("separate")
         self.set_surface_mesh("fsaverage4")
+        self.set_surface_style("smooth")
         self.set_surface_render_component_limit(component_count)
         self.set_surface_render_component_count(1)
         self.set_surface_procrustes_enabled(False)
@@ -332,6 +335,14 @@ class GradientsPrepareDialog(QDialog):
         )
         self.surface_mesh_combo.currentTextChanged.connect(self._on_surface_mesh_changed)
         display_layout.addWidget(self.surface_mesh_combo, row, 1)
+        row += 1
+
+        display_layout.addWidget(QLabel("Surface style"), row, 0)
+        self.surface_style_combo = QComboBox()
+        self.surface_style_combo.addItem("Smooth", "smooth")
+        self.surface_style_combo.addItem("Parcel outlines", "parcel_outlines")
+        self.surface_style_combo.currentIndexChanged.connect(self._on_surface_style_changed)
+        display_layout.addWidget(self.surface_style_combo, row, 1)
         row += 1
 
         display_layout.addWidget(QLabel("Gradients to render"), row, 0)
@@ -654,6 +665,13 @@ class GradientsPrepareDialog(QDialog):
             except Exception:
                 pass
 
+    def _on_surface_style_changed(self, _index):
+        if self._surface_style_changed_callback is not None:
+            try:
+                self._surface_style_changed_callback(self.selected_surface_style())
+            except Exception:
+                pass
+
     def _on_surface_render_count_changed(self, value):
         if self._surface_render_count_changed_callback is not None:
             try:
@@ -899,6 +917,10 @@ class GradientsPrepareDialog(QDialog):
 
     def selected_surface_mesh(self) -> str:
         return self.surface_mesh_combo.currentText().strip()
+
+    def selected_surface_style(self) -> str:
+        value = self.surface_style_combo.currentData()
+        return str(value or "smooth").strip()
 
     def selected_surface_render_component_count(self) -> int:
         return int(self.surface_render_count_spin.value())
@@ -1286,6 +1308,17 @@ class GradientsPrepareDialog(QDialog):
         self.surface_mesh_combo.setCurrentText(text)
         self.surface_mesh_combo.blockSignals(False)
 
+    def set_surface_style(self, value: str) -> None:
+        text = str(value or "smooth").strip().lower().replace("-", "_").replace(" ", "_")
+        if text in {"parcel", "parcels", "parcel_boundaries", "parcel_boundary", "parcel_outline", "parcel_outlines"}:
+            text = "parcel_outlines"
+        if text not in {"smooth", "parcel_outlines"}:
+            text = "smooth"
+        index = self.surface_style_combo.findData(text)
+        self.surface_style_combo.blockSignals(True)
+        self.surface_style_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.surface_style_combo.blockSignals(False)
+
     def set_surface_render_component_limit(self, value: int) -> None:
         try:
             count = int(value)
@@ -1574,6 +1607,7 @@ class GradientsPrepareDialog(QDialog):
         self.parcellation_button.setEnabled(can_interact)
         self.hemisphere_combo.setEnabled(can_interact)
         self.surface_mesh_combo.setEnabled(can_interact)
+        self.surface_style_combo.setEnabled(can_interact)
         self.surface_render_count_spin.setEnabled(can_interact)
         self.surface_procrustes_check.setEnabled(can_interact and self._surface_procrustes_available)
         self.scatter_rotation_combo.setEnabled(can_interact)

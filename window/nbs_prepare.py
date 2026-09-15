@@ -208,6 +208,50 @@ def _connectivity_atlas_string(path: Path) -> str:
     return "unknown"
 
 
+def _candidate_mrsitoolbox_roots(viewer_root: Path, environ=None, cwd: Path | None = None) -> list[Path]:
+    env = os.environ if environ is None else environ
+    candidates: list[Path] = []
+
+    def add(value) -> None:
+        text = str(value or "").strip()
+        if text:
+            candidates.append(Path(text).expanduser())
+
+    for env_name in ("MRSITOOLBOX_PATH", "MRSITOOLBOX_ROOT"):
+        add(env.get(env_name, ""))
+
+    devanalyse = str(env.get("DEVANALYSEPATH", "") or "").strip()
+    if devanalyse:
+        devanalyse_path = Path(devanalyse).expanduser()
+        candidates.append(devanalyse_path)
+        candidates.append(devanalyse_path.parent / "mrsitoolbox")
+
+    viewer_root = Path(viewer_root).expanduser()
+    candidates.append(viewer_root.parent / "mrsitoolbox")
+    candidates.append(Path.cwd() if cwd is None else Path(cwd).expanduser())
+
+    unique: list[Path] = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve())
+        except Exception:
+            key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _find_covariate_balance_script(viewer_root: Path, environ=None, cwd: Path | None = None) -> Path | None:
+    for toolbox_root in _candidate_mrsitoolbox_roots(viewer_root, environ=environ, cwd=cwd):
+        script_path = toolbox_root / "scripts" / "covariate_balance_love_plot.py"
+        if script_path.is_file():
+            return script_path
+    return None
+
+
 class _ImagePreviewDialog(QDialog):
     def __init__(self, image_path, title, parent=None):
         super().__init__(parent)
@@ -1556,10 +1600,11 @@ class NBSPrepareDialog(QDialog):
         if hasattr(self, "covariate_balance_button"):
             selected = self.selected_covariates()
             regressor_type = self._selected_regressor_type()
+            balance_row_count = len(self._covariate_balance_row_indices())
             can_balance = (
                 bool(selected.get("regressor"))
                 and len(selected.get("nuisance") or []) >= 1
-                and len(self.selected_row_indices()) >= 2
+                and balance_row_count >= 2
                 and regressor_type != "continuous"
                 and (not any_busy)
             )
@@ -1975,7 +2020,8 @@ class NBSPrepareDialog(QDialog):
 
     def _build_process_environment(self):
         env = QProcessEnvironment.systemEnvironment()
-        viewer_root = str(Path(__file__).resolve().parents[1])
+        viewer_root_path = Path(__file__).resolve().parents[1]
+        viewer_root = str(viewer_root_path)
         devanalyse = env.value("DEVANALYSEPATH", "")
         if not devanalyse:
             preferred_root = ""
@@ -1994,9 +2040,21 @@ class NBSPrepareDialog(QDialog):
             env.insert("BIDSDATAPATH", fallback_bids)
             print(f"[NBS] BIDSDATAPATH not set; using {fallback_bids}", flush=True)
             self._append_terminal_line(f"[NBS] BIDSDATAPATH not set; using {fallback_bids}")
+        if not env.value("MPLCONFIGDIR", "").strip():
+            mpl_config_dir = Path(viewer_root) / ".matplotlib-cache"
+            try:
+                mpl_config_dir.mkdir(parents=True, exist_ok=True)
+                env.insert("MPLCONFIGDIR", str(mpl_config_dir))
+            except Exception:
+                env.insert("MPLCONFIGDIR", "/tmp")
         pythonpath_current = env.value("PYTHONPATH", "")
         pythonpath_parts = [p for p in pythonpath_current.split(os.pathsep) if p]
-        for candidate in (viewer_root,):
+        prepend_paths = [viewer_root]
+        toolbox_script_path = _find_covariate_balance_script(viewer_root_path)
+        if toolbox_script_path is not None:
+            toolbox_import_root = str(toolbox_script_path.parents[1].parent)
+            prepend_paths.append(toolbox_import_root)
+        for candidate in reversed(prepend_paths):
             if candidate and candidate not in pythonpath_parts and Path(candidate).exists():
                 pythonpath_parts.insert(0, candidate)
         if pythonpath_parts:
@@ -2006,16 +2064,74 @@ class NBSPrepareDialog(QDialog):
     def _covariate_balance_module(self):
         return "mrsitoolbox.scripts.covariate_balance_love_plot"
 
-    def _covariate_balance_output_dir(self, regressor_name):
+    def _covariate_balance_script_path(self):
+        return _find_covariate_balance_script(Path(__file__).resolve().parents[1])
+
+    def _covariate_balance_command_prefix(self):
+        script_path = self._covariate_balance_script_path()
+        if script_path is not None:
+            return [str(script_path)], None
+
+        module_name = self._covariate_balance_module()
+        try:
+            module_spec = importlib.util.find_spec(module_name)
+        except (ImportError, AttributeError, ValueError):
+            module_spec = None
+        if module_spec is not None:
+            return ["-m", module_name], None
+
+        return [], (
+            "Covariate balance diagnostics script not found. Expected "
+            "mrsitoolbox/scripts/covariate_balance_love_plot.py next to Donald, "
+            f"or importable module {module_name}."
+        )
+
+    def _highlighted_data_table_rows(self):
+        if not hasattr(self, "table") or self.table is None:
+            return []
+        selected_table_rows = []
+        try:
+            selection_model = self.table.selectionModel()
+        except Exception:
+            selection_model = None
+        if selection_model is not None:
+            try:
+                selected_table_rows = [index.row() for index in selection_model.selectedRows()]
+            except Exception:
+                selected_table_rows = []
+        if not selected_table_rows:
+            try:
+                selected_table_rows = sorted({index.row() for index in self.table.selectedIndexes()})
+            except Exception:
+                selected_table_rows = []
+        return sorted(set(int(row) for row in selected_table_rows))
+
+    def _highlighted_data_row_indices(self):
+        source_indices = []
+        for table_row in self._highlighted_data_table_rows():
+            if table_row < 0 or table_row >= len(self._filtered_indices):
+                continue
+            source_idx = int(self._filtered_indices[table_row])
+            if source_idx not in self._excluded_indices:
+                source_indices.append(source_idx)
+        return source_indices
+
+    def _covariate_balance_row_indices(self):
+        if self._highlighted_data_table_rows():
+            return self._highlighted_data_row_indices()
+        return self.selected_row_indices()
+
+    def _covariate_balance_output_dir(self, regressor_name, row_count=None):
         base_dir_text = self.output_dir_edit.text().strip() if hasattr(self, "output_dir_edit") else ""
         if base_dir_text:
             base_dir = Path(base_dir_text).expanduser()
         else:
             base_dir = Path(self._default_output_dir_for_context()).expanduser()
+        n_rows = len(self._covariate_balance_row_indices()) if row_count is None else int(row_count)
         return (
             base_dir
             / "covariate_balance"
-            / f"reg-{_slugify_fragment(regressor_name)}_n-{len(self.selected_row_indices())}"
+            / f"reg-{_slugify_fragment(regressor_name)}_n-{n_rows}"
         )
 
     def _build_covariate_balance_input(self):
@@ -2034,8 +2150,15 @@ class NBSPrepareDialog(QDialog):
         if self._selected_regressor_type() == "continuous":
             raise ValueError("Covariate balance Love plots require a categorical regressor.")
 
-        selected_indices = self.selected_row_indices()
+        has_highlighted_rows = bool(self._highlighted_data_table_rows())
+        highlighted_indices = self._highlighted_data_row_indices()
+        selected_indices = highlighted_indices if has_highlighted_rows else self.selected_row_indices()
         if len(selected_indices) < 2:
+            if has_highlighted_rows:
+                raise ValueError(
+                    "Select at least two highlighted table rows, or clear the table selection "
+                    "to use all included rows for balance diagnostics."
+                )
             raise ValueError("Select at least two rows before running balance diagnostics.")
 
         column_order = []
@@ -2050,7 +2173,7 @@ class NBSPrepareDialog(QDialog):
             if covariate not in column_order:
                 column_order.append(covariate)
 
-        output_dir = self._covariate_balance_output_dir(regressor_name)
+        output_dir = self._covariate_balance_output_dir(regressor_name, row_count=len(selected_indices))
         output_dir.mkdir(parents=True, exist_ok=True)
         input_path = output_dir / (
             f"{self._source_path.stem}_key-{_slugify_fragment(self._matrix_key)}"
@@ -2063,7 +2186,7 @@ class NBSPrepareDialog(QDialog):
                 row = self._rows[int(idx)]
                 payload = {column: _display_text(row.get(column)) for column in column_order}
                 writer.writerow(payload)
-        return input_path, output_dir, regressor_name, nuisance_terms
+        return input_path, output_dir, regressor_name, nuisance_terms, has_highlighted_rows, len(selected_indices)
 
     def _run_covariate_balance_analysis(self):
         if self._process_is_running() or self._results_is_running():
@@ -2076,27 +2199,26 @@ class NBSPrepareDialog(QDialog):
             self._set_status("Covariate balance diagnostics are already running.")
             return
 
-        module_name = self._covariate_balance_module()
-        try:
-            module_spec = importlib.util.find_spec(module_name)
-        except (ImportError, AttributeError, ValueError):
-            module_spec = None
-        if module_spec is None:
-            self._set_status(
-                "Covariate balance diagnostics require a newer mrsitoolbox pip package. "
-                "Install or upgrade it with: pip install --upgrade mrsitoolbox"
-            )
+        command_prefix, launcher_error = self._covariate_balance_command_prefix()
+        if launcher_error:
+            self._set_status(launcher_error)
             return
         try:
-            input_path, output_dir, regressor_name, nuisance_terms = self._build_covariate_balance_input()
+            (
+                input_path,
+                output_dir,
+                regressor_name,
+                nuisance_terms,
+                using_highlighted_rows,
+                selected_row_count,
+            ) = self._build_covariate_balance_input()
         except Exception as exc:
             self._set_status(str(exc))
             return
 
         python_exe = sys.executable or "python3"
         command = [
-            "-m",
-            module_name,
+            *command_prefix,
             "--input",
             str(input_path),
             "--regressor",
@@ -2116,6 +2238,8 @@ class NBSPrepareDialog(QDialog):
         self._covariate_balance_process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
         self._covariate_balance_process.setProcessEnvironment(self._build_process_environment())
         self._append_terminal_line(f"[NBS-COVARS] Launch command: {shlex.join([python_exe] + command)}")
+        if using_highlighted_rows:
+            self._append_terminal_line(f"[NBS-COVARS] Using {selected_row_count} highlighted rows from the Data table.")
         self._set_status("Launching covariate balance diagnostics...")
         if hasattr(self, "covariate_balance_button"):
             self.covariate_balance_button.setText("Running...")
