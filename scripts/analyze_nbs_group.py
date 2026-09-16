@@ -48,6 +48,24 @@ SIMILARITY_PATH_RADII = {"left": 10.6, "right": 10.2}
 _OPEN_NILEARN_DISPLAYS = []
 
 
+def _display_debug_dict(data, title=None):
+    display_dict = getattr(debug, "display_dict", None)
+    if callable(display_dict):
+        display_dict(data, title=title)
+        return
+    if title:
+        title_fn = getattr(debug, "title", None)
+        if callable(title_fn):
+            title_fn(str(title))
+        else:
+            debug.info(str(title))
+    console_obj = getattr(debug, "console", None)
+    if console_obj is not None and hasattr(console_obj, "print"):
+        console_obj.print(data)
+    else:
+        debug.info(data)
+
+
 def _combine_signed(values):
     """Combine multiple values by keeping strongest magnitude if signs differ, else average."""
     vals = np.asarray(values, dtype=float)
@@ -1266,7 +1284,7 @@ metrics = {
     "npert": npert,
     "preproc": preproc,
 }
-debug.display_dict(metrics, title="Stored metadata")
+_display_debug_dict(metrics, title="Stored metadata")
 
 comp_masks = data.get("comp_masks")
 comp_mask = None

@@ -18,6 +18,8 @@ try:
     from window.shared.covariate_table import (
         CovariateFilterPage as _CovariateFilterPage,
         filter_row_indices as _filter_row_indices,
+        matches_numeric as _matches_numeric,
+        parse_numeric_filter_targets as _parse_numeric_filter_targets,
         parse_filter_values as _parse_filter_values,
     )
     from window.shared.covars import (
@@ -40,6 +42,8 @@ except Exception:
     from mrsi_viewer.window.shared.covariate_table import (
         CovariateFilterPage as _CovariateFilterPage,
         filter_row_indices as _filter_row_indices,
+        matches_numeric as _matches_numeric,
+        parse_numeric_filter_targets as _parse_numeric_filter_targets,
         parse_filter_values as _parse_filter_values,
     )
     from mrsi_viewer.window.shared.covars import (
@@ -75,7 +79,6 @@ try:
         QHBoxLayout,
         QLabel,
         QLineEdit,
-        QMessageBox,
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
@@ -105,7 +108,6 @@ except Exception:
         QHBoxLayout,
         QLabel,
         QLineEdit,
-        QMessageBox,
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
@@ -304,6 +306,97 @@ class _ImagePreviewDialog(QDialog):
         self.image_label.setPixmap(scaled)
 
 
+class _NBSComponentPValuesDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        result_path,
+        rows,
+        title="NBS Component P-Values",
+        message="Review component p-values before deciding whether to save this result bundle.",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.keep_result = False
+        self.setWindowTitle(title)
+        self.resize(820, 520)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        message_label = QLabel(str(message))
+        message_label.setWordWrap(True)
+        root.addWidget(message_label)
+
+        result_label = QLabel(str(result_path))
+        result_label.setWordWrap(True)
+        root.addWidget(result_label)
+
+        self.table = QTableWidget()
+        headers = ["Component", "Tail", "Tail component", "p-value", "Raw p-value", "Significant"]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(len(rows))
+        self.table.setAlternatingRowColors(True)
+        if QT_LIB == 6:
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            header = self.table.horizontalHeader()
+            header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        else:
+            self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+            header = self.table.horizontalHeader()
+            header.setSectionResizeMode(QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.Stretch)
+        for row_idx, row in enumerate(rows):
+            values = [
+                str(row.get("component_idx", "")),
+                str(row.get("tail", "")),
+                str(row.get("tail_component_idx", "")),
+                self._format_pvalue(row.get("pvalue")),
+                self._format_pvalue(row.get("pvalue_uncorrected")),
+                "yes" if bool(row.get("significant", False)) else "no",
+            ]
+            for col_idx, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~_is_editable_flag())
+                self.table.setItem(row_idx, col_idx, item)
+        self.table.resizeColumnsToContents()
+        root.addWidget(self.table, 1)
+
+        if not rows:
+            empty_label = QLabel("No component p-values were available in the result summary.")
+            empty_label.setWordWrap(True)
+            root.addWidget(empty_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self._save_clicked)
+        button_row.addWidget(save_button)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(cancel_button)
+        root.addLayout(button_row)
+
+    @staticmethod
+    def _format_pvalue(value):
+        try:
+            numeric = float(value)
+        except Exception:
+            return "NA"
+        if not np.isfinite(numeric):
+            return "NA"
+        return f"{numeric:.6g}"
+
+    def _save_clicked(self):
+        self.keep_result = True
+        self.accept()
+
+
 
 class NBSPrepareDialog(QDialog):
     """Dialog to prepare NBS covariates and select filtered row subsets."""
@@ -312,9 +405,9 @@ class NBSPrepareDialog(QDialog):
     REGRESSOR_TYPE_MODEL_OPTIONS = ("Auto", "Categorical", "Continuous")
     MODALITY_OPTIONS = ("fmri", "mrsi", "dwi", "anat", "morph", "pet", "other")
     TEST_OPTIONS = ("t-test", "Ftest")
-    STEP_TITLES = ("Data", "Model", "NBS Settings", "Run", "Results")
-    RUN_STEP_INDEX = 3
-    RESULTS_STEP_INDEX = 4
+    STEP_TITLES = ("Data", "Network", "Model", "NBS Settings", "Run", "Results")
+    RUN_STEP_INDEX = 4
+    RESULTS_STEP_INDEX = 5
     NUMERIC_RANGE_RE = re.compile(
         r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*-\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*$"
     )
@@ -360,6 +453,10 @@ class NBSPrepareDialog(QDialog):
         self._columns, self._rows = _covars_to_rows(covars_info)
         self._filtered_indices = list(range(len(self._rows)))
         self._excluded_indices = set()
+        self._network_columns = ["Matrix index", "Parcel label", "Parcel name"]
+        self._parcel_rows, self._parcel_metadata_error = self._load_network_rows()
+        self._filtered_parcel_indices = list(range(len(self._parcel_rows)))
+        self._excluded_parcel_indices = set()
         self._covar_checks = {}
         self._confound_buttons = {}
         self._regressor_buttons = {}
@@ -381,6 +478,7 @@ class NBSPrepareDialog(QDialog):
         self._current_step = 0
         self._model_updating = False
         self._data_table_refreshing = False
+        self._network_table_refreshing = False
         self._log_expanded = False
         self._log_auto_expanded = False
         self.terminal_output = None
@@ -391,6 +489,7 @@ class NBSPrepareDialog(QDialog):
         self.set_theme(theme_name)
         self._build_ui()
         self._refresh_table()
+        self._refresh_network_table()
         self._update_test_options()
         self._update_run_state()
 
@@ -693,6 +792,7 @@ class NBSPrepareDialog(QDialog):
         self._step_buttons = self.workflow_shell.step_buttons
         self.step_stack = self.workflow_shell.step_stack
         self.workflow_shell.add_step(self._build_step_data())
+        self.workflow_shell.add_step(self._build_step_network())
         self.workflow_shell.add_step(self._build_step_model())
         self.workflow_shell.add_step(self._build_step_nbs_settings())
         self.workflow_shell.add_step(self._build_step_run())
@@ -766,6 +866,28 @@ class NBSPrepareDialog(QDialog):
         self.data_page.set_filter_callbacks(self._apply_filter, self._reset_filter)
         self.table.setSortingEnabled(False)
         return self.data_page
+
+    def _build_step_network(self):
+        self.network_page = _CovariateFilterPage(
+            self._network_columns,
+            exclude_mode="toggle_button",
+            filter_field_label="Parcel field",
+            filter_placeholder="e.g. 10, 32-46 or ctx-rh-parstriangularis_1",
+        )
+        self.network_dataset_summary_label = self.network_page.dataset_summary_label
+        self.network_filter_covar_combo = self.network_page.filter_covar_combo
+        self.network_filter_value_edit = self.network_page.filter_value_edit
+        self.network_filter_button = self.network_page.filter_button
+        self.network_filter_reset_button = self.network_page.filter_reset_button
+        self.network_table = self.network_page.table
+        self.network_showing_parcels_label = self.network_page.showing_rows_label
+        self.network_dataset_summary_label.setText(self._network_summary_text())
+        self.network_page.set_filter_callbacks(self._apply_network_filter, self._reset_network_filter)
+        parcel_name_idx = self.network_filter_covar_combo.findText("Parcel name")
+        if parcel_name_idx >= 0:
+            self.network_filter_covar_combo.setCurrentIndex(parcel_name_idx)
+        self.network_table.setSortingEnabled(False)
+        return self.network_page
 
     def _build_step_model(self):
         page = QWidget()
@@ -1316,6 +1438,8 @@ class NBSPrepareDialog(QDialog):
         regressor = selected.get("regressor") or "none"
         confounds = ", ".join(selected.get("nuisance") or []) or "none"
         n_included = len(self.selected_row_indices())
+        n_parcels = len(self.selected_parcel_indices())
+        total_parcels = len(getattr(self, "_parcel_rows", []) or [])
         threshold = (
             f"{float(self.t_thresh_spin.value()):g}"
             if hasattr(self, "t_thresh_spin")
@@ -1350,6 +1474,7 @@ class NBSPrepareDialog(QDialog):
             f"Component size: {size_label}\n"
             f"Tail (from contrast): {tail_label}\n"
             f"N included: {n_included}\n"
+            f"Parcels: {n_parcels}/{total_parcels}\n"
             f"Permutations: {nperm}\n"
             f"Seed: {seed_label}\n"
             f"Threshold: {threshold}"
@@ -1361,6 +1486,48 @@ class NBSPrepareDialog(QDialog):
         included = len(self.selected_row_indices())
         self.showing_rows_label.setText(
             f"Showing {len(self._filtered_indices)}/{len(self._rows)} rows | Included: {included}"
+        )
+
+    def _network_summary_text(self):
+        summary = (
+            f"{self._source_path.name} | key: {self._matrix_key} | "
+            f"parcels: {len(getattr(self, '_parcel_rows', []) or [])}"
+        )
+        error = str(getattr(self, "_parcel_metadata_error", "") or "").strip()
+        if error:
+            summary = f"{summary} | metadata warning: {error}"
+        return summary
+
+    def _load_network_rows(self):
+        try:
+            with np.load(self._source_path, allow_pickle=True) as npz:
+                labels, names = self._extract_parcel_metadata(npz)
+        except Exception as exc:
+            return [], str(exc)
+
+        labels = np.asarray(labels).reshape(-1)
+        names = np.asarray(names, dtype=object).reshape(-1)
+        count = min(int(labels.shape[0]), int(names.shape[0]))
+        rows = []
+        for idx in range(count):
+            rows.append(
+                {
+                    "Matrix index": str(idx),
+                    "Parcel label": _display_text(labels[idx]),
+                    "Parcel name": _display_text(names[idx]),
+                }
+            )
+        error = None
+        if labels.shape[0] != names.shape[0]:
+            error = f"parcel label/name length mismatch ({labels.shape[0]} vs {names.shape[0]})"
+        return rows, error
+
+    def _update_showing_parcels_label(self):
+        if not hasattr(self, "network_showing_parcels_label"):
+            return
+        included = len(self.selected_parcel_indices())
+        self.network_showing_parcels_label.setText(
+            f"Showing {len(self._filtered_parcel_indices)}/{len(self._parcel_rows)} parcels | Included: {included}"
         )
 
     def _set_status(self, text):
@@ -1575,7 +1742,7 @@ class NBSPrepareDialog(QDialog):
             or self._covariate_balance_is_running()
             or self._results_is_running()
         )
-        can_run = len(classes) >= 2 and not any_busy
+        can_run = len(classes) >= 2 and len(self.selected_parcel_indices()) >= 2 and not any_busy
         if hasattr(self, "run_button"):
             self.run_button.setEnabled(can_run and self._current_step == self.RUN_STEP_INDEX)
         result_path = str(self._last_result_npz_path or "").strip()
@@ -1604,17 +1771,10 @@ class NBSPrepareDialog(QDialog):
             self.next_button.setVisible(self._current_step < (len(self.STEP_TITLES) - 1))
             self.next_button.setEnabled((not any_busy) and next_enabled)
         if hasattr(self, "covariate_balance_button"):
-            selected = self.selected_covariates()
-            regressor_type = self._selected_regressor_type()
-            balance_row_count = len(self._covariate_balance_row_indices())
-            can_balance = (
-                bool(selected.get("regressor"))
-                and len(selected.get("nuisance") or []) >= 1
-                and balance_row_count >= 2
-                and regressor_type != "continuous"
-                and (not any_busy)
+            self.covariate_balance_button.setEnabled(not any_busy)
+            self.covariate_balance_button.setToolTip(
+                self._covariate_balance_status_text(any_busy=any_busy)
             )
-            self.covariate_balance_button.setEnabled(can_balance)
 
     def _on_covar_toggled(self, covar_name, checked):
         _ = covar_name
@@ -1749,6 +1909,105 @@ class NBSPrepareDialog(QDialog):
                 f"Showing {len(self._filtered_indices)}/{len(self._rows)} rows."
             )
 
+    def _on_exclude_parcel_toggled(self, source_idx, checked):
+        if self._network_table_refreshing:
+            return
+        source_idx = int(source_idx)
+        if checked:
+            self._excluded_parcel_indices.add(source_idx)
+        else:
+            self._excluded_parcel_indices.discard(source_idx)
+        included = len(self.selected_parcel_indices())
+        self._update_showing_parcels_label()
+        self._update_run_state()
+        self._update_run_summary()
+        if included < 2:
+            self._set_status("Select at least two parcels for NBS.")
+        else:
+            self._set_status(
+                f"Network parcels updated. Excluded: {len(self._excluded_parcel_indices)}."
+            )
+
+    def _filter_network_row_indices(self, field_name, target_text):
+        field_name = str(field_name or "").strip()
+        target_text = str(target_text or "").strip()
+        if not field_name:
+            return None, None, "Select a parcel field to filter."
+        if target_text == "":
+            return None, None, "Enter a parcel filter value."
+
+        target_values = _parse_filter_values(target_text)
+        if not target_values:
+            return None, None, "Enter at least one parcel filter value."
+
+        values = [row.get(field_name) for row in self._parcel_rows]
+        numeric = _column_is_numeric(values)
+        if numeric:
+            try:
+                exact_targets, range_targets = _parse_numeric_filter_targets(
+                    target_values,
+                    self.NUMERIC_RANGE_RE,
+                )
+            except Exception:
+                return None, None, "Selected parcel field is numeric. Use values like 10,11 or ranges like 32-46."
+            matched = [
+                row_idx
+                for row_idx, value in enumerate(values)
+                if _matches_numeric(value, exact_targets, range_targets)
+            ]
+            return matched, target_values, None
+
+        targets = [str(value).strip().casefold() for value in target_values if str(value).strip()]
+        matched = []
+        for row_idx, value in enumerate(values):
+            text = _display_text(value).strip().casefold()
+            if text and any(target in text for target in targets):
+                matched.append(row_idx)
+        return matched, target_values, None
+
+    def _apply_network_filter(self):
+        if not self._network_columns:
+            self._set_status("No parcel fields available to filter.")
+            return
+
+        matched, target_values, error = self._filter_network_row_indices(
+            self.network_filter_covar_combo.currentText(),
+            self.network_filter_value_edit.text(),
+        )
+        if error:
+            self._set_status(error)
+            return
+        self._filtered_parcel_indices = matched
+        self._refresh_network_table()
+        self._update_run_state()
+        self._update_run_summary()
+        self._set_status(
+            f"Network filter applied: {self.network_filter_covar_combo.currentText().strip()} in [{', '.join(target_values)}]. "
+            f"Showing {len(self._filtered_parcel_indices)}/{len(self._parcel_rows)} parcels."
+        )
+
+    def _reset_network_filter(self):
+        self._filtered_parcel_indices = list(range(len(self._parcel_rows)))
+        self._refresh_network_table()
+        self._update_run_state()
+        self._update_run_summary()
+        self._set_status(f"Network filter reset. Showing {len(self._filtered_parcel_indices)} parcels.")
+
+    def _refresh_network_table(self):
+        if not hasattr(self, "network_page"):
+            return
+        self._network_table_refreshing = True
+        self.network_page.populate_rows(
+            self._filtered_parcel_indices,
+            self._parcel_rows,
+            self._excluded_parcel_indices,
+            on_exclude_toggled=self._on_exclude_parcel_toggled,
+            resize_to_contents=True,
+        )
+        self._network_table_refreshing = False
+        self.network_dataset_summary_label.setText(self._network_summary_text())
+        self._update_showing_parcels_label()
+
     def _subject_session_pairs(self):
         lower_map = {name.lower(): name for name in self._columns}
         participant_col = lower_map.get("participant_id")
@@ -1775,6 +2034,18 @@ class NBSPrepareDialog(QDialog):
             "selected_pairs": self._subject_session_pairs(),
             "filter_covar": self.filter_covar_combo.currentText().strip(),
             "filter_values": _parse_filter_values(self.filter_value_edit.text()),
+            "selected_parcel_indices": self.selected_parcel_indices(),
+            "excluded_parcels": self.excluded_parcel_records(),
+            "network_filter_field": (
+                self.network_filter_covar_combo.currentText().strip()
+                if hasattr(self, "network_filter_covar_combo")
+                else ""
+            ),
+            "network_filter_values": (
+                _parse_filter_values(self.network_filter_value_edit.text())
+                if hasattr(self, "network_filter_value_edit")
+                else []
+            ),
             "covariates": selected,
             "regressor_classes": self._regressor_classes(),
             "test": self.test_combo.currentText().strip(),
@@ -1880,8 +2151,17 @@ class NBSPrepareDialog(QDialog):
             subject_ids, session_ids = self._extract_subject_session(covars_subset)
 
             matrix_subj_list = self._to_subject_stack(raw_matrix, axis, indices)
-            matrix_pop_avg = np.asarray(matrix_subj_list.mean(axis=0), dtype=float)
             labels, names = self._extract_parcel_metadata(npz)
+            labels = np.asarray(labels).reshape(-1)
+            names = np.asarray(names, dtype=object).reshape(-1)
+            parcel_count = int(matrix_subj_list.shape[1])
+            if matrix_subj_list.shape[2] != parcel_count:
+                raise ValueError("Selected matrix stack is not square after row filtering.")
+            if labels.shape[0] != parcel_count or names.shape[0] != parcel_count:
+                raise ValueError(
+                    "Parcel metadata length does not match matrix dimensions "
+                    f"({labels.shape[0]} labels, {names.shape[0]} names, {parcel_count} matrix parcels)."
+                )
 
             metabolites = np.asarray(npz["metabolites"]) if "metabolites" in npz else np.array([])
             if "metab_profiles_subj_list" in npz:
@@ -1898,6 +2178,23 @@ class NBSPrepareDialog(QDialog):
             selected_modality = self.modality_combo.currentText().strip().lower()
             modality = selected_modality or modality_from_npz or "mrsi"
 
+        keep_mask, excluded_parcel_indices = self._parcel_keep_mask(parcel_count)
+        if int(keep_mask.sum()) < 2:
+            raise ValueError("NBS run requires at least two included parcels.")
+        excluded_parcel_labels = np.asarray([], dtype=object)
+        excluded_parcel_names = np.asarray([], dtype=object)
+        if excluded_parcel_indices:
+            excluded_arr = np.asarray(excluded_parcel_indices, dtype=int)
+            excluded_parcel_labels = labels[excluded_arr]
+            excluded_parcel_names = names[excluded_arr]
+            matrix_subj_list = matrix_subj_list[:, keep_mask, :][:, :, keep_mask]
+            labels = labels[keep_mask]
+            names = names[keep_mask]
+            if getattr(metab_profiles, "ndim", 0) >= 2 and metab_profiles.shape[1] == parcel_count:
+                metab_profiles = metab_profiles[:, keep_mask, ...]
+        matrix_pop_avg = np.asarray(matrix_subj_list.mean(axis=0), dtype=float)
+        keep_indices = np.where(keep_mask)[0].astype(int)
+
         reg_name = self._regressor_name() or "regressor"
         # Path.stem only strips ".npz", so re-subsetting a source that is itself an
         # already-built "..._nbs_input.npz" (e.g. re-importing a prior result's
@@ -1906,9 +2203,10 @@ class NBSPrepareDialog(QDialog):
         source_stem = self._source_path.stem
         if source_stem.endswith("_nbs_input"):
             source_stem = source_stem[: -len("_nbs_input")]
+        parcel_suffix = f"_p-{int(keep_mask.sum())}" if excluded_parcel_indices else ""
         subset_name = (
             f"{source_stem}_key-{_slugify_fragment(self._matrix_key)}"
-            f"_reg-{_slugify_fragment(reg_name)}_n-{indices.size}_nbs_input.npz"
+            f"_reg-{_slugify_fragment(reg_name)}_n-{indices.size}{parcel_suffix}_nbs_input.npz"
         )
         subset_path = self._source_path.with_name(subset_name)
         np.savez(
@@ -1921,6 +2219,11 @@ class NBSPrepareDialog(QDialog):
             metab_profiles_subj_list=np.asarray(metab_profiles),
             parcel_labels_group=np.asarray(labels),
             parcel_names_group=np.asarray(names),
+            parcel_keep_indices=keep_indices,
+            parcel_excluded_indices=np.asarray(excluded_parcel_indices, dtype=int),
+            parcel_excluded_labels=np.asarray(excluded_parcel_labels),
+            parcel_excluded_names=np.asarray(excluded_parcel_names, dtype=object),
+            source_parcel_count=np.asarray(parcel_count, dtype=int),
             covars=covars_subset,
             group=np.asarray(group),
             modality=np.asarray(modality),
@@ -2129,6 +2432,37 @@ class NBSPrepareDialog(QDialog):
         if self._highlighted_data_table_rows():
             return self._highlighted_data_row_indices()
         return self.selected_row_indices()
+
+    def _covariate_balance_status_text(self, any_busy=False):
+        if any_busy:
+            return "Wait for the active NBS task to finish."
+        selected = self.selected_covariates()
+        regressor_name = str(selected.get("regressor") or "").strip()
+        if not regressor_name:
+            return "Select exactly one covariate as Regressor before running balance diagnostics."
+        nuisance_terms = [
+            str(name).strip()
+            for name in list(selected.get("nuisance") or [])
+            if str(name).strip() and str(name).strip() != regressor_name
+        ]
+        if not nuisance_terms:
+            return "Select at least one nuisance covariate before running balance diagnostics."
+        if self._selected_regressor_type() == "continuous":
+            return "Covariate balance Love plots require a categorical regressor."
+        has_highlighted_rows = bool(self._highlighted_data_table_rows())
+        selected_indices = (
+            self._highlighted_data_row_indices()
+            if has_highlighted_rows
+            else self.selected_row_indices()
+        )
+        if len(selected_indices) < 2:
+            if has_highlighted_rows:
+                return (
+                    "Select at least two highlighted Data table rows, or clear the table "
+                    "selection to use all included rows."
+                )
+            return "Select at least two rows before running balance diagnostics."
+        return "Run covariate balance diagnostics for the current Data table selection."
 
     def _covariate_balance_output_dir(self, regressor_name, row_count=None):
         base_dir_text = self.output_dir_edit.text().strip() if hasattr(self, "output_dir_edit") else ""
@@ -2489,6 +2823,9 @@ class NBSPrepareDialog(QDialog):
         if len(classes) < 2:
             self._set_status("Regressor must contain at least 2 classes in the current selection.")
             return
+        if len(self.selected_parcel_indices()) < 2:
+            self._set_status("NBS run requires at least two included parcels.")
+            return
         selected_test = self.test_combo.currentText().strip()
         if selected_test == "Ftest" and len(classes) <= 2:
             self._set_status("Ftest is only available when regressor has more than 2 classes.")
@@ -2548,24 +2885,114 @@ class NBSPrepareDialog(QDialog):
             self._run_process = None
             return
 
+    @staticmethod
+    def _component_pvalue_rows(result_path=None, summary=None):
+        rows = []
+        summary_dict = dict(summary or {}) if isinstance(summary, dict) else {}
+        components = summary_dict.get("components") or []
+        if isinstance(components, list) and components:
+            for idx, component in enumerate(components):
+                if not isinstance(component, dict):
+                    continue
+                rows.append(
+                    {
+                        "component_idx": int(component.get("component_idx", idx)),
+                        "tail": str(component.get("tail", "")),
+                        "tail_component_idx": int(component.get("tail_component_idx", idx)),
+                        "pvalue": component.get("pvalue"),
+                        "pvalue_uncorrected": component.get(
+                            "pvalue_uncorrected",
+                            component.get("pvalue"),
+                        ),
+                        "significant": bool(component.get("significant", False)),
+                    }
+                )
+            return rows
+
+        if result_path is None:
+            return rows
+        try:
+            result = Path(str(result_path)).expanduser()
+        except Exception:
+            return rows
+        if not result.is_file():
+            return rows
+        try:
+            with np.load(result, allow_pickle=True) as npz:
+                if "comp_pvals" not in npz:
+                    return rows
+                pvals = np.asarray(npz["comp_pvals"], dtype=float).reshape(-1)
+                raw_pvals = (
+                    np.asarray(npz["comp_pvals_uncorrected"], dtype=float).reshape(-1)
+                    if "comp_pvals_uncorrected" in npz
+                    else pvals
+                )
+                if raw_pvals.shape[0] != pvals.shape[0]:
+                    raw_pvals = pvals
+                if "comp_tails" in npz:
+                    tails = [_display_text(value) for value in np.asarray(npz["comp_tails"]).reshape(-1)]
+                else:
+                    tail = _display_text(npz["test_tail"]) if "test_tail" in npz else ""
+                    tails = [tail] * int(pvals.shape[0])
+                if len(tails) != pvals.shape[0]:
+                    tail = tails[0] if tails else ""
+                    tails = [tail] * int(pvals.shape[0])
+                tail_indices = (
+                    np.asarray(npz["comp_tail_indices"], dtype=int).reshape(-1)
+                    if "comp_tail_indices" in npz
+                    else np.arange(int(pvals.shape[0]), dtype=int)
+                )
+                if tail_indices.shape[0] != pvals.shape[0]:
+                    tail_indices = np.arange(int(pvals.shape[0]), dtype=int)
+                sig_indices = set()
+                if "sig_indices" in npz:
+                    try:
+                        sig_indices = {int(i) for i in np.asarray(npz["sig_indices"], dtype=int).reshape(-1)}
+                    except Exception:
+                        sig_indices = set()
+        except Exception:
+            return rows
+        for idx, pvalue in enumerate(pvals):
+            rows.append(
+                {
+                    "component_idx": int(idx),
+                    "tail": str(tails[idx]),
+                    "tail_component_idx": int(tail_indices[idx]),
+                    "pvalue": float(pvalue),
+                    "pvalue_uncorrected": float(raw_pvals[idx]),
+                    "significant": int(idx) in sig_indices,
+                }
+            )
+        return rows
+
     def _confirm_save_no_significant_result(self, staged_result_path):
         result_path = Path(str(staged_result_path)).expanduser()
         summary = dict(self._last_nbs_summary or {})
         pvalue = summary.get("global_pvalue", None)
-        pvalue_text = f"{float(pvalue):.6g}" if pvalue is not None else "NA"
-        reply = QMessageBox.question(
-            self,
-            "No Significant NBS Result",
-            (
-                "No significant NBS components were detected.\n\n"
-                f"Global p-value: {pvalue_text}\n"
-                f"Staged bundle: {result_path}\n\n"
-                "Do you want to save the staged result bundle anyway?"
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        try:
+            pvalue_text = f"{float(pvalue):.6g}" if pvalue is not None else "NA"
+        except Exception:
+            pvalue_text = str(pvalue)
+        rows = self._component_pvalue_rows(result_path=result_path, summary=summary)
+        message = (
+            "No significant NBS components were detected.\n"
+            f"Global p-value: {pvalue_text}\n"
+            "Review all component p-values below, then choose whether to save the staged bundle."
         )
-        return reply == QMessageBox.StandardButton.Yes
+        dialog = _NBSComponentPValuesDialog(
+            result_path=result_path,
+            rows=rows,
+            title="No Significant NBS Result",
+            message=message,
+            parent=self,
+        )
+        _theme, style = _workflow_dialog_stylesheet(self._theme_name)
+        dialog.setStyleSheet(style)
+        if hasattr(dialog, "exec"):
+            dialog.exec()
+        else:
+            dialog.exec_()
+        return bool(dialog.keep_result)
 
     def _cleanup_staged_result(self, result_path, keep_if_same=None):
         try:
@@ -2916,6 +3343,43 @@ class NBSPrepareDialog(QDialog):
 
     def selected_row_indices(self):
         return [idx for idx in self._filtered_indices if idx not in self._excluded_indices]
+
+    def selected_parcel_indices(self):
+        return [
+            idx
+            for idx in range(len(getattr(self, "_parcel_rows", []) or []))
+            if idx not in getattr(self, "_excluded_parcel_indices", set())
+        ]
+
+    def _parcel_keep_mask(self, parcel_count):
+        parcel_count = int(parcel_count)
+        excluded = sorted(
+            {
+                int(idx)
+                for idx in getattr(self, "_excluded_parcel_indices", set())
+                if 0 <= int(idx) < parcel_count
+            }
+        )
+        keep_mask = np.ones(parcel_count, dtype=bool)
+        if excluded:
+            keep_mask[np.asarray(excluded, dtype=int)] = False
+        return keep_mask, excluded
+
+    def excluded_parcel_records(self):
+        rows = getattr(self, "_parcel_rows", []) or []
+        records = []
+        for idx in sorted(getattr(self, "_excluded_parcel_indices", set())):
+            if idx < 0 or idx >= len(rows):
+                continue
+            row = rows[int(idx)]
+            records.append(
+                {
+                    "matrix_index": int(idx),
+                    "parcel_label": _display_text(row.get("Parcel label")),
+                    "parcel_name": _display_text(row.get("Parcel name")),
+                }
+            )
+        return records
 
 
 __all__ = ["NBSPrepareDialog"]

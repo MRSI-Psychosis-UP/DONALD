@@ -167,6 +167,9 @@ class CovariateFilterPage(QWidget):
         *,
         exclude_mode: str = "toggle_button",
         exclude_object_name: str = "tableExcludeButton",
+        filter_field_label: str = "Covariate",
+        filter_value_label: str = "Value",
+        filter_placeholder: str = "e.g. 0,1 or 32-46",
         parent=None,
     ):
         super().__init__(parent)
@@ -181,13 +184,13 @@ class CovariateFilterPage(QWidget):
         layout.addWidget(self.dataset_summary_label)
 
         filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Covariate"))
+        filter_row.addWidget(QLabel(str(filter_field_label or "Covariate")))
         self.filter_covar_combo = QComboBox()
         self.filter_covar_combo.addItems(self._columns)
         filter_row.addWidget(self.filter_covar_combo)
-        filter_row.addWidget(QLabel("Value"))
+        filter_row.addWidget(QLabel(str(filter_value_label or "Value")))
         self.filter_value_edit = QLineEdit("")
-        self.filter_value_edit.setPlaceholderText("e.g. 0,1 or 32-46")
+        self.filter_value_edit.setPlaceholderText(str(filter_placeholder or "e.g. 0,1 or 32-46"))
         filter_row.addWidget(self.filter_value_edit, 1)
         self.filter_button = QPushButton("Filter")
         filter_row.addWidget(self.filter_button)

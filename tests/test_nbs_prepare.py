@@ -2,6 +2,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
+
 from window.nbs_prepare import (
     NBSPrepareDialog,
     _find_covariate_balance_script,
@@ -42,6 +44,26 @@ class _LineEdit:
 
     def text(self):
         return self._text
+
+
+class _Combo:
+    def __init__(self, text):
+        self._text = text
+
+    def currentText(self):
+        return self._text
+
+
+class _Button:
+    def __init__(self):
+        self.enabled = None
+        self.tooltip = ""
+
+    def setEnabled(self, enabled):
+        self.enabled = bool(enabled)
+
+    def setToolTip(self, text):
+        self.tooltip = str(text)
 
 
 class NBSPrepareDialogTests(unittest.TestCase):
@@ -116,6 +138,213 @@ class NBSPrepareDialogTests(unittest.TestCase):
             )
 
         self.assertEqual(found, script_path)
+
+    def test_network_filter_does_not_limit_selected_parcels_without_exclusion(self):
+        dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
+        dialog._parcel_rows = [
+            {"Matrix index": "0", "Parcel label": "10", "Parcel name": "ctx-a"},
+            {"Matrix index": "1", "Parcel label": "11", "Parcel name": "ctx-b"},
+            {"Matrix index": "2", "Parcel label": "12", "Parcel name": "ctx-c"},
+        ]
+        dialog._filtered_parcel_indices = [1]
+        dialog._excluded_parcel_indices = {2}
+
+        self.assertEqual(dialog.selected_parcel_indices(), [0, 1])
+
+    def test_network_filter_matches_text_substrings_case_insensitively(self):
+        dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
+        dialog._parcel_rows = [
+            {"Matrix index": "0", "Parcel label": "10", "Parcel name": "ctx-rh-cerebellum"},
+            {"Matrix index": "1", "Parcel label": "11", "Parcel name": "ctx-lh-frontal"},
+            {"Matrix index": "2", "Parcel label": "12", "Parcel name": "subc-thalamus"},
+        ]
+
+        matched, target_values, error = dialog._filter_network_row_indices("Parcel name", "CER")
+
+        self.assertIsNone(error)
+        self.assertEqual(target_values, ["CER"])
+        self.assertEqual(matched, [0])
+
+    def test_network_filter_comma_separated_text_terms_match_as_or(self):
+        dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
+        dialog._parcel_rows = [
+            {"Matrix index": "0", "Parcel label": "10", "Parcel name": "cerebellum-right"},
+            {"Matrix index": "1", "Parcel label": "11", "Parcel name": "ctx-lh-frontal"},
+            {"Matrix index": "2", "Parcel label": "12", "Parcel name": "subc-thalamus"},
+        ]
+
+        matched, target_values, error = dialog._filter_network_row_indices("Parcel name", "cer,ctx")
+
+        self.assertIsNone(error)
+        self.assertEqual(target_values, ["cer", "ctx"])
+        self.assertEqual(matched, [0, 1])
+
+    def test_network_filter_keeps_numeric_ranges_for_labels(self):
+        dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
+        dialog._parcel_rows = [
+            {"Matrix index": "0", "Parcel label": "10", "Parcel name": "a"},
+            {"Matrix index": "1", "Parcel label": "11", "Parcel name": "b"},
+            {"Matrix index": "2", "Parcel label": "20", "Parcel name": "c"},
+        ]
+
+        matched, _target_values, error = dialog._filter_network_row_indices("Parcel label", "10-11")
+
+        self.assertIsNone(error)
+        self.assertEqual(matched, [0, 1])
+
+    def test_covariate_balance_button_remains_clickable_when_setup_needs_attention(self):
+        dialog = type("DialogStub", (), {})()
+        dialog._update_run_state = NBSPrepareDialog._update_run_state.__get__(dialog)
+        dialog._covariate_balance_status_text = NBSPrepareDialog._covariate_balance_status_text.__get__(dialog)
+        dialog._regressor_classes = lambda: ["0", "1"]
+        dialog._process_is_running = lambda: False
+        dialog._export_is_running = lambda: False
+        dialog._covariate_balance_is_running = lambda: False
+        dialog._results_is_running = lambda: False
+        dialog.selected_parcel_indices = lambda: [0, 1]
+        dialog._last_result_npz_path = None
+        dialog.RESULTS_STEP_INDEX = NBSPrepareDialog.RESULTS_STEP_INDEX
+        dialog.RUN_STEP_INDEX = NBSPrepareDialog.RUN_STEP_INDEX
+        dialog.STEP_TITLES = NBSPrepareDialog.STEP_TITLES
+        dialog._current_step = NBSPrepareDialog.RUN_STEP_INDEX
+        dialog._step_buttons = []
+        dialog.covariate_balance_button = _Button()
+        dialog.selected_covariates = lambda: {"regressor": "Diag", "nuisance": ["Age"]}
+        dialog._selected_regressor_type = lambda: "categorical"
+        dialog._highlighted_data_table_rows = lambda: [0]
+        dialog._highlighted_data_row_indices = lambda: [0]
+        dialog.selected_row_indices = lambda: [0, 1, 2]
+
+        dialog._update_run_state()
+
+        self.assertTrue(dialog.covariate_balance_button.enabled)
+        self.assertIn("Select at least two highlighted Data table rows", dialog.covariate_balance_button.tooltip)
+
+    def test_component_pvalue_rows_preserve_two_tail_summary_components(self):
+        rows = NBSPrepareDialog._component_pvalue_rows(
+            summary={
+                "components": [
+                    {
+                        "component_idx": 0,
+                        "tail": "right",
+                        "tail_component_idx": 0,
+                        "pvalue": 0.08,
+                        "pvalue_uncorrected": 0.04,
+                        "significant": False,
+                    },
+                    {
+                        "component_idx": 1,
+                        "tail": "left",
+                        "tail_component_idx": 0,
+                        "pvalue": 0.02,
+                        "pvalue_uncorrected": 0.01,
+                        "significant": True,
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "component_idx": 0,
+                    "tail": "right",
+                    "tail_component_idx": 0,
+                    "pvalue": 0.08,
+                    "pvalue_uncorrected": 0.04,
+                    "significant": False,
+                },
+                {
+                    "component_idx": 1,
+                    "tail": "left",
+                    "tail_component_idx": 0,
+                    "pvalue": 0.02,
+                    "pvalue_uncorrected": 0.01,
+                    "significant": True,
+                },
+            ],
+        )
+
+    def test_component_pvalue_rows_fall_back_to_result_npz_tail_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "components_all.npz"
+            np.savez(
+                result_path,
+                comp_pvals=np.asarray([0.12, 0.44]),
+                comp_pvals_uncorrected=np.asarray([0.06, 0.22]),
+                comp_tails=np.asarray(["right", "left"], dtype=object),
+                comp_tail_indices=np.asarray([0, 1]),
+                sig_indices=np.asarray([0]),
+            )
+
+            rows = NBSPrepareDialog._component_pvalue_rows(result_path=result_path)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["tail"], "right")
+        self.assertEqual(rows[1]["tail"], "left")
+        self.assertEqual(rows[0]["pvalue"], 0.12)
+        self.assertEqual(rows[0]["pvalue_uncorrected"], 0.06)
+        self.assertTrue(rows[0]["significant"])
+        self.assertFalse(rows[1]["significant"])
+
+    def test_filtered_conn_subset_removes_excluded_parcel_rows_and_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            source_path = tmp_root / "source_stack.npz"
+            matrix = np.arange(3 * 4 * 4, dtype=float).reshape(3, 4, 4)
+            profiles = np.arange(3 * 4 * 2, dtype=float).reshape(3, 4, 2)
+            covars = np.asarray(
+                [
+                    ("sub-001", "V1", 0),
+                    ("sub-002", "V1", 1),
+                    ("sub-003", "V1", 0),
+                ],
+                dtype=[("participant_id", "U12"), ("session_id", "U4"), ("Diag", "i4")],
+            )
+            np.savez(
+                source_path,
+                matrix_subj_list=matrix,
+                covars=covars,
+                parcel_labels_group=np.asarray([10, 11, 12, 13]),
+                parcel_names_group=np.asarray(["ctx-a", "ctx-b", "ctx-c", "ctx-d"], dtype=object),
+                metabolites=np.asarray(["CrPCr", "GluGln"], dtype=object),
+                metab_profiles_subj_list=profiles,
+                group=np.asarray("test-group"),
+                modality=np.asarray("mrsi"),
+            )
+
+            dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
+            dialog._source_path = source_path
+            dialog._matrix_key = "matrix_subj_list"
+            dialog._filtered_indices = [0, 2]
+            dialog._excluded_indices = set()
+            dialog._excluded_parcel_indices = {1, 3}
+            dialog._parcel_rows = [
+                {"Matrix index": "0", "Parcel label": "10", "Parcel name": "ctx-a"},
+                {"Matrix index": "1", "Parcel label": "11", "Parcel name": "ctx-b"},
+                {"Matrix index": "2", "Parcel label": "12", "Parcel name": "ctx-c"},
+                {"Matrix index": "3", "Parcel label": "13", "Parcel name": "ctx-d"},
+            ]
+            dialog.modality_combo = _Combo("mrsi")
+            dialog._regressor_name = lambda: "Diag"
+
+            subset_path = dialog._build_filtered_conn_subset()
+
+            with np.load(subset_path, allow_pickle=True) as out:
+                expected_matrix = matrix[[0, 2]][:, [0, 2]][:, :, [0, 2]]
+                np.testing.assert_array_equal(out["matrix_subj_list"], expected_matrix)
+                np.testing.assert_array_equal(out["matrix_pop_avg"], expected_matrix.mean(axis=0))
+                np.testing.assert_array_equal(out["metab_profiles_subj_list"], profiles[[0, 2]][:, [0, 2], :])
+                np.testing.assert_array_equal(out["parcel_labels_group"], np.asarray([10, 12]))
+                np.testing.assert_array_equal(out["parcel_names_group"], np.asarray(["ctx-a", "ctx-c"], dtype=object))
+                np.testing.assert_array_equal(out["parcel_keep_indices"], np.asarray([0, 2]))
+                np.testing.assert_array_equal(out["parcel_excluded_indices"], np.asarray([1, 3]))
+                np.testing.assert_array_equal(out["parcel_excluded_labels"], np.asarray([11, 13]))
+                np.testing.assert_array_equal(
+                    out["parcel_excluded_names"],
+                    np.asarray(["ctx-b", "ctx-d"], dtype=object),
+                )
 
 
 if __name__ == "__main__":

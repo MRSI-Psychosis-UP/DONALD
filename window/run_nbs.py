@@ -443,14 +443,21 @@ def _combine_tailed_results(results_by_suffix, alpha, two_tailed_b, export_paths
         raise ValueError("Two-tailed test requested but could not obtain both directional results.")
     comp_masks = list(pos_res["comp_masks"]) + list(neg_res["comp_masks"])
     comp_edges = list(pos_res["comp_edges"]) + list(neg_res["comp_edges"])
-    comp_pvals = [min(1.0, 2.0 * float(p)) for p in pos_res["comp_pvals"]]
-    comp_pvals += [min(1.0, 2.0 * float(p)) for p in neg_res["comp_pvals"]]
+    pos_raw_pvals = [float(p) for p in pos_res["comp_pvals"]]
+    neg_raw_pvals = [float(p) for p in neg_res["comp_pvals"]]
+    comp_pvals = [min(1.0, 2.0 * p) for p in pos_raw_pvals]
+    comp_pvals += [min(1.0, 2.0 * p) for p in neg_raw_pvals]
+    comp_tails = ["right"] * len(pos_raw_pvals) + ["left"] * len(neg_raw_pvals)
+    comp_tail_indices = list(range(len(pos_raw_pvals))) + list(range(len(neg_raw_pvals)))
     sig_mask = np.zeros_like(pos_res["t_mat"], dtype=bool)
     for p, m in zip(comp_pvals, comp_masks):
         if p <= alpha and m.shape == sig_mask.shape:
             sig_mask |= m
     return {
         "comp_pvals": comp_pvals,
+        "comp_pvals_uncorrected": pos_raw_pvals + neg_raw_pvals,
+        "comp_tails": comp_tails,
+        "comp_tail_indices": comp_tail_indices,
         "comp_edges": comp_edges,
         "comp_masks": comp_masks,
         "sig_mask": sig_mask,
@@ -1684,6 +1691,21 @@ if export_paths:
 ids_sig    = np.where(np.array(results_dict["comp_pvals"]) <= args.alpha)[0]
 n_sig_comp = len(ids_sig)
 pvalue_arr = np.array(results_dict["comp_pvals"])
+raw_pvalue_arr = np.asarray(results_dict.get("comp_pvals_uncorrected", pvalue_arr), dtype=float)
+if raw_pvalue_arr.shape[0] != pvalue_arr.shape[0]:
+    raw_pvalue_arr = pvalue_arr.copy()
+comp_tail_labels = np.asarray(
+    results_dict.get("comp_tails", [tail_tag] * int(pvalue_arr.shape[0])),
+    dtype=object,
+)
+if comp_tail_labels.shape[0] != pvalue_arr.shape[0]:
+    comp_tail_labels = np.asarray([tail_tag] * int(pvalue_arr.shape[0]), dtype=object)
+comp_tail_indices = np.asarray(
+    results_dict.get("comp_tail_indices", list(range(int(pvalue_arr.shape[0])))),
+    dtype=int,
+)
+if comp_tail_indices.shape[0] != pvalue_arr.shape[0]:
+    comp_tail_indices = np.arange(int(pvalue_arr.shape[0]), dtype=int)
 global_pvalue = float(np.nanmin(pvalue_arr)) if pvalue_arr.size else float("nan")
 if n_sig_comp:
     debug.success(f"Found {n_sig_comp} significant component(s). Significant p-values:")
@@ -1701,6 +1723,17 @@ summary_payload = {
     "significant_pvalues": [float(pvalue_arr[i]) for i in ids_sig.tolist()],
     "global_pvalue": (float(global_pvalue) if np.isfinite(global_pvalue) else None),
     "result_staged": bool(stage_no_significant),
+    "components": [
+        {
+            "component_idx": int(i),
+            "tail": str(comp_tail_labels[i]),
+            "tail_component_idx": int(comp_tail_indices[i]),
+            "pvalue": float(pvalue_arr[i]),
+            "pvalue_uncorrected": float(raw_pvalue_arr[i]),
+            "significant": bool(i in ids_sig),
+        }
+        for i in range(int(pvalue_arr.shape[0]))
+    ],
 }
 print(f"[NBS_SUMMARY]{json.dumps(summary_payload, separators=(',', ':'))}", flush=True)
 
@@ -1726,6 +1759,9 @@ np.savez(
     components_all_path,
     comp_masks=comp_masks_all,
     comp_pvals=pvalue_arr.astype(float),
+    comp_pvals_uncorrected=raw_pvalue_arr.astype(float),
+    comp_tails=comp_tail_labels.astype(object),
+    comp_tail_indices=comp_tail_indices.astype(int),
     sig_indices=ids_sig.astype(int),
     sig_mask=results_dict.get("sig_mask"),
     t_matrix=results_dict["t_mat"],
