@@ -5,7 +5,7 @@ from os.path import isfile, join
 import numpy as np
 import pandas as pd
 import nibabel as nib
-from nilearn import datasets, plotting
+from nilearn import datasets
 import re
 from collections import OrderedDict
 from glob import glob
@@ -20,6 +20,7 @@ try:
     from mrsitoolbox.connectomics.nettools import NetTools
     from mrsitoolbox.graphplot.circular import plot_connectivity_circle
     from mrsitoolbox.graphplot.colorbar import ColorBar
+    from mrsitoolbox.graphplot.glassbrain import GlassBrainPlotter
 except ImportError as exc:
     raise ImportError(
         "analyze_nbs_group.py requires the current mrsitoolbox pip package. "
@@ -45,7 +46,7 @@ console = Console()
 FONTSIZE = 22
 MAXLEN_NODE_NAME = 20
 SIMILARITY_PATH_RADII = {"left": 10.6, "right": 10.2}
-_OPEN_NILEARN_DISPLAYS = []
+_OPEN_GLASSBRAIN_FIGURES = []
 
 
 def _display_debug_dict(data, title=None):
@@ -64,6 +65,38 @@ def _display_debug_dict(data, title=None):
         console_obj.print(data)
     else:
         debug.info(data)
+
+
+def _npz_scalar_text(data, key: str, default: str = "") -> str:
+    value = data.get(key, default)
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            value = value.item()
+        elif value.size == 1:
+            value = value.reshape(-1)[0]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode()
+        except Exception:
+            value = str(value)
+    return str(value if value is not None else default)
+
+
+def _npz_scalar_float(data, key: str, default: float = 1.0) -> float:
+    try:
+        value = data.get(key, default)
+        if isinstance(value, np.ndarray):
+            value = value.reshape(-1)[0] if value.size else default
+        if isinstance(value, np.generic):
+            value = value.item()
+        value = float(value)
+    except Exception:
+        value = float(default)
+    if not np.isfinite(value) or np.isclose(value, 0.0):
+        return float(default)
+    return value
 
 
 def _combine_signed(values):
@@ -890,6 +923,22 @@ def _glassbrain_path_for_circle(circle_path):
     return root + ext
 
 
+def _crop_light_image(image: np.ndarray, *, padding: int = 10) -> np.ndarray:
+    pixels = np.asarray(image)
+    rgb = pixels[..., :3] if pixels.ndim == 3 and pixels.shape[2] >= 3 else pixels
+    if rgb.ndim != 3:
+        return pixels
+    nonwhite = np.any(rgb < 248, axis=2)
+    rows, columns = np.where(nonwhite)
+    if rows.size == 0 or columns.size == 0:
+        return pixels
+    row_start = max(0, int(rows.min()) - int(padding))
+    row_stop = min(pixels.shape[0], int(rows.max()) + int(padding) + 1)
+    column_start = max(0, int(columns.min()) - int(padding))
+    column_stop = min(pixels.shape[1], int(columns.max()) + int(padding) + 1)
+    return pixels[row_start:row_stop, column_start:column_stop]
+
+
 def _save_nbs_glassbrain(
     edge_matrix,
     node_coords,
@@ -897,8 +946,9 @@ def _save_nbs_glassbrain(
     theme="dark",
     title=None,
     keep_open=False,
+    edge_cmap="RdYlGn_r",
 ):
-    """Save a Nilearn glass-brain connectome for non-zero NBS edges."""
+    """Save a PyVista/FURY-style glass-brain panel for non-zero NBS edges."""
     try:
         matrix = np.asarray(edge_matrix, dtype=float)
         coords = np.asarray(node_coords, dtype=float)
@@ -934,30 +984,74 @@ def _save_nbs_glassbrain(
             debug.warning("Glass brain skipped: NBS edge weights are all zero.")
             return False
 
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        display = plotting.plot_connectome(
-            matrix,
-            coords,
-            node_color="#f2c14e" if theme == "dark" else "#1f77b4",
-            node_size=45,
-            edge_cmap="PiYG",
-            edge_vmin=-edge_abs_max,
-            edge_vmax=edge_abs_max,
-            display_mode="ortho",
-            title=title,
-            annotate=True,
-            black_bg=(theme == "dark"),
-            alpha=0.85,
-            colorbar=True,
-            edge_kwargs={"linewidth": 1.4},
+        upper_i, upper_j = np.triu_indices(matrix.shape[0], k=1)
+        edge_values = matrix[upper_i, upper_j]
+        active = np.isfinite(edge_values) & (np.abs(edge_values) > 0.0)
+        if not np.any(active):
+            debug.warning("Glass brain skipped: no non-zero NBS edges after filtering.")
+            return False
+        edge_i = upper_i[active]
+        edge_j = upper_j[active]
+        edge_values = edge_values[active]
+        paths = [coords[[int(i), int(j)]] for i, j in zip(edge_i, edge_j)]
+
+        cmap = plt.get_cmap(edge_cmap)
+        norm = plt.Normalize(vmin=-edge_abs_max, vmax=edge_abs_max)
+        path_colors = np.asarray(
+            [
+                mcolors.to_rgba(cmap(norm(float(value))), alpha=0.92)
+                for value in edge_values
+            ],
+            dtype=float,
         )
-        display.savefig(output_path, dpi=300)
+        widths = 1.2 + 2.4 * (np.abs(edge_values) / edge_abs_max)
+        degree = np.count_nonzero(np.abs(matrix) > 0.0, axis=0)
+        node_sizes = 2.0 + 0.22 * np.sqrt(np.maximum(degree, 0))
+        node_color = np.asarray(mcolors.to_rgba("#777777", alpha=0.56), dtype=float)
+        node_colors = np.tile(node_color.reshape(1, 4), (coords.shape[0], 1))
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        glassbrain = GlassBrainPlotter(
+            brain_opacity=0.13,
+            background="white",
+            window_size=(1120, 880),
+            path_radius_scale=0.072,
+            off_screen=True,
+        )
+        views = ("dorsal", "coronal", "lateral")
+        images = glassbrain.three_view_screenshots(
+            views=views,
+            node_coords=coords,
+            paths=paths,
+            path_colors=path_colors,
+            path_widths=widths,
+            node_colors=node_colors,
+            node_sizes=node_sizes,
+            hemisphere_mode="both",
+            title=None,
+        )
+
+        fig, axes = plt.subplots(1, len(views), figsize=(12.8, 4.15), facecolor="white")
+        fig.subplots_adjust(left=0.01, right=0.9, top=0.9, bottom=0.12, wspace=0.025)
+        for ax, view in zip(np.asarray(axes).reshape(-1), views):
+            ax.imshow(_crop_light_image(images[view]))
+            ax.set_axis_off()
+        if title:
+            fig.suptitle(str(title), fontsize=13, y=0.985)
+        sm_edges = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm_edges.set_array([])
+        cbar_ax = fig.add_axes([0.92, 0.2, 0.018, 0.62])
+        cbar = fig.colorbar(sm_edges, cax=cbar_ax)
+        cbar.set_label("NBS edge T-statistic", fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+
+        edge_count = int(edge_values.shape[0])
+        fig.savefig(output_path, dpi=300, bbox_inches="tight", pad_inches=0.03)
         if keep_open:
-            _OPEN_NILEARN_DISPLAYS.append(display)
+            _OPEN_GLASSBRAIN_FIGURES.append(fig)
         else:
-            display.close()
-        edge_count = int(np.count_nonzero(np.triu(np.abs(matrix) > 0, k=1)))
-        debug.success(f"Saved NBS glass brain ({edge_count} edges) to", output_path)
+            plt.close(fig)
+        debug.success(f"Saved PyVista glass brain ({edge_count} edges) to", output_path)
         return True
     except Exception as err:
         debug.warning(f"Glass brain export failed: {err}")
@@ -1269,9 +1363,22 @@ nperm = int(data.get("nperm", 0))
 t_thresh = float(data.get("t_thresh", 0.0))
 npert = int(data.get("npert", 0))
 preproc = str(data.get("preproc", ""))
+contrast_effect_sign = _npz_scalar_float(data, "contrast_effect_sign", 1.0)
+edge_color_positive_label = _npz_scalar_text(
+    data, "edge_color_positive_label", "positive regressor effect"
+)
+edge_color_negative_label = _npz_scalar_text(
+    data, "edge_color_negative_label", "negative regressor effect"
+)
+edge_effect_cmap = _npz_scalar_text(data, "edge_effect_cmap", "RdYlGn_r") or "RdYlGn_r"
 debug.info(
     f"Component {component_idx}: p={pvalue:.6f}, permtest={permtest}, "
     f"nperm={nperm}, t_thresh={t_thresh}"
+)
+debug.info(
+    "NBS edge color convention: "
+    f"red = {edge_color_positive_label}; "
+    f"green = {edge_color_negative_label}."
 )
 
 metrics = {
@@ -1310,6 +1417,9 @@ else:
 t_mat = data.get("t_matrix")
 if t_mat is not None:
     debug.info(f"T-matrix shape: {np.asarray(t_mat).shape}")
+effect_t_mat = None
+if t_mat is not None:
+    effect_t_mat = np.asarray(t_mat, dtype=float) * float(contrast_effect_sign)
 
 test_type_label = str(data.get("test_type", "n/a")).lower() or "n/a"
 test_tail_label = str(data.get("test_tail", "n/a")).lower() or "n/a"
@@ -1344,8 +1454,8 @@ if comp_pvals.size > 0:
     sig_set = set(int(i) for i in sig_indices.tolist())
     for comp_i, pval_i in enumerate(comp_pvals.tolist()):
         side = test_tail_label
-        if test_tail_label == "both" and comp_i < len(component_masks_for_table) and t_mat is not None:
-            side = f"both ({_infer_component_side(component_masks_for_table[comp_i], t_mat)})"
+        if test_tail_label == "both" and comp_i < len(component_masks_for_table) and effect_t_mat is not None:
+            side = f"both ({_infer_component_side(component_masks_for_table[comp_i], effect_t_mat)})"
         pval_str = "N/A" if np.isnan(pval_i) else f"{float(pval_i):.6f}"
         is_sig = "yes" if comp_i in sig_set else "no"
         table_pvals.add_row(f"comp {comp_i}", test_type_label.upper(), side, pval_str, is_sig)
@@ -1890,7 +2000,7 @@ else:
 
 # Plot circular connectivity for the significant component (or empty edges)
 if t_mat is not None and comp_mask is not None:
-    t_matrix = np.asarray(t_mat)
+    t_matrix = np.asarray(t_mat, dtype=float) * float(contrast_effect_sign)
     mask_bool = np.asarray(comp_mask, dtype=bool)
     has_edges = significant_nodes.size > 0
     if mask_bool.shape != t_matrix.shape:
@@ -2075,7 +2185,7 @@ if t_mat is not None and comp_mask is not None:
         node_colors=node_colors,
         node_colors_ref=node_colors_ref,
         node_angles=node_angles_deg,
-        colormap=path_edge_colormap if path_edge_mode else "PiYG",
+        colormap=path_edge_colormap if path_edge_mode else edge_effect_cmap,
         vmin=0.0 if path_edge_mode else -edge_abs_max,
         vmax=1.0 if path_edge_mode else edge_abs_max,
         linewidth=1,
@@ -2162,11 +2272,18 @@ if t_mat is not None and comp_mask is not None:
     if not args.hide_colorbar:
         if has_edges and not path_edge_mode:
             sm_edges = plt.cm.ScalarMappable(
-                cmap="PiYG", norm=plt.Normalize(vmin=-vmax, vmax=vmax)
+                cmap=edge_effect_cmap,
+                norm=plt.Normalize(vmin=-edge_abs_max, vmax=edge_abs_max),
             )
             sm_edges.set_array([])
             cb_edges = fig_circle.colorbar(sm_edges, ax=ax_circle, fraction=0.046, pad=0.08)
-            cb_edges.set_label("T-Score", fontsize=FONTSIZE, color=label_color)
+            cb_edges.set_label(
+                "Effect T-score\n"
+                f"red: {edge_color_positive_label}\n"
+                f"green: {edge_color_negative_label}",
+                fontsize=FONTSIZE - 6,
+                color=label_color,
+            )
             cb_edges.ax.yaxis.set_tick_params(labelsize=FONTSIZE - 4, color=label_color)
             plt.setp(plt.getp(cb_edges.ax.axes, "yticklabels"), color=label_color)
         sm_nodes = plt.cm.ScalarMappable(cmap=cmap_nodes, norm=norm_nodes)
@@ -2203,6 +2320,7 @@ if t_mat is not None and comp_mask is not None:
             theme=args.theme,
             title=glassbrain_title,
             keep_open=not args.no_show,
+            edge_cmap=edge_effect_cmap,
         )
     show_figures = True
 else:
@@ -2213,9 +2331,9 @@ if show_figures and not args.no_show:
     try:
         plt.show()
     finally:
-        for display in _OPEN_NILEARN_DISPLAYS:
+        for fig in _OPEN_GLASSBRAIN_FIGURES:
             try:
-                display.close()
+                plt.close(fig)
             except Exception:
                 pass
-        _OPEN_NILEARN_DISPLAYS.clear()
+        _OPEN_GLASSBRAIN_FIGURES.clear()

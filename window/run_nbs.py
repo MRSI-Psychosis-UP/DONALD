@@ -15,6 +15,8 @@ import subprocess
 from nilearn import datasets
 import nibabel as nib
 from scipy.io import loadmat
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 _SCRIPT_PATH = Path(__file__).resolve()
 _VIEWER_ROOT = _SCRIPT_PATH.parents[1]
@@ -25,7 +27,7 @@ try:
     from mrsitoolbox.tools.participants import ParticipantSelector
     from mrsitoolbox.connectomics.nettools import NetTools
     from mrsitoolbox.connectomics.nbs import NBS
-    from mrsitoolbox.graphplot.brain3d import Brain3D
+    from mrsitoolbox.graphplot.glassbrain import GlassBrainPlotter
 except ImportError as exc:
     raise ImportError(
         "Donald NBS requires the current mrsitoolbox pip package. "
@@ -43,7 +45,6 @@ debug    = Debug()
 dutils   = DataUtils()
 nettools = NetTools()
 nbs      = NBS()
-brain3d  = Brain3D()
 
 
 
@@ -397,6 +398,193 @@ def _expand_contrast_tokens(tokens, design_columns, matlab_regressor_cols, repla
         f"--contrast length {vec.size} does not match design columns {len(design_columns)} "
         f"or regressor columns {len(matlab_regressor_cols)}."
     )
+
+
+def _contrast_effect_sign(
+    tokens,
+    contrast_has_b: bool,
+    is_f_test: bool,
+    design_columns: list[str],
+    regressor_columns: list[str],
+    regressor_col: str,
+) -> float:
+    """Sign needed to display T values as a fixed positive-regressor effect."""
+    if is_f_test or contrast_has_b or tokens is None:
+        return 1.0
+    try:
+        vec = _expand_contrast_tokens(
+            tokens,
+            design_columns,
+            regressor_columns,
+            replace_val=1.0,
+        )
+    except Exception:
+        try:
+            vec = np.asarray([float(t) for t in tokens], dtype=float)
+        except Exception:
+            return 1.0
+
+    cols = [c for c in (regressor_columns or [regressor_col]) if c in design_columns]
+    regressor_weights: list[float] = []
+    for col in cols:
+        idx = design_columns.index(col)
+        if idx < vec.size:
+            val = float(vec[idx])
+            if abs(val) > 0:
+                regressor_weights.append(val)
+    if regressor_weights:
+        score = float(np.sum(regressor_weights))
+        if np.isclose(score, 0.0):
+            score = max(regressor_weights, key=lambda v: abs(v))
+        return -1.0 if score < 0 else 1.0
+
+    nonzero = vec[np.abs(vec) > 0]
+    if nonzero.size == 0:
+        return 1.0
+    return -1.0 if float(nonzero[-1]) < 0 else 1.0
+
+
+def _edge_direction_labels(regressor_name: str, regressor_values) -> tuple[str, str]:
+    name = str(regressor_name or "regressor").strip() or "regressor"
+    display_name = name.capitalize() if name.islower() else name
+    try:
+        values = np.asarray(regressor_values, dtype=float)
+        values = values[np.isfinite(values)]
+        levels = np.unique(values)
+    except Exception:
+        levels = np.array([])
+    if levels.size == 2:
+        low, high = levels[0], levels[1]
+        return (
+            f"{display_name}{_format_level(float(high))} > {display_name}{_format_level(float(low))}",
+            f"{display_name}{_format_level(float(low))} > {display_name}{_format_level(float(high))}",
+        )
+    return (f"positive {display_name} effect", f"negative {display_name} effect")
+
+
+def _crop_light_image(image: np.ndarray, *, padding: int = 10) -> np.ndarray:
+    pixels = np.asarray(image)
+    rgb = pixels[..., :3] if pixels.ndim == 3 and pixels.shape[2] >= 3 else pixels
+    if rgb.ndim != 3:
+        return pixels
+    nonwhite = np.any(rgb < 248, axis=2)
+    rows, columns = np.where(nonwhite)
+    if rows.size == 0 or columns.size == 0:
+        return pixels
+    row_start = max(0, int(rows.min()) - int(padding))
+    row_stop = min(pixels.shape[0], int(rows.max()) + int(padding) + 1)
+    column_start = max(0, int(columns.min()) - int(padding))
+    column_stop = min(pixels.shape[1], int(columns.max()) + int(padding) + 1)
+    return pixels[row_start:row_stop, column_start:column_stop]
+
+
+def _save_nbs_glassbrain_panel(
+    *,
+    edge_matrix,
+    node_coords,
+    output_path,
+    edge_cmap,
+    title,
+) -> bool:
+    try:
+        matrix = np.asarray(edge_matrix, dtype=float)
+        coords = np.asarray(node_coords, dtype=float)
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            debug.warning("Glass brain skipped: edge matrix is not square.")
+            return False
+        if coords.ndim != 2 or coords.shape != (matrix.shape[0], 3):
+            debug.warning("Glass brain skipped: node coordinates do not match edge matrix.")
+            return False
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+        np.fill_diagonal(matrix, 0.0)
+        upper = np.triu(matrix, k=1)
+        lower_as_upper = np.triu(matrix.T, k=1)
+        upper = np.where(np.abs(upper) >= np.abs(lower_as_upper), upper, lower_as_upper)
+        matrix = upper + upper.T
+
+        finite_coords = np.all(np.isfinite(coords), axis=1)
+        if not np.all(finite_coords):
+            matrix[~finite_coords, :] = 0.0
+            matrix[:, ~finite_coords] = 0.0
+        degree = np.count_nonzero(np.abs(matrix) > 0.0, axis=0)
+        keep = finite_coords & (degree > 0)
+        if not np.any(keep):
+            debug.warning("Glass brain skipped: no NBS edges with valid MNI coordinates.")
+            return False
+        matrix = matrix[np.ix_(keep, keep)]
+        coords = coords[keep]
+
+        edge_abs_max = float(np.nanmax(np.abs(matrix))) if matrix.size else 0.0
+        if not np.isfinite(edge_abs_max) or edge_abs_max <= 0:
+            debug.warning("Glass brain skipped: NBS edge weights are all zero.")
+            return False
+        upper_i, upper_j = np.triu_indices(matrix.shape[0], k=1)
+        edge_values = matrix[upper_i, upper_j]
+        active = np.isfinite(edge_values) & (np.abs(edge_values) > 0.0)
+        if not np.any(active):
+            debug.warning("Glass brain skipped: no non-zero NBS edges after filtering.")
+            return False
+
+        edge_i = upper_i[active]
+        edge_j = upper_j[active]
+        edge_values = edge_values[active]
+        paths = [coords[[int(i), int(j)]] for i, j in zip(edge_i, edge_j)]
+        cmap = plt.get_cmap(edge_cmap)
+        norm = plt.Normalize(vmin=-edge_abs_max, vmax=edge_abs_max)
+        path_colors = np.asarray(
+            [mcolors.to_rgba(cmap(norm(float(value))), alpha=0.92) for value in edge_values],
+            dtype=float,
+        )
+        path_widths = 1.2 + 2.4 * (np.abs(edge_values) / edge_abs_max)
+        degree = np.count_nonzero(np.abs(matrix) > 0.0, axis=0)
+        node_sizes = 2.0 + 0.22 * np.sqrt(np.maximum(degree, 0))
+        node_color = np.asarray(mcolors.to_rgba("#777777", alpha=0.56), dtype=float)
+        node_colors = np.tile(node_color.reshape(1, 4), (coords.shape[0], 1))
+
+        glassbrain = GlassBrainPlotter(
+            brain_opacity=0.13,
+            background="white",
+            window_size=(1120, 880),
+            path_radius_scale=0.072,
+            off_screen=True,
+        )
+        views = ("dorsal", "coronal", "lateral")
+        images = glassbrain.three_view_screenshots(
+            views=views,
+            node_coords=coords,
+            paths=paths,
+            path_colors=path_colors,
+            path_widths=path_widths,
+            node_colors=node_colors,
+            node_sizes=node_sizes,
+            hemisphere_mode="both",
+            title=None,
+        )
+
+        fig, axes = plt.subplots(1, len(views), figsize=(12.8, 4.15), facecolor="white")
+        fig.subplots_adjust(left=0.01, right=0.9, top=0.9, bottom=0.12, wspace=0.025)
+        for ax, view in zip(np.asarray(axes).reshape(-1), views):
+            ax.imshow(_crop_light_image(images[view]))
+            ax.set_axis_off()
+        if title:
+            fig.suptitle(str(title), fontsize=13, y=0.985)
+        sm_edges = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm_edges.set_array([])
+        cbar_ax = fig.add_axes([0.92, 0.2, 0.018, 0.62])
+        cbar = fig.colorbar(sm_edges, cax=cbar_ax)
+        cbar.set_label("NBS edge T-statistic", fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        fig.savefig(output_path, dpi=300, bbox_inches="tight", pad_inches=0.03)
+        plt.close(fig)
+        debug.success(
+            f"Saved PyVista component glass brain ({int(edge_values.shape[0])} edges) to",
+            output_path,
+        )
+        return True
+    except Exception as exc:
+        debug.warning(f"Component glass brain export failed: {exc}")
+        return False
 
 
 def _build_contrast_specs(contrast_has_b, is_f_test, contrast_cli, tail_value):
@@ -1437,6 +1625,24 @@ if regressor_for_bct not in designmat_dict:
 design_columns_for_run.append(regressor_for_bct)
 design_parts.append(np.asarray(designmat_dict[regressor_for_bct], dtype=float).reshape(-1, 1))
 design_matrix_for_run = np.column_stack(design_parts)
+contrast_effect_sign = _contrast_effect_sign(
+    contrast_tokens,
+    contrast_has_b,
+    is_f_test,
+    design_columns_for_run,
+    matlab_regressor_cols,
+    regressor_for_bct,
+)
+edge_color_positive_label, edge_color_negative_label = _edge_direction_labels(
+    regressor_name,
+    regressor_values_raw,
+)
+edge_effect_cmap = "RdYlGn_r"
+debug.info(
+    "NBS edge color convention: "
+    f"red = {edge_color_positive_label}; "
+    f"green = {edge_color_negative_label}."
+)
 
 if run_python_compat:
     if args.permtest != "freedman":
@@ -1687,6 +1893,9 @@ if export_paths:
             matlab_results, args.alpha, two_tailed_b, export_paths=export_paths
         )
 
+if parcel_df.shape[0] != results_dict["t_mat"].shape[0]:
+    raise ValueError("Parcel coordinate table does not match the NBS matrix dimension.")
+display_t_mat = np.asarray(results_dict["t_mat"], dtype=float) * float(contrast_effect_sign)
 
 ids_sig    = np.where(np.array(results_dict["comp_pvals"]) <= args.alpha)[0]
 n_sig_comp = len(ids_sig)
@@ -1723,6 +1932,8 @@ summary_payload = {
     "significant_pvalues": [float(pvalue_arr[i]) for i in ids_sig.tolist()],
     "global_pvalue": (float(global_pvalue) if np.isfinite(global_pvalue) else None),
     "result_staged": bool(stage_no_significant),
+    "edge_color_positive_label": edge_color_positive_label,
+    "edge_color_negative_label": edge_color_negative_label,
     "components": [
         {
             "component_idx": int(i),
@@ -1765,6 +1976,10 @@ np.savez(
     sig_indices=ids_sig.astype(int),
     sig_mask=results_dict.get("sig_mask"),
     t_matrix=results_dict["t_mat"],
+    contrast_effect_sign=np.array(contrast_effect_sign, dtype=float),
+    edge_color_positive_label=np.array(edge_color_positive_label),
+    edge_color_negative_label=np.array(edge_color_negative_label),
+    edge_effect_cmap=np.array(edge_effect_cmap),
     permtest=args.permtest,
     nperm=np.array(args.nperm, dtype=int),
     t_thresh=np.array(args.t_thresh, dtype=float),
@@ -1837,11 +2052,6 @@ if not stage_no_significant:
         component_labels = parcel_labels[comp_nodes]
         component_names = [str(parcel_names[i]) for i in comp_nodes]
         component_coords = centroids_world[comp_nodes]
-        comp_results = {
-            "comp_masks": [nbs_network_arr],
-            "comp_pvals": [results_dict["comp_pvals"][comp_idx]],
-            "t_mat": results_dict["t_mat"],
-        }
         regressor_values_out = regressor_values_raw
         if regressor_values_out is None and expanded_info:
             level_cols = expanded_info.get("columns") or []
@@ -1864,6 +2074,10 @@ if not stage_no_significant:
             component_idx=np.array(comp_idx, dtype=int),
             comp_mask=nbs_network_arr.astype(np.uint8),
             t_matrix=results_dict["t_mat"],
+            contrast_effect_sign=np.array(contrast_effect_sign, dtype=float),
+            edge_color_positive_label=np.array(edge_color_positive_label),
+            edge_color_negative_label=np.array(edge_color_negative_label),
+            edge_effect_cmap=np.array(edge_effect_cmap),
             pvalue=np.array(results_dict["comp_pvals"][comp_idx], dtype=float),
             significant=np.array(int(is_sig), dtype=int),
             permtest=args.permtest,
@@ -1901,15 +2115,12 @@ if not stage_no_significant:
             "connectivity_path": connectivity_path,
         })
         if is_sig:
-            brain3d.plot_significant_connectome(
-                comp_results,
-                parcel_df,
-                plot_path,
-                alpha=0.8,
-                node_size=6,
-                node_color="cyan",
-                edge_cmap="PiYG",
-                black_bg=True,
+            _save_nbs_glassbrain_panel(
+                edge_matrix=np.where(nbs_network_arr, display_t_mat, 0.0),
+                node_coords=centroids_world,
+                output_path=plot_path,
+                edge_cmap=edge_effect_cmap,
+                title=f"NBS component {comp_idx} edges",
             )
             debug.success(f"Saved component {comp_idx} outputs to {plot_dir}")
     if summary_rows:

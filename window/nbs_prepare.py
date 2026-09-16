@@ -83,6 +83,7 @@ try:
         QProgressBar,
         QPushButton,
         QScrollArea,
+        QSizePolicy,
         QSplitter,
         QSpinBox,
         QTableWidget,
@@ -112,6 +113,7 @@ except Exception:
         QProgressBar,
         QPushButton,
         QScrollArea,
+        QSizePolicy,
         QSplitter,
         QSpinBox,
         QTableWidget,
@@ -142,6 +144,41 @@ def _qprocess_not_running():
     if process_state is not None and hasattr(process_state, "NotRunning"):
         return process_state.NotRunning
     return 0
+
+
+def _set_size_policy(widget, horizontal, vertical):
+    try:
+        if QT_LIB == 6:
+            widget.setSizePolicy(
+                getattr(QSizePolicy.Policy, horizontal),
+                getattr(QSizePolicy.Policy, vertical),
+            )
+        else:
+            widget.setSizePolicy(
+                getattr(QSizePolicy, horizontal),
+                getattr(QSizePolicy, vertical),
+            )
+    except Exception:
+        pass
+
+
+def _set_plaintext_wrap_widget_width(widget):
+    try:
+        if QT_LIB == 6:
+            widget.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        else:
+            widget.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+    except Exception:
+        pass
+
+
+def _compact_inline_text(text, max_chars=220):
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(value) <= max_chars:
+        return value
+    head = max(20, (max_chars - 5) // 2)
+    tail = max(20, max_chars - head - 5)
+    return f"{value[:head]} ... {value[-tail:]}"
 
 
 def _slugify_fragment(value):
@@ -810,12 +847,11 @@ class NBSPrepareDialog(QDialog):
         self.terminal_output.setObjectName("nbsTerminal")
         self.terminal_output.setReadOnly(True)
         self.terminal_output.document().setMaximumBlockCount(4000)
-        if QT_LIB == 6:
-            self.terminal_output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        else:
-            self.terminal_output.setLineWrapMode(QPlainTextEdit.NoWrap)
+        _set_plaintext_wrap_widget_width(self.terminal_output)
+        _set_size_policy(self.terminal_output, "Ignored", "Expanding")
         self.terminal_output.setMinimumHeight(180)
         log_layout.addWidget(self.terminal_output)
+        _set_size_policy(self.log_drawer, "Ignored", "Preferred")
         self.workflow_shell.right_layout.addWidget(self.log_drawer, 0)
         self._apply_terminal_style()
         self._set_log_drawer_expanded(False)
@@ -823,7 +859,8 @@ class NBSPrepareDialog(QDialog):
         root_layout.addWidget(self.workflow_shell, 1)
 
         self.status_label = QLabel("")
-        self.status_label.setWordWrap(False)
+        self.status_label.setWordWrap(True)
+        _set_size_policy(self.status_label, "Ignored", "Preferred")
         root_layout.addWidget(self.status_label)
 
         actions = QHBoxLayout()
@@ -1148,6 +1185,8 @@ class NBSPrepareDialog(QDialog):
         run_group = QGroupBox("Run controls")
         run_layout = QVBoxLayout(run_group)
         self.run_progress_label = QLabel("Idle")
+        self.run_progress_label.setWordWrap(True)
+        _set_size_policy(self.run_progress_label, "Ignored", "Preferred")
         run_layout.addWidget(self.run_progress_label)
         self.run_progress = QProgressBar()
         self.run_progress.setRange(0, 1)
@@ -1531,7 +1570,20 @@ class NBSPrepareDialog(QDialog):
         )
 
     def _set_status(self, text):
-        self.status_label.setText(str(text))
+        if not hasattr(self, "status_label") or self.status_label is None:
+            return
+        full_text = str(text)
+        display_text = _compact_inline_text(full_text, max_chars=260)
+        self.status_label.setText(display_text)
+        self.status_label.setToolTip(full_text if display_text != full_text else "")
+
+    def _set_run_progress_text(self, text):
+        if not hasattr(self, "run_progress_label") or self.run_progress_label is None:
+            return
+        full_text = str(text)
+        display_text = _compact_inline_text(full_text, max_chars=220)
+        self.run_progress_label.setText(display_text)
+        self.run_progress_label.setToolTip(full_text if display_text != full_text else "")
 
     def _apply_terminal_style(self):
         if self.terminal_output is None:
@@ -1639,12 +1691,12 @@ class NBSPrepareDialog(QDialog):
         if hasattr(self, "run_progress"):
             if busy:
                 self.run_progress.setRange(0, 0)
-                self.run_progress_label.setText("Running...")
+                self._set_run_progress_text("Running...")
             else:
                 self.run_progress.setRange(0, 1)
                 self.run_progress.setValue(1 if self._last_result_npz_path else 0)
                 if self.run_progress_label.text().strip() == "Running...":
-                    self.run_progress_label.setText("Idle")
+                    self._set_run_progress_text("Idle")
         if busy:
             self.export_button.setEnabled(False)
         elif self._last_result_npz_path and Path(self._last_result_npz_path).is_file():
@@ -2687,7 +2739,7 @@ class NBSPrepareDialog(QDialog):
             self._run_output_tail = self._run_output_tail[-8:]
             self._set_status(self._run_output_tail[-1])
             if hasattr(self, "run_progress_label"):
-                self.run_progress_label.setText(self._run_output_tail[-1])
+                self._set_run_progress_text(self._run_output_tail[-1])
 
     def _on_process_finished(self, exit_code, _exit_status):
         self._set_run_busy(False)
@@ -2697,19 +2749,21 @@ class NBSPrepareDialog(QDialog):
         if self._run_cancel_requested:
             self.export_button.setEnabled(False)
             if hasattr(self, "run_progress_label"):
-                self.run_progress_label.setText("Cancelled")
+                self._set_run_progress_text("Cancelled")
             if hasattr(self, "run_progress"):
                 self.run_progress.setRange(0, 1)
                 self.run_progress.setValue(0)
             self._set_status("NBS run cancelled by user.")
         elif exit_code == 0:
             message = "NBS run completed successfully."
+            allow_auto_export = True
             if self._last_run_payload and self._last_run_payload.get("conn_subset_path"):
                 subset_name = Path(self._last_run_payload["conn_subset_path"]).name
                 message = f"NBS run completed successfully. Input: {subset_name}"
+            n_significant = int(dict(self._last_nbs_summary or {}).get("n_significant", 0) or 0)
             staged_empty_result = (
                 bool(self._last_result_was_staged)
-                and int(dict(self._last_nbs_summary or {}).get("n_significant", 0) or 0) == 0
+                and n_significant == 0
             )
             if self._last_result_npz_path and Path(self._last_result_npz_path).is_file():
                 if staged_empty_result:
@@ -2732,7 +2786,15 @@ class NBSPrepareDialog(QDialog):
                     if copied_path:
                         self._last_result_npz_path = copied_path
                     self.export_button.setEnabled(True)
-                    message = f"{message} Ready to export results."
+                    if n_significant > 0:
+                        keep_export_ready = self._confirm_save_significant_result(self._last_result_npz_path)
+                        if keep_export_ready:
+                            message = f"{message} Significant components were found; ready to export results."
+                        else:
+                            allow_auto_export = False
+                            message = f"{message} Significant components were found; result bundle saved, export paused."
+                    else:
+                        message = f"{message} Ready to export results."
             else:
                 self.export_button.setEnabled(False)
                 if staged_empty_result:
@@ -2743,21 +2805,21 @@ class NBSPrepareDialog(QDialog):
             if summary_line:
                 message = f"{message} {summary_line}"
             if hasattr(self, "run_progress_label"):
-                self.run_progress_label.setText("Completed")
+                self._set_run_progress_text("Completed")
             if hasattr(self, "run_progress"):
                 self.run_progress.setRange(0, 1)
                 self.run_progress.setValue(1)
             self._set_status(message)
             self._refresh_results_step(force_defaults=True)
             self._update_run_state()
-            if self.export_on_finish_check.isChecked() and self.export_button.isEnabled():
+            if allow_auto_export and self.export_on_finish_check.isChecked() and self.export_button.isEnabled():
                 self._export_results()
         else:
             tail = self._run_output_tail[-1] if self._run_output_tail else "See terminal output."
             self._set_status(f"NBS run failed (exit {exit_code}). {tail}")
             self.export_button.setEnabled(False)
             if hasattr(self, "run_progress_label"):
-                self.run_progress_label.setText("Failed")
+                self._set_run_progress_text("Failed")
             if hasattr(self, "run_progress"):
                 self.run_progress.setRange(0, 1)
                 self.run_progress.setValue(0)
@@ -2783,7 +2845,7 @@ class NBSPrepareDialog(QDialog):
         self._run_cancel_requested = True
         self._set_status("Stopping NBS run...")
         if hasattr(self, "run_progress_label"):
-            self.run_progress_label.setText("Stopping...")
+            self._set_run_progress_text("Stopping...")
         if hasattr(self, "stop_button"):
             self.stop_button.setEnabled(False)
         print("[NBS] Stop requested by user. Sending terminate signal.", flush=True)
@@ -2867,7 +2929,7 @@ class NBSPrepareDialog(QDialog):
         self._append_terminal_line(f"[NBS] Launch command: {shlex.join(full_cmd)}")
         self._set_run_busy(True)
         if hasattr(self, "run_progress_label"):
-            self.run_progress_label.setText("Running...")
+            self._set_run_progress_text("Running...")
         self._set_status(
             f"Launching NBS ({selected_test}) with {len(self.selected_row_indices())} rows..."
         )
@@ -2881,7 +2943,7 @@ class NBSPrepareDialog(QDialog):
                 "[NBS] Failed to start run_nbs.py process. Check Python executable/path."
             )
             if hasattr(self, "run_progress_label"):
-                self.run_progress_label.setText("Failed to start")
+                self._set_run_progress_text("Failed to start")
             self._run_process = None
             return
 
@@ -2979,10 +3041,41 @@ class NBSPrepareDialog(QDialog):
             f"Global p-value: {pvalue_text}\n"
             "Review all component p-values below, then choose whether to save the staged bundle."
         )
-        dialog = _NBSComponentPValuesDialog(
+        return self._exec_component_pvalues_dialog(
             result_path=result_path,
             rows=rows,
             title="No Significant NBS Result",
+            message=message,
+        )
+
+    def _confirm_save_significant_result(self, result_path):
+        result_path = Path(str(result_path)).expanduser()
+        summary = dict(self._last_nbs_summary or {})
+        pvalue = summary.get("global_pvalue", None)
+        try:
+            pvalue_text = f"{float(pvalue):.6g}" if pvalue is not None else "NA"
+        except Exception:
+            pvalue_text = str(pvalue)
+        n_sig = int(summary.get("n_significant", 0) or 0)
+        rows = self._component_pvalue_rows(result_path=result_path, summary=summary)
+        message = (
+            f"{n_sig} significant NBS component(s) were detected.\n"
+            f"Global p-value: {pvalue_text}\n"
+            "Review the component p-values below. Save keeps the result export-ready; "
+            "Cancel leaves the bundle saved but skips automatic export."
+        )
+        return self._exec_component_pvalues_dialog(
+            result_path=result_path,
+            rows=rows,
+            title="Significant NBS Result",
+            message=message,
+        )
+
+    def _exec_component_pvalues_dialog(self, *, result_path, rows, title, message):
+        dialog = _NBSComponentPValuesDialog(
+            result_path=result_path,
+            rows=rows,
+            title=title,
             message=message,
             parent=self,
         )
@@ -3069,7 +3162,7 @@ class NBSPrepareDialog(QDialog):
             self._export_output_tail = self._export_output_tail[-8:]
             self._set_status(self._export_output_tail[-1])
             if hasattr(self, "run_progress_label"):
-                self.run_progress_label.setText(self._export_output_tail[-1])
+                self._set_run_progress_text(self._export_output_tail[-1])
 
     def _on_export_finished(self, exit_code, _exit_status):
         self._set_export_busy(False)

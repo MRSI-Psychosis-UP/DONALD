@@ -6,6 +6,7 @@ import numpy as np
 
 from window.nbs_prepare import (
     NBSPrepareDialog,
+    _compact_inline_text,
     _find_covariate_balance_script,
 )
 
@@ -67,6 +68,15 @@ class _Button:
 
 
 class NBSPrepareDialogTests(unittest.TestCase):
+    def test_compact_inline_text_preserves_bounded_labels(self):
+        text = "prefix " + ("x" * 300) + " suffix"
+        compact = _compact_inline_text(text, max_chars=80)
+
+        self.assertLessEqual(len(compact), 80)
+        self.assertTrue(compact.startswith("prefix"))
+        self.assertTrue(compact.endswith("suffix"))
+        self.assertIn(" ... ", compact)
+
     def test_highlighted_data_rows_map_to_source_indices_and_skip_excluded(self):
         dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
         dialog.table = _Table(selected_rows=[0, 2, 3])
