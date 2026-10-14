@@ -36,7 +36,10 @@ try:
         is_user_checkable_flag as _is_user_checkable_flag,
     )
     from window.shared.workflow import WorkflowShell as _WorkflowShell
-    from window.shared.theme import workflow_dialog_stylesheet as _workflow_dialog_stylesheet
+    from window.shared.theme import (
+        switch_checkbox_theme_styles as _switch_checkbox_theme_styles,
+        workflow_dialog_stylesheet as _workflow_dialog_stylesheet,
+    )
 except Exception:
     from mrsi_viewer.window.shared.controls import make_toggle_button as _make_toggle_button
     from mrsi_viewer.window.shared.covariate_table import (
@@ -60,7 +63,10 @@ except Exception:
         is_user_checkable_flag as _is_user_checkable_flag,
     )
     from mrsi_viewer.window.shared.workflow import WorkflowShell as _WorkflowShell
-    from mrsi_viewer.window.shared.theme import workflow_dialog_stylesheet as _workflow_dialog_stylesheet
+    from mrsi_viewer.window.shared.theme import (
+        switch_checkbox_theme_styles as _switch_checkbox_theme_styles,
+        workflow_dialog_stylesheet as _workflow_dialog_stylesheet,
+    )
 
 try:
     from PyQt6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
@@ -79,6 +85,7 @@ try:
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QMessageBox,
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
@@ -88,6 +95,7 @@ try:
         QSpinBox,
         QTableWidget,
         QTableWidgetItem,
+        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -109,6 +117,7 @@ except Exception:
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QMessageBox,
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
@@ -118,6 +127,7 @@ except Exception:
         QSpinBox,
         QTableWidget,
         QTableWidgetItem,
+        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -160,6 +170,15 @@ def _set_size_policy(widget, horizontal, vertical):
             )
     except Exception:
         pass
+
+
+def _switch_checkbox_style(track_off: str, track_on: str, border_color: str) -> str:
+    return (
+        "QCheckBox#switchCheckBox { spacing: 10px; } "
+        "QCheckBox#switchCheckBox::indicator { width: 42px; height: 22px; border-radius: 11px; } "
+        f"QCheckBox#switchCheckBox::indicator:unchecked {{ background-color: {track_off}; border: 1px solid {border_color}; }} "
+        f"QCheckBox#switchCheckBox::indicator:checked {{ background-color: {track_on}; border: 1px solid {track_on}; }}"
+    )
 
 
 def _set_plaintext_wrap_widget_width(widget):
@@ -875,15 +894,68 @@ class NBSPrepareDialog(QDialog):
         self.run_button.setMinimumWidth(130)
         self.run_button.clicked.connect(self._run_configuration)
         actions.addWidget(self.run_button)
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.close)
-        actions.addWidget(close_button)
+        self.close_button = QPushButton("Close")
+        self.close_button.clicked.connect(self.close)
+        actions.addWidget(self.close_button)
         root_layout.addLayout(actions)
 
         if len(self._step_buttons) > self.RESULTS_STEP_INDEX:
             self._step_buttons[self.RESULTS_STEP_INDEX].setEnabled(False)
         self._go_to_step(0)
         self._update_dataset_summary()
+
+    @staticmethod
+    def _message_box_button(name):
+        standard_buttons = getattr(QMessageBox, "StandardButton", None)
+        if standard_buttons is not None and hasattr(standard_buttons, name):
+            return getattr(standard_buttons, name)
+        return getattr(QMessageBox, name)
+
+    def _running_task_labels(self):
+        labels = []
+        for label, method_name in (
+            ("NBS run", "_process_is_running"),
+            ("NBS figure creation", "_export_is_running"),
+            ("covariate balance", "_covariate_balance_is_running"),
+            ("results generation", "_results_is_running"),
+        ):
+            method = getattr(self, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                running = bool(method())
+            except Exception:
+                running = False
+            if running:
+                labels.append(label)
+        return labels
+
+    def _confirm_close_requested(self):
+        running_labels = self._running_task_labels()
+        if running_labels:
+            task_text = ", ".join(running_labels)
+            message = (
+                f"{task_text} is still running.\n\n"
+                "Close the NBS window anyway?"
+            )
+        else:
+            message = "Close the NBS window?"
+        close_button = self._message_box_button("Close")
+        cancel_button = self._message_box_button("Cancel")
+        answer = QMessageBox.question(
+            self,
+            "Close NBS Window",
+            message,
+            close_button | cancel_button,
+            cancel_button,
+        )
+        return answer == close_button
+
+    def closeEvent(self, event):
+        if self._confirm_close_requested():
+            super().closeEvent(event)
+        else:
+            event.ignore()
 
     def _build_step_data(self):
         self.data_page = _CovariateFilterPage(self._columns, exclude_mode="toggle_button")
@@ -1165,21 +1237,9 @@ class NBSPrepareDialog(QDialog):
         self.output_prefix_edit.setPlaceholderText("Optional prefix for copied result .npz")
         output_grid.addWidget(self.output_prefix_edit, 2, 1, 1, 3)
 
-        self.display_results_check = QCheckBox("Display results")
-        self.display_results_check.setChecked(True)
-        output_grid.addWidget(self.display_results_check, 3, 0, 1, 2)
-        self.export_on_finish_check = QCheckBox("Export results on finish")
+        self.export_on_finish_check = QCheckBox("Create figures on finish")
         self.export_on_finish_check.setChecked(False)
-        output_grid.addWidget(self.export_on_finish_check, 3, 2, 1, 2)
-        self.display_collapse_check = QCheckBox("Collapse parcels")
-        self.display_collapse_check.setChecked(False)
-        output_grid.addWidget(self.display_collapse_check, 4, 0, 1, 2)
-        self.display_intra_hemi_check = QCheckBox("Intra-hemisphere edges only")
-        self.display_intra_hemi_check.setChecked(False)
-        self.display_intra_hemi_check.setToolTip(
-            "When exporting NBS plots, hide inter-hemisphere edges and show only LH-LH/RH-RH connections."
-        )
-        output_grid.addWidget(self.display_intra_hemi_check, 4, 2, 1, 2)
+        output_grid.addWidget(self.export_on_finish_check, 3, 0, 1, 4)
         layout.addWidget(output_group)
 
         run_group = QGroupBox("Run controls")
@@ -1200,10 +1260,6 @@ class NBSPrepareDialog(QDialog):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._cancel_run)
         run_buttons.addWidget(self.stop_button)
-        self.export_button = QPushButton("Export Results")
-        self.export_button.setEnabled(False)
-        self.export_button.clicked.connect(self._export_results)
-        run_buttons.addWidget(self.export_button)
         run_buttons.addStretch(1)
         run_layout.addLayout(run_buttons)
         layout.addWidget(run_group)
@@ -1213,8 +1269,60 @@ class NBSPrepareDialog(QDialog):
     def _build_step_results(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        self.results_tabs = QTabWidget()
 
-        info_group = QGroupBox("Structural context results")
+        plots_tab = QWidget()
+        plots_layout = QVBoxLayout(plots_tab)
+        plots_group = QGroupBox("NBS plot figures")
+        plots_grid = QGridLayout(plots_group)
+
+        plots_grid.addWidget(QLabel("NBS result bundle"), 0, 0)
+        self.plots_input_nbs_edit = QLineEdit("")
+        self.plots_input_nbs_edit.setReadOnly(True)
+        self.plots_input_nbs_edit.setPlaceholderText("Available after a successful NBS run")
+        plots_grid.addWidget(self.plots_input_nbs_edit, 0, 1, 1, 3)
+
+        self.display_results_check = QCheckBox("Display figures")
+        self.display_results_check.setObjectName("switchCheckBox")
+        self.display_results_check.setChecked(True)
+        plots_grid.addWidget(self.display_results_check, 1, 0, 1, 2)
+
+        self.display_collapse_check = QCheckBox("Collapse parcels")
+        self.display_collapse_check.setObjectName("switchCheckBox")
+        self.display_collapse_check.setChecked(False)
+        self.display_collapse_check.setToolTip(
+            "Collapse parcels for circular plots and summaries. Glassbrain plots keep original parcel resolution."
+        )
+        plots_grid.addWidget(self.display_collapse_check, 1, 2, 1, 2)
+
+        self.display_intra_hemi_check = QCheckBox("Intra-hemisphere edges only")
+        self.display_intra_hemi_check.setObjectName("switchCheckBox")
+        self.display_intra_hemi_check.setChecked(False)
+        self.display_intra_hemi_check.setToolTip(
+            "Hide inter-hemisphere edges and show only LH-LH/RH-RH connections in exported plots."
+        )
+        plots_grid.addWidget(self.display_intra_hemi_check, 2, 0, 1, 2)
+
+        self.display_split_tails_check = QCheckBox("Separate tail glassbrains")
+        self.display_split_tails_check.setObjectName("switchCheckBox")
+        self.display_split_tails_check.setChecked(False)
+        self.display_split_tails_check.setToolTip(
+            "For two-tailed NBS results, save separate positive-tail and negative-tail glassbrain figures."
+        )
+        plots_grid.addWidget(self.display_split_tails_check, 2, 2, 1, 2)
+
+        self.export_button = QPushButton("Create Figures")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self._export_results)
+        plots_grid.addWidget(self.export_button, 3, 0, 1, 4)
+
+        plots_layout.addWidget(plots_group)
+        plots_layout.addStretch(1)
+        self.results_tabs.addTab(plots_tab, "NBS Plots")
+
+        hub_tab = QWidget()
+        hub_layout = QVBoxLayout(hub_tab)
+        info_group = QGroupBox("Hub context")
         info_grid = QGridLayout(info_group)
 
         info_grid.addWidget(QLabel("NBS result bundle"), 0, 0)
@@ -1264,8 +1372,11 @@ class NBSPrepareDialog(QDialog):
         info_grid.addWidget(self.results_run_button, 6, 0, 1, 4)
 
         self._sync_reference_workspace_combo(self.reference_matrix_edit.text())
-        layout.addWidget(info_group)
-        layout.addStretch(1)
+        hub_layout.addWidget(info_group)
+        hub_layout.addStretch(1)
+        self.results_tabs.addTab(hub_tab, "Hub Context")
+
+        layout.addWidget(self.results_tabs, 1)
         return page
 
     def _results_script_path(self):
@@ -1283,6 +1394,8 @@ class NBSPrepareDialog(QDialog):
 
     def _refresh_results_step(self, force_defaults=False):
         result_path = str(self._last_result_npz_path or "").strip()
+        if hasattr(self, "plots_input_nbs_edit"):
+            self.plots_input_nbs_edit.setText(result_path)
         if hasattr(self, "results_input_nbs_edit"):
             self.results_input_nbs_edit.setText(result_path)
         if hasattr(self, "results_status_label"):
@@ -1651,10 +1764,11 @@ class NBSPrepareDialog(QDialog):
             "QPushButton#tableExcludeButton:disabled { background: transparent; color: transparent; border: 1px solid #cbd5e1; } "
             "QPushButton#tableExcludeButton:checked:disabled { background: #fca5a5; color: transparent; border: 1px solid #fca5a5; } "
         )
+        switch_style = _switch_checkbox_theme_styles(theme_name, builder=_switch_checkbox_style)
         _theme, style = _workflow_dialog_stylesheet(
             theme_name,
             control_selector="QPushButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QTableWidget",
-            extra_styles=toggle_style,
+            extra_styles=toggle_style + switch_style,
         )
         self.setStyleSheet(style)
         self._apply_terminal_style()
@@ -1697,14 +1811,17 @@ class NBSPrepareDialog(QDialog):
                 self.run_progress.setValue(1 if self._last_result_npz_path else 0)
                 if self.run_progress_label.text().strip() == "Running...":
                     self._set_run_progress_text("Idle")
-        if busy:
-            self.export_button.setEnabled(False)
-        elif self._last_result_npz_path and Path(self._last_result_npz_path).is_file():
-            self.export_button.setEnabled(True)
+        if hasattr(self, "export_button"):
+            if busy:
+                self.export_button.setEnabled(False)
+            elif self._last_result_npz_path and Path(self._last_result_npz_path).is_file():
+                self.export_button.setEnabled(True)
         self._update_run_state()
 
     def _set_export_busy(self, busy):
-        self.export_button.setText("Exporting..." if busy else "Export Results")
+        if not hasattr(self, "export_button"):
+            return
+        self.export_button.setText("Creating..." if busy else "Create Figures")
         if busy:
             self.export_button.setEnabled(False)
         elif not self._process_is_running() and self._last_result_npz_path and Path(self._last_result_npz_path).is_file():
@@ -1801,6 +1918,8 @@ class NBSPrepareDialog(QDialog):
         results_enabled = bool(result_path) and Path(result_path).is_file()
         if len(getattr(self, "_step_buttons", [])) > self.RESULTS_STEP_INDEX:
             self._step_buttons[self.RESULTS_STEP_INDEX].setEnabled(results_enabled and not any_busy)
+        if hasattr(self, "export_button"):
+            self.export_button.setEnabled(results_enabled and not any_busy)
         if hasattr(self, "results_run_button"):
             reference_path = self.reference_matrix_edit.text().strip() if hasattr(self, "reference_matrix_edit") else ""
             reference_key = self._selected_reference_matrix_key()
@@ -2132,6 +2251,7 @@ class NBSPrepareDialog(QDialog):
             "display_no_show": (not bool(self.display_results_check.isChecked())),
             "display_collapse_parcels": bool(self.display_collapse_check.isChecked()),
             "display_intra_hemisphere_only": bool(self.display_intra_hemi_check.isChecked()),
+            "display_separate_tail_glassbrains": bool(self.display_split_tails_check.isChecked()),
             "display_regressor_type": self._selected_export_regressor_type(),
             "export_on_finish": bool(self.export_on_finish_check.isChecked()),
             "output_folder": self.output_dir_edit.text().strip(),
@@ -2160,6 +2280,17 @@ class NBSPrepareDialog(QDialog):
         if axis == 1:
             return matrix_3d[:, indices, :].transpose(1, 0, 2)
         return matrix_3d[:, :, indices].transpose(2, 0, 1)
+
+    def _nbs_work_dir(self, modality):
+        modality_token = _slugify_fragment(str(modality or "mrsi").strip().lower() or "mrsi")
+        source_path = Path(self._source_path).expanduser()
+        parts = source_path.parts
+        if "derivatives" in parts:
+            derivatives_idx = len(parts) - 1 - list(reversed(parts)).index("derivatives")
+            derivatives_root = Path(*parts[: derivatives_idx + 1])
+        else:
+            derivatives_root = source_path.parent / "derivatives"
+        return derivatives_root / "nbs_work" / modality_token
 
     def _extract_parcel_metadata(self, npz):
         labels = None
@@ -2260,7 +2391,9 @@ class NBSPrepareDialog(QDialog):
             f"{source_stem}_key-{_slugify_fragment(self._matrix_key)}"
             f"_reg-{_slugify_fragment(reg_name)}_n-{indices.size}{parcel_suffix}_nbs_input.npz"
         )
-        subset_path = self._source_path.with_name(subset_name)
+        work_dir = self._nbs_work_dir(modality)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        subset_path = work_dir / subset_name
         np.savez(
             subset_path,
             matrix_subj_list=np.asarray(matrix_subj_list, dtype=float),
@@ -2588,7 +2721,7 @@ class NBSPrepareDialog(QDialog):
             self._set_status("Wait for active processing to finish before launching covariate balance diagnostics.")
             return
         if self._export_is_running():
-            self._set_status("Wait for export to finish before launching covariate balance diagnostics.")
+            self._set_status("Wait for figure creation to finish before launching covariate balance diagnostics.")
             return
         if self._covariate_balance_is_running():
             self._set_status("Covariate balance diagnostics are already running.")
@@ -2747,7 +2880,8 @@ class NBSPrepareDialog(QDialog):
         print(f"[NBS] Process finished with exit code {exit_code}", flush=True)
         self._append_terminal_line(f"[NBS] Process finished with exit code {exit_code}")
         if self._run_cancel_requested:
-            self.export_button.setEnabled(False)
+            if hasattr(self, "export_button"):
+                self.export_button.setEnabled(False)
             if hasattr(self, "run_progress_label"):
                 self._set_run_progress_text("Cancelled")
             if hasattr(self, "run_progress"):
@@ -2774,29 +2908,33 @@ class NBSPrepareDialog(QDialog):
                         if copied_path:
                             self._last_result_npz_path = copied_path
                         self._cleanup_staged_result(original_staged_path, keep_if_same=self._last_result_npz_path)
-                        self.export_button.setEnabled(True)
-                        message = f"{message} No significant components were found; staged bundle kept after confirmation. Ready to export results."
+                        if hasattr(self, "export_button"):
+                            self.export_button.setEnabled(True)
+                        message = f"{message} No significant components were found; staged bundle kept after confirmation. Ready to create figures."
                     else:
                         self._cleanup_staged_result(self._last_result_npz_path)
                         self._last_result_npz_path = None
-                        self.export_button.setEnabled(False)
+                        if hasattr(self, "export_button"):
+                            self.export_button.setEnabled(False)
                         message = f"{message} No significant components were found; staged bundle discarded."
                 else:
                     copied_path = self._copy_result_to_output_folder(self._last_result_npz_path)
                     if copied_path:
                         self._last_result_npz_path = copied_path
-                    self.export_button.setEnabled(True)
+                    if hasattr(self, "export_button"):
+                        self.export_button.setEnabled(True)
                     if n_significant > 0:
                         keep_export_ready = self._confirm_save_significant_result(self._last_result_npz_path)
                         if keep_export_ready:
-                            message = f"{message} Significant components were found; ready to export results."
+                            message = f"{message} Significant components were found; ready to create figures."
                         else:
                             allow_auto_export = False
-                            message = f"{message} Significant components were found; result bundle saved, export paused."
+                            message = f"{message} Significant components were found; result bundle saved, figure creation paused."
                     else:
-                        message = f"{message} Ready to export results."
+                        message = f"{message} Ready to create figures."
             else:
-                self.export_button.setEnabled(False)
+                if hasattr(self, "export_button"):
+                    self.export_button.setEnabled(False)
                 if staged_empty_result:
                     message = f"{message} No significant components were found and no staged bundle was available."
                 else:
@@ -2812,12 +2950,18 @@ class NBSPrepareDialog(QDialog):
             self._set_status(message)
             self._refresh_results_step(force_defaults=True)
             self._update_run_state()
-            if allow_auto_export and self.export_on_finish_check.isChecked() and self.export_button.isEnabled():
+            if (
+                allow_auto_export
+                and self.export_on_finish_check.isChecked()
+                and hasattr(self, "export_button")
+                and self.export_button.isEnabled()
+            ):
                 self._export_results()
         else:
             tail = self._run_output_tail[-1] if self._run_output_tail else "See terminal output."
             self._set_status(f"NBS run failed (exit {exit_code}). {tail}")
-            self.export_button.setEnabled(False)
+            if hasattr(self, "export_button"):
+                self.export_button.setEnabled(False)
             if hasattr(self, "run_progress_label"):
                 self._set_run_progress_text("Failed")
             if hasattr(self, "run_progress"):
@@ -2914,7 +3058,8 @@ class NBSPrepareDialog(QDialog):
         self._last_nbs_summary = None
         self._last_result_npz_path = None
         self._last_result_was_staged = False
-        self.export_button.setEnabled(False)
+        if hasattr(self, "export_button"):
+            self.export_button.setEnabled(False)
         self._go_to_step(self.RUN_STEP_INDEX)
         self._run_process = QProcess(self)
         self._run_process.readyReadStandardOutput.connect(self._on_process_output)
@@ -3061,8 +3206,8 @@ class NBSPrepareDialog(QDialog):
         message = (
             f"{n_sig} significant NBS component(s) were detected.\n"
             f"Global p-value: {pvalue_text}\n"
-            "Review the component p-values below. Save keeps the result export-ready; "
-            "Cancel leaves the bundle saved but skips automatic export."
+            "Review the component p-values below. Save keeps the result ready for figure creation; "
+            "Cancel leaves the bundle saved but skips automatic figure creation."
         )
         return self._exec_component_pvalues_dialog(
             result_path=result_path,
@@ -3171,12 +3316,12 @@ class NBSPrepareDialog(QDialog):
         if exit_code == 0:
             cleanup_msg = self._cleanup_matlab_export_dir()
             if cleanup_msg:
-                self._set_status(f"NBS result export completed. {cleanup_msg}")
+                self._set_status(f"NBS figures created. {cleanup_msg}")
             else:
-                self._set_status("NBS result export completed.")
+                self._set_status("NBS figures created.")
         else:
             tail = self._export_output_tail[-1] if self._export_output_tail else "See terminal output."
-            self._set_status(f"NBS result export failed (exit {exit_code}). {tail}")
+            self._set_status(f"NBS figure creation failed (exit {exit_code}). {tail}")
         self._export_process = None
 
     def _cleanup_matlab_export_dir(self):
@@ -3249,18 +3394,18 @@ class NBSPrepareDialog(QDialog):
 
     def _export_results(self):
         if self._process_is_running() or self._results_is_running():
-            self._set_status("Wait for active processing to finish before exporting.")
+            self._set_status("Wait for active processing to finish before creating figures.")
             return
         result_path = (self._last_result_npz_path or "").strip()
         if not result_path or not Path(result_path).is_file():
-            self._set_status("No NBS result file available to export.")
+            self._set_status("No NBS result file available for figure creation.")
             return
         script_path = Path(__file__).resolve().parents[1] / "scripts" / "analyze_nbs_group.py"
         if not script_path.exists():
-            self._set_status(f"Export script not found: {script_path}")
+            self._set_status(f"NBS figure script not found: {script_path}")
             return
         if self._export_process is not None and self._export_process.state() != _qprocess_not_running():
-            self._set_status("Export already running.")
+            self._set_status("Figure creation already running.")
             return
 
         python_exe = sys.executable or "python3"
@@ -3274,6 +3419,8 @@ class NBSPrepareDialog(QDialog):
             command.append("--collapse-parcels")
         if self.display_intra_hemi_check.isChecked():
             command.append("--intra-hemisphere-only")
+        if getattr(self, "display_split_tails_check", None) is not None and self.display_split_tails_check.isChecked():
+            command.append("--separate-tail-glassbrains")
         regressor_name = (self._regressor_name() or "").strip()
         if regressor_name:
             regressor_spec = regressor_name
@@ -3300,7 +3447,7 @@ class NBSPrepareDialog(QDialog):
         print("[NBS-EXPORT] Launch command:", shlex.join([python_exe] + command), flush=True)
         self._append_terminal_line(f"[NBS-EXPORT] Launch command: {shlex.join([python_exe] + command)}")
         self._set_export_busy(True)
-        self._set_status("Launching NBS result export...")
+        self._set_status("Creating NBS figures...")
         self._export_process.start(python_exe, command)
         if not self._export_process.waitForStarted(3000):
             self._set_export_busy(False)

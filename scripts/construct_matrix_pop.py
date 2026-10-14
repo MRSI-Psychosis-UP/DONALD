@@ -574,7 +574,7 @@ def _collapse_square_matrix_entry(matrix, key, prefix):
 
 def main(con_path_list,covar_df,modality,matrix_outpath,
          matrix_key=None,
-         ignore_parc_list=[],qmask_path=None,mrsi_cov=0.67,
+         ignore_parc_list=[],ignore_parcel_labels=[],qmask_path=None,mrsi_cov=0.67,
          comp_gradients=True,parcellation_img_path=None,
          parcel_labels_retain=[],include_parcels=False,
          include_parcels_start=0,include_parcels_end=None):
@@ -873,18 +873,25 @@ def main(con_path_list,covar_df,modality,matrix_outpath,
         matrix_pop_avg_clean = copy.deepcopy(matrix_list_sel.mean(axis=0))
         debug.info("No sparse nodes detected, none removed")
 
-    # Optionally drop parcels matching substrings provided via --ignore_parc_list
+    # Optionally drop parcels selected in the GUI by name or exact parcel label.
     ignore_tokens = [token.lower() for token in ignore_parc_list if isinstance(token, str) and token.strip()]
-    if ignore_tokens:
+    ignore_label_keys = {_parcel_label_key(label) for label in _coerce_label_list(ignore_parcel_labels)}
+    ignore_label_keys.discard("")
+    if ignore_tokens or ignore_label_keys:
         ignore_indices = []
-        for idx, name in enumerate(parcel_names_group):
+        for idx, (label, name) in enumerate(zip(parcel_labels_group, parcel_names_group)):
+            label_key = _parcel_label_key(label)
             name_str = str(name).lower()
-            if any(token in name_str for token in ignore_tokens):
+            if label_key in ignore_label_keys or any(token in name_str for token in ignore_tokens):
                 ignore_indices.append(idx)
         ignore_indices = sorted(set(ignore_indices))
         if ignore_indices:
             ignored_names = [parcel_names_group[i] for i in ignore_indices]
-            debug.info(f"Discarding parcels via --ignore_parc_list {ignore_tokens}: {ignored_names}")
+            ignored_labels = [parcel_labels_group[i] for i in ignore_indices]
+            debug.info(
+                f"Discarding parcels via trim selection names={ignore_tokens} "
+                f"labels={list(ignore_label_keys)}: {list(zip(ignored_labels, ignored_names))}"
+            )
             parcel_labels_group = np.delete(parcel_labels_group, ignore_indices)
             parcel_names_group = np.delete(parcel_names_group, ignore_indices)
             _matrix_pop_avg_clean = np.delete(matrix_pop_avg_clean, ignore_indices, axis=0)
@@ -893,7 +900,9 @@ def main(con_path_list,covar_df,modality,matrix_outpath,
             matrix_subjects_list_clean = np.delete(_matrix_subjects_list_clean, ignore_indices, axis=2)
             node_signals_subjects_clean = np.delete(node_signals_subjects_clean, ignore_indices, axis=1)
         else:
-            debug.warning(f"--ignore_parc_list patterns {ignore_tokens} matched no parcel names")
+            debug.warning(
+                f"Trim selection names={ignore_tokens} labels={list(ignore_label_keys)} matched no parcels"
+            )
 
     debug.info(f"Final Matrix shape {matrix_pop_avg_clean.shape}")
     debug.separator()

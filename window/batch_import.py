@@ -71,6 +71,12 @@ except ImportError:
     QT_LIB = 5
 
 
+if QT_LIB == 6:
+    Qt.Checked = Qt.CheckState.Checked
+    Qt.Unchecked = Qt.CheckState.Unchecked
+    Qt.Vertical = Qt.Orientation.Vertical
+
+
 def _write_diagnostic_line(text: str) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -250,7 +256,7 @@ class BatchMatrixImportDialog(QDialog):
         ("mrsi", "connectivity_mrsi"),
         ("func", "connectivity_func"),
     )
-    _STEP_TITLES = ("Select Matrices", "Selection", "Setup", "Multimodal", "Run")
+    _STEP_TITLES = ("Select Matrices", "Selection", "Trim", "Setup", "Multimodal", "Run")
     _HARMONIZE_TYPE_OPTIONS = ("categorical", "continuous")
 
     def __init__(self, folder_path: Path, candidate_paths, export_callback=None, parent=None) -> None:
@@ -261,6 +267,7 @@ class BatchMatrixImportDialog(QDialog):
         self._atlas_options = self._detected_atlas_options()
         self._requested_action = "add"
         self._selection_widget = None
+        self._trim_widget = None
         self._stack_prepare_widget = None
         self._stack_matrix_key_candidates = []
         self._current_step = 0
@@ -434,10 +441,19 @@ class BatchMatrixImportDialog(QDialog):
         self.selection_tab_layout.addWidget(self.selection_placeholder)
         self.selection_tab_layout.addStretch(1)
 
+        self.trim_page = QWidget()
+        self.trim_tab_layout = QVBoxLayout(self.trim_page)
+        self.trim_placeholder = QLabel(
+            "Step 3 appears here after you open the Selection step."
+        )
+        self.trim_placeholder.setWordWrap(True)
+        self.trim_tab_layout.addWidget(self.trim_placeholder)
+        self.trim_tab_layout.addStretch(1)
+
         self.setup_page = QWidget()
         self.setup_tab_layout = QVBoxLayout(self.setup_page)
         self.setup_placeholder = QLabel(
-            "Step 3 appears here after you open the Selection step."
+            "Step 4 appears here after you open the Selection step."
         )
         self.setup_placeholder.setWordWrap(True)
         self.setup_tab_layout.addWidget(self.setup_placeholder)
@@ -485,7 +501,7 @@ class BatchMatrixImportDialog(QDialog):
         self.run_info_label.setWordWrap(True)
         run_layout.addWidget(self.run_info_label)
         self.run_summary_label = QLabel(
-            "The stack preview will appear here after Selection and Setup are ready."
+            "The stack preview will appear here after Selection, Trim, and Setup are ready."
         )
         self.run_summary_label.setWordWrap(True)
         run_layout.addWidget(self.run_summary_label)
@@ -515,6 +531,7 @@ class BatchMatrixImportDialog(QDialog):
 
         self.step_stack.addWidget(selection_page)
         self.step_stack.addWidget(self.selection_page)
+        self.step_stack.addWidget(self.trim_page)
         self.step_stack.addWidget(self.setup_page)
         self.step_stack.addWidget(multimodal_page)
         self.step_stack.addWidget(run_page)
@@ -568,6 +585,8 @@ class BatchMatrixImportDialog(QDialog):
         self._apply_filters()
         if self._selection_widget is not None:
             self._selection_widget.set_selected_paths(self.selected_paths())
+        if self._trim_widget is not None:
+            self._trim_widget.set_selected_paths(self.selected_paths())
         if self._stack_prepare_widget is not None:
             self._stack_prepare_widget.set_selected_paths(self.selected_paths())
             self._refresh_optional_steps()
@@ -643,6 +662,13 @@ class BatchMatrixImportDialog(QDialog):
             except Exception:
                 pass
             self._stack_prepare_widget = None
+        if self._trim_widget is not None:
+            _write_diagnostic_line("Tearing down embedded trim_widget")
+            try:
+                self._trim_widget.hide()
+            except Exception:
+                pass
+            self._trim_widget = None
         if self._selection_widget is not None:
             _write_diagnostic_line("Tearing down embedded selection_widget")
             if hasattr(self._selection_widget, "prepare_for_close"):
@@ -715,15 +741,18 @@ class BatchMatrixImportDialog(QDialog):
             button.setChecked(is_current)
             prefix = "▶ " if is_current else ""
             button.setText(f"{prefix}{idx + 1}. {self._STEP_TITLES[idx]}")
-        if step == 4:
+        if step == self._run_step_index():
             self._refresh_run_table()
         self._sync_workflow_process_button()
+
+    def _run_step_index(self) -> int:
+        return len(self._STEP_TITLES) - 1
 
     def _run_preview_visible(self) -> bool:
         if not hasattr(self, "step_stack") or self.step_stack is None:
             return False
         try:
-            return int(self.step_stack.currentIndex()) == 4
+            return int(self.step_stack.currentIndex()) == self._run_step_index()
         except Exception:
             return False
 
@@ -844,6 +873,14 @@ class BatchMatrixImportDialog(QDialog):
             except Exception:
                 return ("all", "all")
         return ("all", "all")
+
+    def _selected_trim_parcels(self):
+        if self._trim_widget is not None and hasattr(self._trim_widget, "selected_trim_parcels"):
+            try:
+                return self._trim_widget.selected_trim_parcels()
+            except Exception:
+                pass
+        return {"names": [], "labels": [], "key": ""}
 
     def _harmonization_columns(self):
         if self._selection_widget is not None and hasattr(self._selection_widget, "covars_columns"):
@@ -970,10 +1007,14 @@ class BatchMatrixImportDialog(QDialog):
             )
         self.matrix_key_group.setVisible(self._selection_widget is not None)
 
+        if self._trim_widget is not None and hasattr(self._trim_widget, "set_matrix_key"):
+            self._trim_widget.set_matrix_key(self._selected_stack_matrix_key())
         if self._stack_prepare_widget is not None and hasattr(self._stack_prepare_widget, "set_matrix_key"):
             self._stack_prepare_widget.set_matrix_key(self._selected_stack_matrix_key())
 
     def _on_stack_matrix_key_changed(self, _index):
+        if self._trim_widget is not None and hasattr(self._trim_widget, "set_matrix_key"):
+            self._trim_widget.set_matrix_key(self._selected_stack_matrix_key())
         if self._stack_prepare_widget is not None and hasattr(self._stack_prepare_widget, "set_matrix_key"):
             self._stack_prepare_widget.set_matrix_key(self._selected_stack_matrix_key())
         self._sync_workflow_process_button()
@@ -1168,7 +1209,7 @@ class BatchMatrixImportDialog(QDialog):
             self.run_table.setRowCount(0)
             self.run_table.setColumnCount(0)
             self.run_summary_label.setText(
-                "The stack preview will appear here after Selection and Setup are ready."
+                "The stack preview will appear here after Selection, Trim, and Setup are ready."
             )
             return
 
@@ -1246,7 +1287,7 @@ class BatchMatrixImportDialog(QDialog):
         self.reference_modality_combo.blockSignals(False)
         ready = self._stack_prepare_widget is not None and self._selection_widget is not None
         self._refresh_stack_matrix_key_options()
-        for idx in (1, 2, 3, 4):
+        for idx in range(1, len(self._STEP_TITLES)):
             self._step_buttons[idx].setEnabled(ready)
         self._update_multimodal_controls()
         if self._run_preview_visible():
@@ -1466,10 +1507,10 @@ class BatchMatrixImportDialog(QDialog):
             )
             return
         try:
-            from window.stack_prepare import CovarsSelectionWidget, StackPrepareDialog
+            from window.stack_prepare import CovarsSelectionWidget, ParcelTrimWidget, StackPrepareDialog
         except Exception:
             try:
-                from mrsi_viewer.window.stack_prepare import CovarsSelectionWidget, StackPrepareDialog
+                from mrsi_viewer.window.stack_prepare import CovarsSelectionWidget, ParcelTrimWidget, StackPrepareDialog
             except Exception as exc:
                 QMessageBox.warning(self, "Stack Unavailable", f"Failed to open stack step: {exc}")
                 return
@@ -1494,6 +1535,30 @@ class BatchMatrixImportDialog(QDialog):
             self._selection_widget.set_selected_paths(selected)
         self._refresh_stack_matrix_key_options()
 
+        if self._trim_widget is None:
+            self._trim_widget = ParcelTrimWidget(
+                selected_paths=selected,
+                matrix_key=self._selected_stack_matrix_key(),
+                parent=self.trim_page,
+            )
+            _write_diagnostic_line("Created embedded trim_widget with parent=trim_page")
+            try:
+                self._trim_widget.destroyed.connect(
+                    lambda *_args: _write_diagnostic_line("embedded trim_widget destroyed")
+                )
+            except Exception:
+                pass
+            if hasattr(self._trim_widget, "configuration_changed"):
+                self._trim_widget.configuration_changed.connect(self._schedule_refresh_optional_steps)
+            self.trim_tab_layout.removeWidget(self.trim_placeholder)
+            self.trim_placeholder.hide()
+            self.trim_tab_layout.insertWidget(0, self._trim_widget, 1)
+        else:
+            self._trim_widget.set_selected_paths(selected)
+            if hasattr(self._trim_widget, "set_matrix_key"):
+                self._trim_widget.set_matrix_key(self._selected_stack_matrix_key())
+            self._trim_widget.show()
+
         if self._stack_prepare_widget is None:
             if hasattr(self, "workflow_terminal") and self.workflow_terminal is not None:
                 self.workflow_terminal.clear()
@@ -1508,6 +1573,8 @@ class BatchMatrixImportDialog(QDialog):
                 selection_suffix_provider=self._selection_suffix,
                 multimodal_config_provider=self._multimodal_process_config,
                 include_covars_widget=False,
+                include_trim_widget=False,
+                trim_parcels_provider=self._selected_trim_parcels,
                 show_embedded_terminal=False,
                 show_import_button=False,
                 show_process_button=False,
@@ -1531,7 +1598,7 @@ class BatchMatrixImportDialog(QDialog):
                 self._stack_prepare_widget.log_message_emitted.connect(self._append_workflow_terminal)
             self.setup_tab_layout.removeWidget(self.setup_placeholder)
             self.setup_placeholder.hide()
-            self.setup_tab_layout.addWidget(self._stack_prepare_widget, 1)
+            self.setup_tab_layout.insertWidget(0, self._stack_prepare_widget, 1)
         else:
             self._stack_prepare_widget.set_selected_paths(selected)
             self._stack_prepare_widget.show()

@@ -90,6 +90,16 @@ if QT_LIB == 6:
     Qt.Unchecked = Qt.CheckState.Unchecked
 
 
+def _user_role():
+    role = getattr(Qt, "UserRole", None)
+    if role is not None:
+        return role
+    return getattr(Qt.ItemDataRole, "UserRole")
+
+
+USER_ROLE = _user_role()
+
+
 NUMERIC_RANGE_RE = re.compile(
     r"^\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*-\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*$"
 )
@@ -250,6 +260,120 @@ def _max_parcel_label_from_npz(npz_path) -> int:
     except Exception as exc:
         _stack_diagnostic_log(f"Failed to inspect parcel labels in {npz_path}: {exc}")
     return 0
+
+
+def _vector_from_npz(archive, key):
+    if not key or key not in archive:
+        return None
+    try:
+        arr = np.asarray(archive[key])
+    except Exception:
+        return None
+    if arr.ndim == 0:
+        return None
+    return arr.reshape(-1)
+
+
+def _default_stack_matrix_key_for_modality(modality):
+    modality_token = str(modality or "").strip().lower()
+    if modality_token == "dwi":
+        return "connectome_density"
+    if modality_token == "func":
+        return "connectivity"
+    return "simmatrix_sp"
+
+
+def _matrix_node_count_from_npz(npz_path, matrix_key=None, modality=""):
+    try:
+        with np.load(str(npz_path), allow_pickle=True) as archive:
+            keys = list(archive.files)
+            candidates = []
+            if matrix_key:
+                candidates.append(str(matrix_key))
+            default_key = _default_stack_matrix_key_for_modality(modality)
+            if default_key:
+                candidates.append(default_key)
+            candidates.extend(("simmatrix_sp", "connectivity", "connectome_density", "matrix_pop_avg"))
+            for key in dict.fromkeys(candidates):
+                if key not in archive:
+                    continue
+                arr = np.asarray(archive[key])
+                if arr.ndim == 2 and arr.shape[0] == arr.shape[1]:
+                    return int(arr.shape[0])
+                if arr.ndim == 3:
+                    if arr.shape[1] == arr.shape[2]:
+                        return int(arr.shape[1])
+                    if arr.shape[0] == arr.shape[1]:
+                        return int(arr.shape[0])
+            for key in keys:
+                arr = np.asarray(archive[key])
+                if arr.ndim == 2 and arr.shape[0] == arr.shape[1]:
+                    return int(arr.shape[0])
+                if arr.ndim == 3:
+                    if arr.shape[1] == arr.shape[2]:
+                        return int(arr.shape[1])
+                    if arr.shape[0] == arr.shape[1]:
+                        return int(arr.shape[0])
+    except Exception as exc:
+        _stack_diagnostic_log(f"Failed to inspect matrix shape in {npz_path}: {exc}")
+    return None
+
+
+def _parcel_vector_key_candidates(npz_path, expected_len=None):
+    preferred = (
+        "parcel_names_group",
+        "parcel_names",
+        "labels",
+        "labels_group",
+        "parcel_labels_group",
+        "labels_indices",
+        "parcel_labels",
+    )
+    candidates = []
+    try:
+        with np.load(str(npz_path), allow_pickle=True) as archive:
+            for key in archive.files:
+                vector = _vector_from_npz(archive, key)
+                if vector is None or vector.size == 0:
+                    continue
+                if expected_len is not None and int(vector.size) != int(expected_len):
+                    continue
+                candidates.append(
+                    {
+                        "key": str(key),
+                        "size": int(vector.size),
+                        "dtype": str(vector.dtype),
+                    }
+                )
+    except Exception as exc:
+        _stack_diagnostic_log(f"Failed to inspect parcel metadata keys in {npz_path}: {exc}")
+        return []
+
+    order = {name: idx for idx, name in enumerate(preferred)}
+    return sorted(
+        candidates,
+        key=lambda item: (
+            order.get(str(item.get("key")), len(order)),
+            str(item.get("key", "")).lower(),
+        ),
+    )
+
+
+def _best_label_vector_from_archive(archive, expected_len, names_key=""):
+    preferred = (
+        "parcel_labels_group",
+        "labels_indices",
+        "parcel_labels",
+        "labels_group",
+        "labels",
+    )
+    for key in preferred:
+        if key == names_key:
+            continue
+        vector = _vector_from_npz(archive, key)
+        if vector is not None and int(vector.size) == int(expected_len):
+            return str(key), vector
+    return "", np.arange(int(expected_len), dtype=int)
 
 
 def _covars_to_rows(covars_df):
@@ -886,6 +1010,335 @@ class CovarsSelectionWidget(QWidget):
         # Qt will destroy child widgets/items when the parent dialog closes.
 
 
+class ParcelTrimWidget(QWidget):
+    configuration_changed = pyqtSignal()
+
+    def __init__(self, selected_paths=None, matrix_key=None, parent=None):
+        super().__init__(parent)
+        self._selected_paths = [Path(path) for path in (selected_paths or [])]
+        self._matrix_key = str(matrix_key or "").strip() or None
+        self._parcel_rows = []
+        self._filtered_indices = []
+        self._trimmed_indices = set()
+        self._table_refreshing = False
+        self._key_combo_refreshing = False
+        self._build_ui()
+        self._refresh_key_combo()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        group = QGroupBox("Trim Parcels")
+        layout = QVBoxLayout(group)
+
+        key_row = QHBoxLayout()
+        key_row.addWidget(QLabel("Parcel names key"))
+        self.parcel_key_combo = QComboBox()
+        self.parcel_key_combo.currentIndexChanged.connect(self._on_key_changed)
+        key_row.addWidget(self.parcel_key_combo, 1)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self._refresh_key_combo)
+        key_row.addWidget(self.refresh_button)
+        layout.addLayout(key_row)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter"))
+        self.filter_edit = QLineEdit("")
+        self.filter_edit.setPlaceholderText("Comma-separated substrings, e.g. thal, wm-, ventricle")
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self.filter_edit, 1)
+        self.mark_filtered_button = QPushButton("Trim Filtered")
+        self.mark_filtered_button.clicked.connect(self._mark_filtered_for_trim)
+        filter_row.addWidget(self.mark_filtered_button)
+        self.clear_filtered_button = QPushButton("Clear Filtered")
+        self.clear_filtered_button.clicked.connect(self._clear_filtered_trim)
+        filter_row.addWidget(self.clear_filtered_button)
+        self.clear_all_button = QPushButton("Clear All")
+        self.clear_all_button.clicked.connect(self._clear_all_trim)
+        filter_row.addWidget(self.clear_all_button)
+        layout.addLayout(filter_row)
+
+        self.trim_table = QTableWidget()
+        self.trim_table.setAlternatingRowColors(True)
+        self.trim_table.itemChanged.connect(self._on_table_item_changed)
+        if QT_LIB == 6:
+            self.trim_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.trim_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        else:
+            self.trim_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.trim_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        layout.addWidget(self.trim_table, 1)
+
+        self.summary_label = QLabel("")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+        root.addWidget(group, 1)
+
+    def set_selected_paths(self, selected_paths):
+        self._selected_paths = [Path(path) for path in (selected_paths or [])]
+        self._trimmed_indices.clear()
+        self._refresh_key_combo()
+
+    def set_matrix_key(self, matrix_key):
+        normalized = str(matrix_key or "").strip() or None
+        if normalized == self._matrix_key:
+            return
+        selected_names = set(self.selected_trim_parcel_names())
+        selected_labels = set(str(value) for value in self.selected_trim_parcel_labels())
+        self._matrix_key = normalized
+        self._refresh_key_combo()
+        self._restore_trim_selection(selected_names, selected_labels)
+
+    def _first_path(self):
+        return self._selected_paths[0] if self._selected_paths else None
+
+    def _expected_len(self):
+        first = self._first_path()
+        if first is None:
+            return None
+        modality = _infer_modality_from_path(first)
+        return _matrix_node_count_from_npz(first, self._matrix_key, modality=modality)
+
+    def _refresh_key_combo(self):
+        first = self._first_path()
+        previous = self.selected_parcel_key()
+        self._key_combo_refreshing = True
+        self.parcel_key_combo.blockSignals(True)
+        self.parcel_key_combo.clear()
+        if first is None:
+            self.parcel_key_combo.addItem("No selected NPZ files", "")
+            self.parcel_key_combo.setEnabled(False)
+            self._key_combo_refreshing = False
+            self.parcel_key_combo.blockSignals(False)
+            self._load_current_key()
+            return
+
+        expected_len = self._expected_len()
+        candidates = _parcel_vector_key_candidates(first, expected_len=expected_len)
+        if not candidates and expected_len is not None:
+            candidates = _parcel_vector_key_candidates(first, expected_len=None)
+        for entry in candidates:
+            key = str(entry.get("key") or "")
+            label = f"{key} ({entry.get('size')} values, {entry.get('dtype')})"
+            self.parcel_key_combo.addItem(label, key)
+
+        self.parcel_key_combo.setEnabled(bool(candidates))
+        selected_index = 0
+        keys = [str(entry.get("key") or "") for entry in candidates]
+        if previous and previous in keys:
+            selected_index = keys.index(previous)
+        elif "parcel_names" in keys:
+            selected_index = keys.index("parcel_names")
+        elif "labels" in keys:
+            selected_index = keys.index("labels")
+        elif keys:
+            selected_index = 0
+        if keys:
+            self.parcel_key_combo.setCurrentIndex(selected_index)
+        else:
+            self.parcel_key_combo.addItem("No parcel vectors found", "")
+        self.parcel_key_combo.blockSignals(False)
+        self._key_combo_refreshing = False
+        self._load_current_key()
+
+    def selected_parcel_key(self):
+        if not hasattr(self, "parcel_key_combo"):
+            return ""
+        data = self.parcel_key_combo.currentData()
+        if data is not None:
+            return str(data).strip()
+        return self.parcel_key_combo.currentText().split("(", 1)[0].strip()
+
+    def _on_key_changed(self, _index):
+        if self._key_combo_refreshing:
+            return
+        self._trimmed_indices.clear()
+        self._load_current_key()
+        self.configuration_changed.emit()
+
+    def _load_current_key(self):
+        first = self._first_path()
+        key = self.selected_parcel_key()
+        self._parcel_rows = []
+        if first is None or not key:
+            self._filtered_indices = []
+            self._refresh_table()
+            self._set_summary("Select NPZ files to inspect parcel metadata.")
+            return
+
+        expected_len = self._expected_len()
+        try:
+            with np.load(str(first), allow_pickle=True) as archive:
+                names = _vector_from_npz(archive, key)
+                if names is None:
+                    raise ValueError(f"Key '{key}' is not a vector.")
+                if expected_len is not None and int(names.size) != int(expected_len):
+                    raise ValueError(
+                        f"Key '{key}' has {int(names.size)} values, but the selected matrix has {expected_len} nodes."
+                    )
+                label_key, labels = _best_label_vector_from_archive(archive, int(names.size), names_key=key)
+        except Exception as exc:
+            self._filtered_indices = []
+            self._refresh_table()
+            self._set_summary(f"Could not load parcel names from '{key}': {exc}")
+            return
+
+        if int(labels.size) != int(names.size):
+            labels = np.arange(int(names.size), dtype=int)
+            label_key = ""
+        self._parcel_rows = [
+            {
+                "index": idx,
+                "label": _display_text(labels[idx]),
+                "name": _display_text(names[idx]),
+            }
+            for idx in range(int(names.size))
+        ]
+        self._trimmed_indices = {
+            idx for idx in self._trimmed_indices if 0 <= int(idx) < len(self._parcel_rows)
+        }
+        self._apply_filter()
+        label_source = f"; IDs from {label_key}" if label_key else ""
+        self._set_summary(
+            f"Loaded {len(self._parcel_rows)} parcels from {Path(first).name} key '{key}'{label_source}."
+        )
+
+    def _filter_tokens(self):
+        values = [token.strip().lower() for token in self.filter_edit.text().split(",")]
+        return [token for token in values if token]
+
+    def _apply_filter(self):
+        tokens = self._filter_tokens()
+        if not tokens:
+            self._filtered_indices = list(range(len(self._parcel_rows)))
+        else:
+            matched = []
+            for idx, row in enumerate(self._parcel_rows):
+                haystack = f"{row.get('label', '')} {row.get('name', '')}".lower()
+                if any(token in haystack for token in tokens):
+                    matched.append(idx)
+            self._filtered_indices = matched
+        self._refresh_table()
+
+    def _refresh_table(self):
+        self._table_refreshing = True
+        self.trim_table.blockSignals(True)
+        self.trim_table.clear()
+        headers = ["Trim", "Index", "Parcel ID", "Parcel Name"]
+        self.trim_table.setColumnCount(len(headers))
+        self.trim_table.setHorizontalHeaderLabels(headers)
+        self.trim_table.setRowCount(len(self._filtered_indices))
+        enabled_flag = _is_enabled_flag()
+        selectable_flag = _is_selectable_flag()
+        checkable_flag = _is_user_checkable_flag()
+        editable_flag = _is_editable_flag()
+        for table_row, source_idx in enumerate(self._filtered_indices):
+            row = self._parcel_rows[source_idx]
+            trim_item = QTableWidgetItem("")
+            trim_item.setData(USER_ROLE, source_idx)
+            trim_item.setFlags(enabled_flag | selectable_flag | checkable_flag)
+            trim_item.setCheckState(Qt.Checked if source_idx in self._trimmed_indices else Qt.Unchecked)
+            self.trim_table.setItem(table_row, 0, trim_item)
+            values = (source_idx, row.get("label", ""), row.get("name", ""))
+            for col_idx, value in enumerate(values, start=1):
+                item = QTableWidgetItem(_display_text(value))
+                item.setFlags(item.flags() & ~editable_flag)
+                self.trim_table.setItem(table_row, col_idx, item)
+        header = self.trim_table.horizontalHeader()
+        if QT_LIB == 6:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        else:
+            header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.trim_table.blockSignals(False)
+        self._table_refreshing = False
+        self._update_count_summary()
+
+    def _on_table_item_changed(self, item):
+        if item is None or self._table_refreshing or item.column() != 0:
+            return
+        source_idx = item.data(USER_ROLE)
+        if source_idx is None:
+            return
+        source_idx = int(source_idx)
+        if item.checkState() == Qt.Checked:
+            self._trimmed_indices.add(source_idx)
+        else:
+            self._trimmed_indices.discard(source_idx)
+        self._update_count_summary()
+        self.configuration_changed.emit()
+
+    def _mark_filtered_for_trim(self):
+        self._trimmed_indices.update(int(idx) for idx in self._filtered_indices)
+        self._refresh_table()
+        self.configuration_changed.emit()
+
+    def _clear_filtered_trim(self):
+        for idx in self._filtered_indices:
+            self._trimmed_indices.discard(int(idx))
+        self._refresh_table()
+        self.configuration_changed.emit()
+
+    def _clear_all_trim(self):
+        self._trimmed_indices.clear()
+        self._refresh_table()
+        self.configuration_changed.emit()
+
+    def _restore_trim_selection(self, names, labels):
+        if not names and not labels:
+            return
+        restored = set()
+        for idx, row in enumerate(self._parcel_rows):
+            if row.get("name", "") in names or str(row.get("label", "")) in labels:
+                restored.add(idx)
+        self._trimmed_indices = restored
+        self._refresh_table()
+        self.configuration_changed.emit()
+
+    def _set_summary(self, text):
+        base = str(text or "").strip()
+        counts = (
+            f" Showing {len(self._filtered_indices)}/{len(self._parcel_rows)} parcels. "
+            f"Trim selected: {len(self._trimmed_indices)}."
+        )
+        self.summary_label.setText((base + counts).strip())
+
+    def _update_count_summary(self):
+        current = self.summary_label.text().split(" Showing ", 1)[0].strip()
+        if not current:
+            current = "Parcel trim table ready."
+        self._set_summary(current)
+
+    def selected_trim_parcel_names(self):
+        values = []
+        for idx in sorted(self._trimmed_indices):
+            if 0 <= int(idx) < len(self._parcel_rows):
+                name = _display_text(self._parcel_rows[int(idx)].get("name", "")).strip()
+                if name:
+                    values.append(name)
+        return values
+
+    def selected_trim_parcel_labels(self):
+        values = []
+        for idx in sorted(self._trimmed_indices):
+            if 0 <= int(idx) < len(self._parcel_rows):
+                label = _display_text(self._parcel_rows[int(idx)].get("label", "")).strip()
+                if label:
+                    values.append(label)
+        return values
+
+    def selected_trim_parcels(self):
+        return {
+            "names": self.selected_trim_parcel_names(),
+            "labels": self.selected_trim_parcel_labels(),
+            "key": self.selected_parcel_key(),
+        }
+
+
 class _StackWorker(QObject):
     log_message = pyqtSignal(str)
     completed = pyqtSignal(object)
@@ -1030,6 +1483,8 @@ class StackPrepareDialog(QWidget):
         show_embedded_terminal=True,
         show_import_button=True,
         show_process_button=True,
+        include_trim_widget=True,
+        trim_parcels_provider=None,
         default_results_dir="",
         default_bids_dir="",
         default_atlas_dir="",
@@ -1050,10 +1505,13 @@ class StackPrepareDialog(QWidget):
         self._show_embedded_terminal = bool(show_embedded_terminal)
         self._show_import_button = bool(show_import_button)
         self._show_process_button = bool(show_process_button)
+        self._include_trim_widget = bool(include_trim_widget)
+        self._trim_parcels_provider = trim_parcels_provider
         self._default_results_dir = str(default_results_dir or "").strip()
         self._default_bids_dir = str(default_bids_dir or "").strip()
         self._default_atlas_dir = str(default_atlas_dir or "").strip()
         self._covars_widget = None
+        self._trim_widget = None
         self._matrix_key = None
         self._output_path_auto = True
         self._processing = False
@@ -1101,83 +1559,57 @@ class StackPrepareDialog(QWidget):
         summary_layout.addWidget(self.selection_label)
         root.addWidget(summary_group)
 
+        if self._include_trim_widget:
+            self._trim_widget = ParcelTrimWidget(
+                selected_paths=self._selected_paths,
+                matrix_key=self._matrix_key,
+                parent=self,
+            )
+            self._trim_widget.configuration_changed.connect(self._handle_trim_selection_changed)
+            root.addWidget(self._trim_widget, 1)
+
         options_group = QGroupBox("Processing")
         options_layout = QGridLayout(options_group)
-        options_layout.addWidget(QLabel("Ignore parcels"), 0, 0)
-        self.ignore_parc_edit = QLineEdit("")
-        self.ignore_parc_edit.setPlaceholderText("Comma-separated substrings, e.g. wm-, ventricle")
-        options_layout.addWidget(self.ignore_parc_edit, 0, 1, 1, 3)
-
-        options_layout.addWidget(QLabel("Qmask (optional)"), 1, 0)
+        options_layout.addWidget(QLabel("Qmask (optional)"), 0, 0)
         self.qmask_path_edit = FileDropLineEdit(accepted_suffixes=(".nii", ".nii.gz"))
         self.qmask_path_edit.setPlaceholderText("Optional qmask .nii or .nii.gz path")
         self.qmask_path_edit.textChanged.connect(self._sync_processing_options)
         self.qmask_path_edit.textChanged.connect(self._update_process_enabled)
-        options_layout.addWidget(self.qmask_path_edit, 1, 1, 1, 2)
+        options_layout.addWidget(self.qmask_path_edit, 0, 1, 1, 2)
         self.qmask_browse_button = QPushButton("Browse")
         self.qmask_browse_button.clicked.connect(self._browse_qmask_file)
-        options_layout.addWidget(self.qmask_browse_button, 1, 3)
+        options_layout.addWidget(self.qmask_browse_button, 0, 3)
 
         self.parcellation_label = QLabel("Parcellation image (required)")
-        options_layout.addWidget(self.parcellation_label, 2, 0)
+        options_layout.addWidget(self.parcellation_label, 1, 0)
         self.parcellation_path_edit = FileDropLineEdit(accepted_suffixes=(".nii", ".nii.gz"))
         self.parcellation_path_edit.setPlaceholderText(
             "Required NIfTI parcellation image (.nii or .nii.gz)"
         )
         self.parcellation_path_edit.textChanged.connect(self._sync_processing_options)
         self.parcellation_path_edit.textChanged.connect(self._update_process_enabled)
-        options_layout.addWidget(self.parcellation_path_edit, 2, 1, 1, 2)
+        options_layout.addWidget(self.parcellation_path_edit, 1, 1, 1, 2)
         self.parcellation_browse_button = QPushButton("Browse")
         self.parcellation_browse_button.clicked.connect(self._browse_parcellation_file)
-        options_layout.addWidget(self.parcellation_browse_button, 2, 3)
+        options_layout.addWidget(self.parcellation_browse_button, 1, 3)
 
         self.mrsi_cov_label = QLabel("MRSI coverage")
-        options_layout.addWidget(self.mrsi_cov_label, 3, 0)
+        options_layout.addWidget(self.mrsi_cov_label, 2, 0)
         self.mrsi_cov_spin = QDoubleSpinBox()
         self.mrsi_cov_spin.setRange(0.0, 1.0)
         self.mrsi_cov_spin.setSingleStep(0.01)
         self.mrsi_cov_spin.setDecimals(2)
         self.mrsi_cov_spin.setValue(0.67)
-        options_layout.addWidget(self.mrsi_cov_spin, 3, 1)
+        options_layout.addWidget(self.mrsi_cov_spin, 2, 1)
 
         self.compute_gradients_check = QCheckBox("Compute gradients")
         self.compute_gradients_check.setObjectName("switchCheckBox")
         self.compute_gradients_check.setChecked(True)
         self.compute_gradients_check.toggled.connect(self._sync_processing_options)
         self.compute_gradients_check.toggled.connect(self._update_process_enabled)
-        options_layout.addWidget(self.compute_gradients_check, 4, 0, 1, 4)
-
-        self.include_parcels_row = QWidget()
-        include_parcels_layout = QHBoxLayout(self.include_parcels_row)
-        include_parcels_layout.setContentsMargins(0, 0, 0, 0)
-        include_parcels_layout.setSpacing(8)
-        self.include_parcels_check = QCheckBox("Include parcels")
-        self.include_parcels_check.setObjectName("switchCheckBox")
-        self.include_parcels_check.setChecked(False)
-        self.include_parcels_check.toggled.connect(self._sync_include_parcel_controls)
-        include_parcels_layout.addWidget(self.include_parcels_check)
-        self.include_parcels_start_label = QLabel("Start label")
-        include_parcels_layout.addWidget(self.include_parcels_start_label)
-        self.include_parcels_start_spin = QSpinBox()
-        self.include_parcels_start_spin.setRange(0, 0)
-        self.include_parcels_start_spin.setValue(1)
-        self.include_parcels_start_spin.setKeyboardTracking(False)
-        self.include_parcels_start_spin.valueChanged.connect(self._on_include_parcel_start_changed)
-        include_parcels_layout.addWidget(self.include_parcels_start_spin)
-        self.include_parcels_end_label = QLabel("End label")
-        include_parcels_layout.addWidget(self.include_parcels_end_label)
-        self.include_parcels_end_spin = QSpinBox()
-        self.include_parcels_end_spin.setRange(0, 0)
-        self.include_parcels_end_spin.setValue(0)
-        self.include_parcels_end_spin.setKeyboardTracking(False)
-        self.include_parcels_end_spin.valueChanged.connect(self._on_include_parcel_end_changed)
-        include_parcels_layout.addWidget(self.include_parcels_end_spin)
-        include_parcels_layout.addStretch(1)
-        options_layout.addWidget(self.include_parcels_row, 5, 0, 1, 4)
+        options_layout.addWidget(self.compute_gradients_check, 3, 0, 1, 4)
         root.addWidget(options_group)
 
-        self._refresh_include_parcel_defaults(force=True)
-        self._sync_include_parcel_controls()
         self._sync_processing_options()
 
         if self._include_covars_widget:
@@ -1198,17 +1630,15 @@ class StackPrepareDialog(QWidget):
         output_layout = QGridLayout(output_group)
         output_layout.addWidget(QLabel("Output NPZ (BIDS)"), 0, 0)
         self.output_path_edit = QLineEdit("")
-        self.output_path_edit.setReadOnly(True)
+        self.output_path_edit.setReadOnly(False)
+        self.output_path_edit.textEdited.connect(self._on_output_path_edited)
         self.output_path_edit.setToolTip(
-            "Stack output is written next to the source connectivity matrices under "
-            "derivatives/group/connectivity/<modality>."
+            "Edit the output NPZ path directly or use Browse to choose a filename."
         )
         output_layout.addWidget(self.output_path_edit, 0, 1)
         self.output_browse_button = QPushButton("Browse")
-        self.output_browse_button.setEnabled(False)
-        self.output_browse_button.setToolTip(
-            "Stack output location is fixed to the source BIDS derivatives/group/connectivity folder."
-        )
+        self.output_browse_button.setEnabled(True)
+        self.output_browse_button.setToolTip("Choose the stack output NPZ path.")
         self.output_browse_button.clicked.connect(self._browse_output_path)
         output_layout.addWidget(self.output_browse_button, 0, 2)
         root.addWidget(output_group)
@@ -1256,13 +1686,14 @@ class StackPrepareDialog(QWidget):
         self._selected_paths = [Path(path) for path in (selected_paths or [])]
         if self._covars_widget is not None:
             self._covars_widget.set_selected_paths(self._selected_paths)
+        if self._trim_widget is not None:
+            self._trim_widget.set_selected_paths(self._selected_paths)
         self._detected_atlas = _atlas_tag_from_path(self._selected_paths[0]) if self._selected_paths else "unknown"
         self._detected_modality = (
             _infer_modality_from_path(self._selected_paths[0]) if self._selected_paths else "connectivity"
         )
         self._detected_modalities = _modalities_from_paths(self._selected_paths)
         self._refresh_selection_summary()
-        self._refresh_include_parcel_defaults(force=True)
         self._sync_processing_options()
         if self._output_path_auto:
             self._set_default_output_path(force=True)
@@ -1272,6 +1703,10 @@ class StackPrepareDialog(QWidget):
     def _handle_covars_selection_changed(self):
         if self._output_path_auto:
             self._set_default_output_path(force=True)
+        self._update_process_enabled()
+        self.configuration_changed.emit()
+
+    def _handle_trim_selection_changed(self):
         self._update_process_enabled()
         self.configuration_changed.emit()
 
@@ -1296,6 +1731,8 @@ class StackPrepareDialog(QWidget):
         if normalized == self._matrix_key:
             return
         self._matrix_key = normalized
+        if self._trim_widget is not None:
+            self._trim_widget.set_matrix_key(normalized)
         self._refresh_selection_summary()
         self._update_process_enabled()
         self.configuration_changed.emit()
@@ -1373,7 +1810,6 @@ class StackPrepareDialog(QWidget):
         self.mrsi_cov_label.setVisible(show_mrsi_cov)
         self.mrsi_cov_spin.setVisible(show_mrsi_cov)
         self.mrsi_cov_spin.setEnabled(show_mrsi_cov)
-        self._sync_include_parcel_controls()
         self._update_parcellation_requirement_ui()
 
     def _parcellation_required(self):
@@ -1386,6 +1822,8 @@ class StackPrepareDialog(QWidget):
         )
 
     def _set_include_parcel_spin_bounds(self, start_value=None, end_value=None):
+        if not hasattr(self, "include_parcels_start_spin") or not hasattr(self, "include_parcels_end_spin"):
+            return
         max_label = max(0, int(self._include_parcel_label_max))
         if start_value is None:
             start_value = self.include_parcels_start_spin.value()
@@ -1419,6 +1857,8 @@ class StackPrepareDialog(QWidget):
             self._set_include_parcel_spin_bounds()
 
     def _sync_include_parcel_controls(self):
+        if not hasattr(self, "include_parcels_check"):
+            return
         enabled = bool(self.include_parcels_check.isChecked())
         for widget in (
             self.include_parcels_start_label,
@@ -1533,12 +1973,24 @@ class StackPrepareDialog(QWidget):
         self._update_process_enabled()
 
     def _browse_output_path(self):
-        resolved = self._resolved_stack_output_path()
-        if resolved is not None:
-            self.output_path_edit.setText(str(resolved))
-        self._set_status(
-            "Stack output path is fixed to derivatives/group/connectivity/<modality> in the source BIDS dataset."
+        current = self.output_path_edit.text().strip()
+        if current:
+            start_path = Path(current)
+        else:
+            start_path = self._resolved_stack_output_path() or Path.home() / "stacked_connectivity.npz"
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select stack output NPZ",
+            str(start_path),
+            "NPZ files (*.npz);;All files (*)",
         )
+        if selected:
+            output = Path(selected)
+            if output.suffix.lower() != ".npz":
+                output = output.with_suffix(".npz")
+            self.output_path_edit.setText(str(output))
+            self._output_path_auto = False
+            self._set_status("Output path updated.")
         self._update_process_enabled()
 
     def _selected_covars_df(self):
@@ -1563,8 +2015,28 @@ class StackPrepareDialog(QWidget):
                 pass
 
     def _parse_ignore_parcels(self):
-        values = [token.strip() for token in self.ignore_parc_edit.text().split(",")]
-        return [token for token in values if token]
+        trim = self._selected_trim_parcels()
+        return [str(token).strip() for token in trim.get("names", []) if str(token).strip()]
+
+    def _parse_ignore_parcel_labels(self):
+        trim = self._selected_trim_parcels()
+        return [str(token).strip() for token in trim.get("labels", []) if str(token).strip()]
+
+    def _selected_trim_parcels(self):
+        if callable(self._trim_parcels_provider):
+            try:
+                payload = self._trim_parcels_provider()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                return {
+                    "names": list(payload.get("names", []) or []),
+                    "labels": list(payload.get("labels", []) or []),
+                    "key": str(payload.get("key") or ""),
+                }
+        if self._trim_widget is not None and hasattr(self._trim_widget, "selected_trim_parcels"):
+            return self._trim_widget.selected_trim_parcels()
+        return {"names": [], "labels": [], "key": ""}
 
     def _update_process_enabled(self):
         effective_paths = self.effective_selected_paths()
@@ -1669,10 +2141,13 @@ class StackPrepareDialog(QWidget):
         effective_paths = self.effective_selected_paths()
         if not effective_paths:
             raise ValueError("No NPZ files remain after applying the current filters.")
-        output_path = self._resolved_stack_output_path()
-        if output_path is None:
-            raise ValueError("Unable to resolve a BIDS output path for the stack.")
-        self.output_path_edit.setText(str(output_path))
+        output_text = self.output_path_edit.text().strip()
+        if not output_text:
+            raise ValueError("Choose an output NPZ path for the stack.")
+        output_path = Path(output_text).expanduser()
+        if output_path.suffix.lower() != ".npz":
+            output_path = output_path.with_suffix(".npz")
+            self.output_path_edit.setText(str(output_path))
 
         return {
             "con_path_list": [str(path) for path in effective_paths],
@@ -1680,12 +2155,13 @@ class StackPrepareDialog(QWidget):
             "modality": self._detected_modality,
             "matrix_key": self._matrix_key,
             "ignore_parc_list": self._parse_ignore_parcels(),
+            "ignore_parcel_labels": self._parse_ignore_parcel_labels(),
             "qmask_path": self.qmask_path_edit.text().strip() or None,
             "mrsi_cov": float(self.mrsi_cov_spin.value()),
             "comp_gradients": bool(self.compute_gradients_check.isChecked()),
-            "include_parcels": bool(self.include_parcels_check.isChecked()),
-            "include_parcels_start": int(self.include_parcels_start_spin.value()),
-            "include_parcels_end": int(self.include_parcels_end_spin.value()),
+            "include_parcels": False,
+            "include_parcels_start": 0,
+            "include_parcels_end": None,
             "matrix_outpath": str(output_path),
             "parcellation_img_path": self.parcellation_path_edit.text().strip() or None,
             "parcel_labels_retain": [],

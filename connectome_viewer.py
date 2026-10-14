@@ -215,6 +215,10 @@ try:
         pairwise_distance_matrix as _combine_pairwise_distance_matrix,
         residualize_matrix as _combine_residualize_matrix,
         spatially_residualize_matrix as _combine_spatially_residualize_matrix,
+        parcel_keep_mask as _combine_parcel_keep_mask,
+        trim_matrix_array_by_parcel_mask as _combine_trim_matrix_array,
+        trim_npz_payload_by_parcel_mask as _combine_trim_npz_payload,
+        trim_vector_by_parcel_mask as _combine_trim_vector,
     )
     from services.data_access import MatrixDataAccess as _MatrixDataAccess
     from services.entry_helpers import (
@@ -242,6 +246,10 @@ except Exception:
         pairwise_distance_matrix as _combine_pairwise_distance_matrix,
         residualize_matrix as _combine_residualize_matrix,
         spatially_residualize_matrix as _combine_spatially_residualize_matrix,
+        parcel_keep_mask as _combine_parcel_keep_mask,
+        trim_matrix_array_by_parcel_mask as _combine_trim_matrix_array,
+        trim_npz_payload_by_parcel_mask as _combine_trim_npz_payload,
+        trim_vector_by_parcel_mask as _combine_trim_vector,
     )
     from mrsi_viewer.services.data_access import MatrixDataAccess as _MatrixDataAccess
     from mrsi_viewer.services.entry_helpers import (
@@ -1581,10 +1589,23 @@ class ConnectomeViewer(QMainWindow):
         self._gradient_parcel_label_key = ""
         self._gradient_parcel_name_key = ""
         self._gradient_hemisphere_mode = "separate"
+        self._gradient_surface_color_scale_auto = True
+        self._gradient_surface_color_scale_min = -0.2
+        self._gradient_surface_color_scale_max = 0.2
         self._gradient_surface_mesh = "fsaverage4"
         self._gradient_surface_style = "smooth"
+        self._gradient_surface_sampling_radius = 6.0
+        self._gradient_surface_contour_count = 9
+        self._gradient_surface_contour_smoothing = 32
+        self._gradient_surface_contour_min_width = 0.2
+        self._gradient_surface_contour_width_by_value = False
+        self._gradient_surface_parcel_outlines_visible = True
+        self._gradient_surface_parcel_outline_smoothing = 2
+        self._gradient_surface_mask_path = ""
         self._gradient_surface_render_count = 1
         self._gradient_surface_procrustes = False
+        self._gradient_surface_procrustes_ref_entry_id = None
+        self._gradient_surface_procrustes_rotation_angle = 0.0
         self._gradient_classification_surface_mesh = self._gradient_surface_mesh
         self._gradient_classification_hemisphere_mode = "separate"
         self._gradient_scatter_rotation = "Default"
@@ -3088,6 +3109,8 @@ class ConnectomeViewer(QMainWindow):
                 theme_name=self._theme_name,
                 process_callback=self._process_combine_operation,
                 confirm_callback=self._confirm_combine_result,
+                save_callback=self._save_combine_result,
+                trim_metadata_callback=self._combine_trim_metadata,
                 parent=self,
             )
 
@@ -3132,6 +3155,37 @@ class ConnectomeViewer(QMainWindow):
             alignment.used_label_intersection,
         )
 
+    def _combine_trim_metadata(self, entry_id):
+        entry = self._entries.get(entry_id)
+        if entry is None:
+            return {"labels": [], "names": [], "message": "Select a valid workspace matrix."}
+        try:
+            selected_key, _payload, selected_matrix = self._combine_source_npz_payload(entry)
+            node_count = self._combine_matrix_node_count(np.asarray(selected_matrix))
+            if node_count is None:
+                matrix, _ = self._matrix_for_entry(entry)
+                matrix = np.asarray(matrix)
+                if matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1]:
+                    node_count = int(matrix.shape[0])
+            if node_count is None:
+                return {
+                    "labels": [],
+                    "names": [],
+                    "message": "Trim requires a square matrix or a subject stack of square matrices.",
+                }
+            labels, names = self._entry_parcel_metadata(entry, expected_len=node_count)
+            message = f"Loaded {node_count} parcels"
+            if selected_key:
+                message += f" from key '{selected_key}'"
+            if labels is None:
+                labels = np.arange(node_count, dtype=int)
+                message += "; no parcel_labels_group found, using row indices."
+            if names is None:
+                names = ["" for _ in range(node_count)]
+            return {"labels": np.asarray(labels).reshape(-1), "names": names, "message": message}
+        except Exception as exc:
+            return {"labels": [], "names": [], "message": f"Could not load parcel metadata: {exc}"}
+
     def _process_combine_operation(self, first_entry_id, second_entry_id, operation) -> None:
         dialog = getattr(self, "_combine_dialog", None)
         self._combine_pending_result = None
@@ -3140,9 +3194,9 @@ class ConnectomeViewer(QMainWindow):
         operation_name = str(operation or "").strip().lower()
         first_entry = self._entries.get(first_entry_id)
         second_entry = self._entries.get(second_entry_id) if second_entry_id is not None else None
-        if first_entry is None or (operation_name != "spatial_correction" and second_entry is None):
+        if first_entry is None or (operation_name not in {"spatial_correction", "trim"} and second_entry is None):
             message = "Select two valid workspace matrices."
-            if operation_name == "spatial_correction":
+            if operation_name in {"spatial_correction", "trim"}:
                 message = "Select a valid workspace matrix."
             if dialog is not None:
                 dialog.set_status(message)
@@ -3150,6 +3204,9 @@ class ConnectomeViewer(QMainWindow):
             return
         if operation_name == "spatial_correction":
             self._process_combine_spatial_correction(first_entry_id)
+            return
+        if operation_name == "trim":
+            self._process_combine_trim(first_entry_id)
             return
 
         first_label = self._gradient_matrix_label_for_entry(first_entry)
@@ -3265,6 +3322,138 @@ class ConnectomeViewer(QMainWindow):
             message = f"{operation_label} failed: {exc}"
             if dialog is not None:
                 dialog.set_status(message)
+            self.statusBar().showMessage(message)
+
+    def _process_combine_trim(self, first_entry_id) -> None:
+        dialog = getattr(self, "_combine_dialog", None)
+        self._combine_pending_result = None
+        if dialog is not None:
+            dialog.set_can_confirm(False)
+        first_entry = self._entries.get(first_entry_id)
+        if first_entry is None:
+            message = "Select a valid workspace matrix."
+            if dialog is not None:
+                dialog.set_status(message)
+            self.statusBar().showMessage(message)
+            return
+
+        operation = "trim"
+        operation_label = self._combine_operation_label(operation)
+        first_label = self._gradient_matrix_label_for_entry(first_entry)
+        try:
+            selected_key, source_payload, selected_matrix = self._combine_source_npz_payload(first_entry)
+            selected_matrix = np.asarray(selected_matrix)
+            node_count = self._combine_matrix_node_count(selected_matrix)
+            display_source_matrix, _ = self._matrix_for_entry(first_entry)
+            display_source_matrix = np.asarray(display_source_matrix)
+            if node_count is None and display_source_matrix.ndim == 2 and display_source_matrix.shape[0] == display_source_matrix.shape[1]:
+                node_count = int(display_source_matrix.shape[0])
+            if node_count is None:
+                raise ValueError("Trim requires a square matrix or a subject stack of square matrices.")
+
+            labels, names = self._entry_parcel_metadata(first_entry, expected_len=node_count)
+            if labels is None:
+                labels = np.arange(node_count, dtype=int)
+            labels = np.asarray(labels).reshape(-1)
+            if names is None:
+                names = ["" for _ in range(node_count)]
+            names = [str(value) for value in np.asarray(names, dtype=object).reshape(-1).tolist()]
+
+            remove_indices = []
+            apply_population = False
+            if dialog is not None and hasattr(dialog, "selected_trim_remove_indices"):
+                remove_indices = dialog.selected_trim_remove_indices()
+            if dialog is not None and hasattr(dialog, "selected_trim_apply_to_population"):
+                apply_population = dialog.selected_trim_apply_to_population()
+            if not remove_indices:
+                raise ValueError("Select at least one parcel to remove in the Trim table.")
+
+            keep_mask = _combine_parcel_keep_mask(node_count, remove_indices)
+            result_labels, _ = _combine_trim_vector(labels, keep_mask)
+            result_names, _ = _combine_trim_vector(np.asarray(names, dtype=object), keep_mask)
+            removed_labels = labels[np.asarray(remove_indices, dtype=int)]
+            removed_names = np.asarray(names, dtype=object)[np.asarray(remove_indices, dtype=int)]
+
+            changed_keys = []
+            trimmed_payload = None
+            selected_key_out = "matrix"
+            if apply_population:
+                compatible_keys = self._combine_spatial_compatible_matrix_keys(source_payload, node_count)
+                if selected_key not in compatible_keys:
+                    compatible_keys.insert(0, selected_key)
+                trimmed_payload, changed_keys = _combine_trim_npz_payload(
+                    source_payload,
+                    keep_mask,
+                    matrix_keys=compatible_keys,
+                    parcel_label_keys=PARCEL_LABEL_KEYS,
+                    parcel_name_keys=PARCEL_NAME_KEYS,
+                )
+                if selected_key not in trimmed_payload:
+                    raise ValueError(f"Selected matrix key '{selected_key}' was not available after trimming.")
+                result_matrix = np.asarray(trimmed_payload[selected_key])
+                selected_key_out = selected_key
+                preview_matrix = _average_to_square(result_matrix) if result_matrix.ndim == 3 else result_matrix
+            else:
+                result_matrix, changed = _combine_trim_matrix_array(display_source_matrix, keep_mask)
+                if not changed:
+                    raise ValueError("Selected matrix could not be trimmed by parcel axes.")
+                preview_matrix = result_matrix
+
+            finite_values = np.asarray(preview_matrix, dtype=float)
+            finite_values = finite_values[np.isfinite(finite_values)]
+            min_text = f"{float(np.min(finite_values)):.4g}" if finite_values.size else "n/a"
+            max_text = f"{float(np.max(finite_values)):.4g}" if finite_values.size else "n/a"
+            result_label = f"trim({first_label})"
+            removed_text = ", ".join(str(label) for label in removed_labels.tolist()[:8])
+            if len(removed_labels) > 8:
+                removed_text += ", ..."
+            result_summary = (
+                f"{operation_label} result | shape={tuple(result_matrix.shape)} | "
+                f"removed {len(remove_indices)} of {node_count} parcels"
+                f" ({removed_text}) | "
+                f"kept {int(np.sum(keep_mask))} parcels | "
+                f"{'trimmed keys: ' + ', '.join(changed_keys) + ' | ' if changed_keys else ''}"
+                f"min={min_text} | max={max_text}"
+            )
+            source_path = first_entry.get("source_path", first_entry.get("path"))
+            stack_axis = _stack_axis(result_matrix.shape) if result_matrix.ndim == 3 else None
+            self._combine_pending_result = {
+                "matrix": np.asarray(result_matrix),
+                "label": result_label,
+                "summary_text": result_summary,
+                "source_path": source_path,
+                "operation": operation,
+                "first_entry_id": first_entry_id,
+                "second_entry_id": None,
+                "selected_key": selected_key_out,
+                "sample_index": first_entry.get("sample_index", -1) if result_matrix.ndim == 3 else None,
+                "stack_axis": stack_axis,
+                "stack_len": result_matrix.shape[stack_axis] if stack_axis is not None else None,
+                "parcel_labels_group": np.asarray(result_labels),
+                "parcel_names_group": np.asarray(result_names, dtype=object),
+                "npz_payload": trimmed_payload,
+                "trim_removed_parcel_indices": np.asarray(remove_indices, dtype=int),
+                "trim_removed_parcel_labels": np.asarray(removed_labels),
+                "trim_removed_parcel_names": np.asarray(removed_names, dtype=object),
+                "trim_apply_population": bool(apply_population),
+                "trimmed_npz_keys": np.asarray(changed_keys, dtype=object),
+            }
+
+            if dialog is not None:
+                dialog.show_matrix_result(
+                    preview_matrix,
+                    title=result_label,
+                    summary_text=result_summary,
+                )
+                dialog.set_status("Processed trim. Click Add to Workspace or Save NPZ.")
+            self.statusBar().showMessage(
+                f"{operation_label} complete. Removed {len(remove_indices)} parcel(s)."
+            )
+        except Exception as exc:
+            message = f"{operation_label} failed: {exc}"
+            if dialog is not None:
+                dialog.set_status(message)
+                dialog.set_can_confirm(False)
             self.statusBar().showMessage(message)
 
     def _process_combine_spatial_correction(self, first_entry_id) -> None:
@@ -3603,6 +3792,11 @@ class ConnectomeViewer(QMainWindow):
                 "npz_payload": payload.get("npz_payload"),
                 "stack_axis": payload.get("stack_axis"),
                 "stack_len": payload.get("stack_len"),
+                "trim_removed_parcel_indices": payload.get("trim_removed_parcel_indices"),
+                "trim_removed_parcel_labels": payload.get("trim_removed_parcel_labels"),
+                "trim_removed_parcel_names": payload.get("trim_removed_parcel_names"),
+                "trim_apply_population": payload.get("trim_apply_population"),
+                "trimmed_npz_keys": payload.get("trimmed_npz_keys"),
                 "parcel_labels_group": (
                     np.asarray(payload["parcel_labels_group"])
                     if payload.get("parcel_labels_group") is not None
@@ -3623,6 +3817,74 @@ class ConnectomeViewer(QMainWindow):
             dialog.set_can_confirm(False)
             dialog.set_status("Added the previewed result to the workspace.")
         self.statusBar().showMessage("Added confirmed combine result to the workspace.")
+
+    def _combine_result_npz_payload(self, payload):
+        save_payload = {}
+        stored_payload = payload.get("npz_payload")
+        if isinstance(stored_payload, dict):
+            for key, value in stored_payload.items():
+                save_payload[str(key)] = np.asarray(value)
+        else:
+            key = str(payload.get("selected_key") or "matrix").strip() or "matrix"
+            save_payload[key] = np.asarray(payload["matrix"])
+
+        if payload.get("parcel_labels_group") is not None:
+            save_payload["parcel_labels_group"] = np.asarray(payload["parcel_labels_group"])
+        if payload.get("parcel_names_group") is not None:
+            save_payload["parcel_names_group"] = np.asarray(payload["parcel_names_group"], dtype=object)
+        for key in (
+            "trim_removed_parcel_indices",
+            "trim_removed_parcel_labels",
+            "trim_removed_parcel_names",
+            "trimmed_npz_keys",
+            "spatial_correction_keys",
+        ):
+            if payload.get(key) is not None:
+                save_payload[key] = np.asarray(payload[key])
+        save_payload["combine_operation"] = np.asarray(str(payload.get("operation") or ""))
+        save_payload["combine_summary"] = np.asarray(str(payload.get("summary_text") or ""))
+        return save_payload
+
+    def _save_combine_result(self) -> None:
+        dialog = getattr(self, "_combine_dialog", None)
+        payload = self._combine_pending_result
+        if not isinstance(payload, dict):
+            message = "No processed combine result is waiting to be saved."
+            if dialog is not None:
+                dialog.set_status(message)
+            self.statusBar().showMessage(message)
+            return
+        label = self._safe_name_fragment(str(payload.get("label") or "combine_result"))
+        default_dir = self._default_results_dir()
+        source_path = payload.get("source_path")
+        if source_path:
+            try:
+                default_dir = Path(source_path).parent
+            except Exception:
+                pass
+        save_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save combine result",
+            str(default_dir / f"{label}.npz"),
+            "NumPy archive (*.npz);;All files (*)",
+        )
+        if not save_path:
+            return
+        output_path = Path(save_path)
+        if output_path.suffix.lower() != ".npz" and "NumPy" in selected_filter:
+            output_path = output_path.with_suffix(".npz")
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(output_path, **self._combine_result_npz_payload(payload))
+        except Exception as exc:
+            message = f"Failed to save combine result: {exc}"
+            if dialog is not None:
+                dialog.set_status(message)
+            self.statusBar().showMessage(message)
+            return
+        if dialog is not None:
+            dialog.set_status(f"Saved combine result to {output_path}.")
+        self.statusBar().showMessage(f"Saved combine result to {output_path.name}.")
 
     def _combine_apply_matrix_operation(self, first_matrix, second_matrix, operation):
         return _combine_apply_op(first_matrix, second_matrix, operation)

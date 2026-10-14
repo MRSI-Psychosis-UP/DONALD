@@ -841,6 +841,48 @@ def _parse_regressor_spec(spec: str) -> tuple[str | None, list[str]]:
     return parts[0], parts[1:]
 
 
+def _categorical_label(value):
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (np.integer, int)):
+        return str(int(value))
+    if isinstance(value, (np.floating, float)):
+        float_value = float(value)
+        if np.isfinite(float_value) and float_value.is_integer():
+            return str(int(float_value))
+        return f"{float_value:g}"
+    text = str(value).strip()
+    numeric_value = pd.to_numeric(text, errors="coerce")
+    if not pd.isna(numeric_value):
+        float_value = float(numeric_value)
+        if np.isfinite(float_value) and float_value.is_integer():
+            return str(int(float_value))
+        return f"{float_value:g}"
+    return text
+
+
+def _profile_feature_names(raw_names, n_features: int) -> list[str]:
+    names = []
+    if raw_names is not None:
+        for value in np.asarray(raw_names, dtype=object).reshape(-1).tolist():
+            if pd.isna(value):
+                continue
+            text = str(value).strip()
+            if text:
+                names.append(text)
+    if len(names) < int(n_features):
+        names.extend(f"feature_{idx + 1:03d}" for idx in range(len(names), int(n_features)))
+    names = names[: int(n_features)]
+
+    seen = {}
+    unique_names = []
+    for name in names:
+        count = seen.get(name, 0)
+        seen[name] = count + 1
+        unique_names.append(name if count == 0 else f"{name}_{count + 1}")
+    return unique_names
+
+
 def _infer_component_side(mask: np.ndarray, t_matrix: np.ndarray) -> str:
     """Infer component sign from mean edge t-value."""
     try:
@@ -921,6 +963,50 @@ def _glassbrain_path_for_circle(circle_path):
     else:
         root = root + "_glassbrain"
     return root + ext
+
+
+def _glassbrain_path_with_suffix(glassbrain_path, suffix):
+    root, ext = os.path.splitext(glassbrain_path)
+    return f"{root}_{suffix}{ext}"
+
+
+def _component_tail_labels(data, comp_masks, fallback_tail):
+    if comp_masks is None:
+        return np.asarray([], dtype=object)
+    masks = np.asarray(comp_masks)
+    n_components = int(masks.shape[0]) if masks.ndim == 3 else 1
+    raw = data.get("comp_tails")
+    if raw is None:
+        labels = [fallback_tail] * n_components
+    else:
+        labels = [str(value).strip().lower() for value in np.asarray(raw, dtype=object).reshape(-1)]
+    if len(labels) != n_components:
+        labels = [fallback_tail] * n_components
+    return np.asarray(labels, dtype=object)
+
+
+def _filter_glassbrain_edges(edge_matrix, parcel_names, coords, substrings):
+    normalized = tuple(
+        token.strip().lower()
+        for value in substrings
+        for token in str(value).split(",")
+        if token.strip()
+    )
+    names = [str(name) for name in parcel_names]
+    matrix = np.asarray(edge_matrix, dtype=float)
+    coordinates = np.asarray(coords, dtype=float)
+    if not normalized:
+        return matrix, names, coordinates, []
+    keep_indices = [
+        idx
+        for idx, name in enumerate(names)
+        if not any(token in name.lower() for token in normalized)
+    ]
+    excluded_names = [name for idx, name in enumerate(names) if idx not in keep_indices]
+    if not keep_indices:
+        raise ValueError("--exclude-parcel-substring removed every parcel from the glassbrain plot.")
+    keep = np.asarray(keep_indices, dtype=int)
+    return matrix[np.ix_(keep, keep)], [names[idx] for idx in keep_indices], coordinates[keep], excluded_names
 
 
 def _crop_light_image(image: np.ndarray, *, padding: int = 10) -> np.ndarray:
@@ -1004,7 +1090,7 @@ def _save_nbs_glassbrain(
             ],
             dtype=float,
         )
-        widths = 1.2 + 2.4 * (np.abs(edge_values) / edge_abs_max)
+        widths = 2.4 + 4.8 * (np.abs(edge_values) / edge_abs_max)
         degree = np.count_nonzero(np.abs(matrix) > 0.0, axis=0)
         node_sizes = 2.0 + 0.22 * np.sqrt(np.maximum(degree, 0))
         node_color = np.asarray(mcolors.to_rgba("#777777", alpha=0.56), dtype=float)
@@ -1015,7 +1101,7 @@ def _save_nbs_glassbrain(
             brain_opacity=0.13,
             background="white",
             window_size=(1120, 880),
-            path_radius_scale=0.072,
+            path_radius_scale=0.144,
             off_screen=True,
         )
         views = ("dorsal", "coronal", "lateral")
@@ -1197,6 +1283,15 @@ parser.add_argument(
     "--intrahemisphere-only",
     action="store_true",
     help="Show only intra-hemisphere edges (LH-LH and RH-RH) in exported NBS plots.",
+)
+parser.add_argument(
+    "--separate-tail-glassbrains",
+    "--split-tail-glassbrains",
+    action="store_true",
+    help=(
+        "For two-tailed NBS results, also save separate positive/right-tail and "
+        "negative/left-tail glassbrain figures."
+    ),
 )
 parser.add_argument(
     "--exclude-parcel-substring",
@@ -1424,6 +1519,7 @@ if t_mat is not None:
 test_type_label = str(data.get("test_type", "n/a")).lower() or "n/a"
 test_tail_label = str(data.get("test_tail", "n/a")).lower() or "n/a"
 comp_pvals = np.asarray(data.get("comp_pvals", []), dtype=float)
+comp_tail_labels = _component_tail_labels(data, comp_masks, test_tail_label)
 sig_indices = np.asarray(data.get("sig_indices", []), dtype=int)
 overall_pvalue = np.nan
 if comp_pvals.size > 0:
@@ -1514,7 +1610,7 @@ if args.regressor_type == "continuous":
     regressor_values = pd.to_numeric(regressor_values_raw, errors="coerce").astype(float)
 else:
     regressor_values = np.array(
-        [str(v) if not pd.isna(v) else np.nan for v in regressor_values_raw], dtype=object
+        [_categorical_label(v) for v in regressor_values_raw], dtype=object
     )
 if stored_subjects.size == 0 or stored_sessions.size == 0:
     raise ValueError("NPZ missing subject/session identifiers for the analyzed subset.")
@@ -1578,10 +1674,12 @@ if override_regressor:
                 "treating values as labels."
             )
         regressor_values = np.array(
-            [str(v) if not pd.isna(v) else np.nan for v in reg_vals], dtype=object
+            [_categorical_label(v) for v in reg_vals], dtype=object
         )
         if override_values:
-            regressor_filter_values = np.array([str(v) for v in override_values], dtype=object)
+            regressor_filter_values = np.array(
+                [_categorical_label(v) for v in override_values], dtype=object
+            )
     regressor_name = reg_col
     debug.info(f"Using regressor '{regressor_name}' from covariates.")
 
@@ -1713,8 +1811,9 @@ analysis_mask = np.ones(selected_indices.shape[0], dtype=bool)
 mesim_subset = MeSiM_all[selected_indices]
 metab_subset = metab_profiles_all[selected_indices]
 metab_value_scale = None
-if metab_subset.size > 0:
-    metab_max_abs = np.nanmax(np.abs(metab_subset), axis=(0, 1, 3))
+if metab_subset.size > 0 and metab_subset.ndim >= 2:
+    metabolite_axes = tuple(range(metab_subset.ndim - 1))
+    metab_max_abs = np.nanmax(np.abs(metab_subset), axis=metabolite_axes)
     metab_value_scale = np.where(metab_max_abs == 0, np.nan, metab_max_abs)
 debug.info(
     f"Subset MeSiM shape {mesim_subset.shape}; metab profiles shape {metab_subset.shape}"
@@ -1918,7 +2017,12 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
         delta_metab = None
         cluster_ids = None
     if delta_metab is not None and cluster_ids is not None:
-        metabolite_names = [str(m) for m in metabolites[: delta_metab.shape[1]]]
+        metabolite_names = _profile_feature_names(metabolites, delta_metab.shape[1])
+        if np.asarray(metabolites).size < delta_metab.shape[1]:
+            debug.warning(
+                "Metabolite names are missing or shorter than the profile feature axis; "
+                f"using fallback names for {delta_metab.shape[1]} feature columns."
+            )
         delta_display = delta_metab.copy()
         column_prefix = "delta_"
         value_suffix = ""
@@ -1958,7 +2062,14 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
         table_clusters.add_column("Δ Gradient", justify="right")
         table_clusters.add_column("Gradient (ref)", justify="right")
         table_clusters.add_column("Gradient (cmp)", justify="right")
-        for m in metabolite_names:
+        max_table_features = 12
+        table_metabolite_names = metabolite_names[:max_table_features]
+        if len(metabolite_names) > max_table_features:
+            debug.warning(
+                f"Showing first {max_table_features}/{len(metabolite_names)} feature-delta "
+                "columns in the terminal table; the TSV contains all columns."
+            )
+        for m in table_metabolite_names:
             table_clusters.add_column(f"Δ {m}{value_suffix}", justify="right")
 
         is_percent_mode = args.metabolite_delta_mode == "percent" and bool(value_suffix)
@@ -1983,7 +2094,7 @@ if ref_values_raw.size > 0 and cmp_values_raw.size > 0:
                 _format_delta(
                     row[f"{column_prefix}{m}"], as_percent=is_percent_mode
                 )
-                for m in metabolite_names
+                for m in table_metabolite_names
             ]
             table_clusters.add_row(*row_values)
         console.print(table_clusters)
@@ -2307,14 +2418,50 @@ if t_mat is not None and comp_mask is not None:
         fig_circle.savefig(plot_path_circle, bbox_inches="tight", dpi=300)
         debug.success("Saved circular plot to", plot_path_circle)
         glassbrain_path = _glassbrain_path_for_circle(plot_path_circle)
-        glassbrain_coords = _plot_name_coords(collapsed_names, parcel_names, centroids_world)
         glassbrain_title = (
             "Selected path GM-adjacency edges"
             if path_edge_mode
             else f"NBS component {component_idx} edges"
         )
+        if path_edge_mode:
+            glassbrain_matrix = mat
+            glassbrain_names = collapsed_names
+            glassbrain_coords = _plot_name_coords(collapsed_names, parcel_names, centroids_world)
+        else:
+            glassbrain_matrix = np.array(tmasked, dtype=float, copy=True)
+            glassbrain_names = [str(name) for name in parcel_names]
+            glassbrain_coords = np.asarray(centroids_world, dtype=float)
+            if args.intra_hemisphere_only:
+                (
+                    glassbrain_matrix,
+                    gb_removed_inter_edges,
+                    gb_kept_intra_edges,
+                    gb_unknown_hemi_nodes,
+                ) = _filter_intrahemispheric_edges(glassbrain_matrix, glassbrain_names)
+                debug.info(
+                    "Applied intra-hemisphere edge filter to glassbrain: "
+                    f"kept {gb_kept_intra_edges} LH-LH/RH-RH edges, "
+                    f"removed {gb_removed_inter_edges} inter/unknown-hemisphere edges."
+                )
+                if gb_unknown_hemi_nodes:
+                    debug.warning(
+                        f"{gb_unknown_hemi_nodes} glassbrain nodes had unknown hemisphere labels; their edges were hidden."
+                    )
+            glassbrain_matrix, glassbrain_names, glassbrain_coords, gb_excluded_names = (
+                _filter_glassbrain_edges(
+                    glassbrain_matrix,
+                    glassbrain_names,
+                    glassbrain_coords,
+                    args.exclude_parcel_substring,
+                )
+            )
+            if gb_excluded_names:
+                debug.info(
+                    f"Excluded {len(gb_excluded_names)} glassbrain parcels by substring: "
+                    + ", ".join(gb_excluded_names)
+                )
         _save_nbs_glassbrain(
-            mat,
+            glassbrain_matrix,
             glassbrain_coords,
             glassbrain_path,
             theme=args.theme,
@@ -2322,6 +2469,51 @@ if t_mat is not None and comp_mask is not None:
             keep_open=not args.no_show,
             edge_cmap=edge_effect_cmap,
         )
+        if args.separate_tail_glassbrains and not path_edge_mode:
+            if test_tail_label != "both":
+                debug.warning(
+                    "--separate-tail-glassbrains requested, but the result is not marked as two-tailed."
+                )
+            elif comp_masks is None or np.asarray(comp_masks).ndim != 3:
+                debug.warning(
+                    "--separate-tail-glassbrains requested, but component masks are unavailable."
+                )
+            else:
+                masks = np.asarray(comp_masks, dtype=bool)
+                tail_labels = np.asarray(comp_tail_labels, dtype=object)
+                tail_specs = (
+                    ("right", "positive_tail", "Positive/right-tail NBS edges"),
+                    ("left", "negative_tail", "Negative/left-tail NBS edges"),
+                )
+                for tail_value, suffix, tail_title in tail_specs:
+                    selector = tail_labels == tail_value
+                    if not np.any(selector):
+                        debug.warning(f"No {tail_value}-tail NBS components available for separate glassbrain.")
+                        continue
+                    tail_mask = np.any(masks[selector], axis=0)
+                    tail_matrix = np.where(tail_mask, t_matrix, 0.0)
+                    if args.intra_hemisphere_only:
+                        tail_matrix, _, _, _ = _filter_intrahemispheric_edges(
+                            tail_matrix,
+                            parcel_names,
+                        )
+                    tail_coords = np.asarray(centroids_world, dtype=float)
+                    tail_names = [str(name) for name in parcel_names]
+                    tail_matrix, tail_names, tail_coords, _ = _filter_glassbrain_edges(
+                        tail_matrix,
+                        tail_names,
+                        tail_coords,
+                        args.exclude_parcel_substring,
+                    )
+                    _save_nbs_glassbrain(
+                        tail_matrix,
+                        tail_coords,
+                        _glassbrain_path_with_suffix(glassbrain_path, suffix),
+                        theme=args.theme,
+                        title=tail_title,
+                        keep_open=not args.no_show,
+                        edge_cmap=edge_effect_cmap,
+                    )
     show_figures = True
 else:
     debug.warning("Missing t-matrix or component mask; skipping connectivity circle plot.")

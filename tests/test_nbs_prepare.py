@@ -4,6 +4,7 @@ import unittest
 
 import numpy as np
 
+import window.nbs_prepare as nbs_prepare
 from window.nbs_prepare import (
     NBSPrepareDialog,
     _compact_inline_text,
@@ -65,6 +66,28 @@ class _Button:
 
     def setToolTip(self, text):
         self.tooltip = str(text)
+
+
+class _FakeMessageBox:
+    class StandardButton:
+        Close = 1
+        Cancel = 2
+
+    response = StandardButton.Close
+    calls = []
+
+    @classmethod
+    def question(cls, parent, title, message, buttons, default_button):
+        cls.calls.append(
+            {
+                "parent": parent,
+                "title": title,
+                "message": message,
+                "buttons": buttons,
+                "default_button": default_button,
+            }
+        )
+        return cls.response
 
 
 class NBSPrepareDialogTests(unittest.TestCase):
@@ -230,6 +253,45 @@ class NBSPrepareDialogTests(unittest.TestCase):
         self.assertTrue(dialog.covariate_balance_button.enabled)
         self.assertIn("Select at least two highlighted Data table rows", dialog.covariate_balance_button.tooltip)
 
+    def test_confirm_close_uses_cancel_default_and_accepts_close(self):
+        dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
+        dialog._process_is_running = lambda: False
+        dialog._export_is_running = lambda: False
+        dialog._covariate_balance_is_running = lambda: False
+        dialog._results_is_running = lambda: False
+
+        original_message_box = nbs_prepare.QMessageBox
+        try:
+            _FakeMessageBox.calls = []
+            _FakeMessageBox.response = _FakeMessageBox.StandardButton.Close
+            nbs_prepare.QMessageBox = _FakeMessageBox
+
+            self.assertTrue(dialog._confirm_close_requested())
+
+            self.assertEqual(_FakeMessageBox.calls[0]["default_button"], _FakeMessageBox.StandardButton.Cancel)
+            self.assertIn("Close the NBS window?", _FakeMessageBox.calls[0]["message"])
+        finally:
+            nbs_prepare.QMessageBox = original_message_box
+
+    def test_confirm_close_cancel_blocks_running_task_close(self):
+        dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
+        dialog._process_is_running = lambda: True
+        dialog._export_is_running = lambda: False
+        dialog._covariate_balance_is_running = lambda: False
+        dialog._results_is_running = lambda: False
+
+        original_message_box = nbs_prepare.QMessageBox
+        try:
+            _FakeMessageBox.calls = []
+            _FakeMessageBox.response = _FakeMessageBox.StandardButton.Cancel
+            nbs_prepare.QMessageBox = _FakeMessageBox
+
+            self.assertFalse(dialog._confirm_close_requested())
+
+            self.assertIn("NBS run is still running", _FakeMessageBox.calls[0]["message"])
+        finally:
+            nbs_prepare.QMessageBox = original_message_box
+
     def test_component_pvalue_rows_preserve_two_tail_summary_components(self):
         rows = NBSPrepareDialog._component_pvalue_rows(
             summary={
@@ -341,6 +403,9 @@ class NBSPrepareDialogTests(unittest.TestCase):
 
             subset_path = dialog._build_filtered_conn_subset()
 
+            self.assertEqual(subset_path.parent, tmp_root / "derivatives" / "nbs_work" / "mrsi")
+            self.assertTrue(subset_path.name.endswith("_key-matrix_subj_list_reg-Diag_n-2_p-2_nbs_input.npz"))
+
             with np.load(subset_path, allow_pickle=True) as out:
                 expected_matrix = matrix[[0, 2]][:, [0, 2]][:, :, [0, 2]]
                 np.testing.assert_array_equal(out["matrix_subj_list"], expected_matrix)
@@ -355,6 +420,17 @@ class NBSPrepareDialogTests(unittest.TestCase):
                     out["parcel_excluded_names"],
                     np.asarray(["ctx-b", "ctx-d"], dtype=object),
                 )
+
+    def test_nbs_work_dir_uses_existing_derivatives_root(self):
+        dialog = NBSPrepareDialog.__new__(NBSPrepareDialog)
+        dialog._source_path = Path(
+            "/tmp/project/derivatives/group/connectivity/mrsi/source_stack.npz"
+        )
+
+        self.assertEqual(
+            dialog._nbs_work_dir("MRSI"),
+            Path("/tmp/project/derivatives/nbs_work/mrsi"),
+        )
 
 
 if __name__ == "__main__":

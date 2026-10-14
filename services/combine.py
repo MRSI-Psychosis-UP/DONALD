@@ -56,6 +56,7 @@ def combine_operation_label(operation: str) -> str:
     mapping = {
         "add": "Addition",
         "subtract": "Subtraction",
+        "trim": "Trim",
         "intersect": "Intersect",
         "correct": "Correction",
         "spatial_correction": "Spatial Correction",
@@ -70,6 +71,7 @@ def combine_operation_symbol(operation: str) -> str:
     mapping = {
         "add": "+",
         "subtract": "-",
+        "trim": "trim",
         "intersect": "intersect",
         "correct": "corrected_by",
         "spatial_correction": "spatial_corrected",
@@ -213,6 +215,8 @@ def apply_matrix_operation(first_matrix, second_matrix, operation):
         return first_matrix + second_matrix
     if operation_name == "subtract":
         return first_matrix - second_matrix
+    if operation_name == "trim":
+        return np.array(first_matrix, copy=True)
     if operation_name == "intersect":
         return np.array(first_matrix, copy=True)
     if operation_name == "correct":
@@ -230,6 +234,84 @@ def apply_matrix_operation(first_matrix, second_matrix, operation):
                 f"{first_matrix.shape} and {second_matrix.shape}."
             ) from exc
     raise ValueError(f"Unsupported operation: {operation}")
+
+
+def parcel_keep_mask(node_count, remove_indices):
+    """Return a boolean parcel-node mask after excluding requested indices."""
+    try:
+        node_count = int(node_count)
+    except Exception as exc:
+        raise ValueError("Invalid parcel count.") from exc
+    if node_count <= 0:
+        raise ValueError("Parcel count must be positive.")
+    keep_mask = np.ones(node_count, dtype=bool)
+    for index in np.asarray(remove_indices, dtype=int).reshape(-1).tolist():
+        if index < 0 or index >= node_count:
+            raise ValueError(f"Parcel index {index} is out of range for {node_count} parcels.")
+        keep_mask[int(index)] = False
+    if not np.any(keep_mask):
+        raise ValueError("Trim would remove every parcel.")
+    return keep_mask
+
+
+def trim_matrix_array_by_parcel_mask(array, keep_mask):
+    """Trim a square matrix or a stack with exactly two parcel axes."""
+    arr = np.asarray(array)
+    keep = np.asarray(keep_mask, dtype=bool).reshape(-1)
+    if keep.size == 0 or keep.all():
+        return np.array(arr, copy=True), False
+    indices = np.flatnonzero(keep)
+    node_count = int(keep.size)
+
+    if arr.ndim == 2 and arr.shape[0] == node_count and arr.shape[1] == node_count:
+        return np.asarray(arr[np.ix_(indices, indices)]), True
+
+    if arr.ndim == 3:
+        parcel_axes = [axis for axis, size in enumerate(arr.shape) if int(size) == node_count]
+        if len(parcel_axes) == 2:
+            trimmed = np.take(arr, indices, axis=parcel_axes[0])
+            trimmed = np.take(trimmed, indices, axis=parcel_axes[1])
+            return np.asarray(trimmed), True
+
+    return np.array(arr, copy=True), False
+
+
+def trim_vector_by_parcel_mask(values, keep_mask):
+    """Trim a 1D vector only when it matches the parcel count."""
+    arr = np.asarray(values)
+    keep = np.asarray(keep_mask, dtype=bool).reshape(-1)
+    if arr.ndim == 1 and arr.shape[0] == keep.size:
+        return np.asarray(arr[keep]), True
+    return np.array(arr, copy=True), False
+
+
+def trim_npz_payload_by_parcel_mask(
+    payload,
+    keep_mask,
+    *,
+    matrix_keys=None,
+    parcel_label_keys=(),
+    parcel_name_keys=(),
+):
+    """Trim selected matrix keys and parcel metadata vectors in an NPZ-style payload."""
+    matrix_key_set = {str(key) for key in (matrix_keys or []) if str(key or "").strip()}
+    label_key_set = {str(key) for key in (parcel_label_keys or []) if str(key or "").strip()}
+    name_key_set = {str(key) for key in (parcel_name_keys or []) if str(key or "").strip()}
+    trimmed_payload = {}
+    changed_keys = []
+    for key, value in dict(payload or {}).items():
+        key_text = str(key)
+        changed = False
+        if key_text in label_key_set or key_text in name_key_set:
+            trimmed, changed = trim_vector_by_parcel_mask(value, keep_mask)
+        elif key_text in matrix_key_set:
+            trimmed, changed = trim_matrix_array_by_parcel_mask(value, keep_mask)
+        else:
+            trimmed = np.array(value, copy=True)
+        trimmed_payload[key_text] = trimmed
+        if changed:
+            changed_keys.append(key_text)
+    return trimmed_payload, changed_keys
 
 
 def correlation_vectors(first_matrix, second_matrix):

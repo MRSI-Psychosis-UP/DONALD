@@ -29,6 +29,7 @@ GLASSBRAIN_EDGE_MIN_WIDTH = 5.0
 GLASSBRAIN_EDGE_RADIUS_SCALE = 0.12
 GLASSBRAIN_SUBC_DASH_LENGTH = 7.0
 GLASSBRAIN_SUBC_DASH_GAP = 4.0
+SURFACE_PROCRUSTES_GRADIENTS_AVG_ID = "__surface_gradients_avg__"
 
 PARCEL_LABEL_KEYS = ()
 PARCEL_NAME_KEYS = ()
@@ -50,10 +51,19 @@ class GradientDialogController:
         '_set_gradients_progress',
         '_current_gradient_component_count',
         '_normalize_gradient_hemisphere_mode',
+        '_normalize_gradient_surface_color_scale_limit',
         '_normalize_gradient_surface_mesh',
         '_normalize_gradient_surface_style',
+        '_normalize_gradient_surface_sampling_radius',
+        '_normalize_gradient_surface_contour_count',
+        '_normalize_gradient_surface_contour_smoothing',
+        '_normalize_gradient_surface_contour_min_width',
+        '_normalize_gradient_surface_contour_width_by_value',
+        '_normalize_gradient_surface_parcel_outlines_visible',
+        '_normalize_gradient_surface_parcel_outline_smoothing',
         '_normalize_gradient_surface_render_count',
         '_normalize_gradient_surface_procrustes',
+        '_normalize_gradient_surface_procrustes_rotation_angle',
         '_normalize_gradient_classification_component',
         '_normalize_gradient_classification_axis',
         '_normalize_gradient_scatter_rotation',
@@ -66,10 +76,26 @@ class GradientDialogController:
         '_ensure_gradient_rotation_count',
         '_available_gradient_network_component_count',
         '_gradient_surface_procrustes_available',
+        '_available_gradient_surface_procrustes_reference_entries',
+        '_gradient_surface_mask_img',
         '_selected_gradient_hemisphere_mode',
+        '_selected_gradient_surface_color_scale_auto',
+        '_selected_gradient_surface_color_scale_min',
+        '_selected_gradient_surface_color_scale_max',
         '_selected_gradient_surface_mesh',
         '_selected_gradient_surface_style',
+        '_selected_gradient_surface_sampling_radius',
+        '_selected_gradient_surface_contour_count',
+        '_selected_gradient_surface_contour_smoothing',
+        '_selected_gradient_surface_contour_min_width',
+        '_selected_gradient_surface_contour_width_by_value',
+        '_selected_gradient_surface_parcel_outlines_visible',
+        '_selected_gradient_surface_parcel_outline_smoothing',
+        '_selected_gradient_surface_mask_path',
         '_selected_gradient_surface_render_count',
+        '_selected_gradient_surface_procrustes_ref_entry_id',
+        '_selected_gradient_surface_procrustes_ref_label',
+        '_selected_gradient_surface_procrustes_rotation_angle',
         '_selected_gradient_surface_procrustes',
         '_selected_gradient_classification_surface_mesh',
         '_selected_gradient_classification_hemisphere_mode',
@@ -106,10 +132,23 @@ class GradientDialogController:
         '_on_gradient_component_changed',
         '_on_gradient_colormap_changed',
         '_on_gradient_hemisphere_changed',
+        '_on_gradient_surface_color_scale_auto_changed',
+        '_on_gradient_surface_color_scale_min_changed',
+        '_on_gradient_surface_color_scale_max_changed',
         '_on_gradient_surface_mesh_changed',
         '_on_gradient_surface_style_changed',
+        '_on_gradient_surface_sampling_radius_changed',
+        '_on_gradient_surface_contour_count_changed',
+        '_on_gradient_surface_contour_smoothing_changed',
+        '_on_gradient_surface_contour_min_width_changed',
+        '_on_gradient_surface_contour_width_by_value_changed',
+        '_on_gradient_surface_parcel_outlines_visible_changed',
+        '_on_gradient_surface_parcel_outline_smoothing_changed',
+        '_on_gradient_surface_mask_path_changed',
         '_on_gradient_surface_render_count_changed',
         '_on_gradient_surface_procrustes_changed',
+        '_on_gradient_surface_procrustes_ref_entry_changed',
+        '_on_gradient_surface_procrustes_rotation_changed',
         '_on_gradient_classification_surface_mesh_changed',
         '_on_gradient_classification_hemisphere_changed',
         '_on_gradient_scatter_rotation_changed',
@@ -187,16 +226,23 @@ class GradientDialogController:
         '_compute_spectral_coords_and_order',
         '_gradient_template_img_and_data',
         '_projected_gradient_component_count',
+        '_prepare_gradient_surface_render',
         '_ensure_projected_gradient_data',
         '_surface_render_gradient_matrix',
+        '_surface_procrustes_reference_gradient_matrix',
+        '_reference_gradient_matrix_from_entry',
+        '_align_gradient_matrix_to_reference',
+        '_rotate_gradient_components',
         '_project_gradient_matrix_to_volume',
         '_gradient_spatial_embedding',
         '_classification_spatial_embedding',
+        '_gradient_matrix_node_support',
         '_classification_spatial_indices',
         '_classification_reference_gradient_payload',
         '_classification_axis_payload',
         '_rescale_classification_axis_to_range',
         '_render_gradients_3d',
+        '_render_gradients_static',
         '_classify_gradients_fsaverage',
         '_project_classification_paths_to_fibrenet',
         '_project_classification_paths_to_brain',
@@ -299,6 +345,16 @@ class GradientDialogController:
         return text
 
     @staticmethod
+    def _normalize_gradient_surface_color_scale_limit(value, default=0.0) -> float:
+        try:
+            limit = float(value)
+        except Exception:
+            limit = float(default)
+        if not math.isfinite(limit):
+            limit = float(default)
+        return float(min(max(limit, -1000000.0), 1000000.0))
+
+    @staticmethod
     def _normalize_gradient_surface_mesh(value: str) -> str:
         text = str(value or "fsaverage4").strip().lower()
         valid = {"fsaverage3", "fsaverage4", "fsaverage5", "fsaverage6", "fsaverage7"}
@@ -311,7 +367,61 @@ class GradientDialogController:
         text = str(value or "smooth").strip().lower().replace("-", "_").replace(" ", "_")
         if text in {"parcel", "parcels", "parcel_boundaries", "parcel_boundary", "parcel_outline", "parcel_outlines"}:
             return "parcel_outlines"
+        if text in {"contour", "contours", "contour_lines", "isoline", "isolines", "iso_contour", "iso_contours", "isocontour", "isocontours"}:
+            return "contours"
         return "smooth"
+
+    @staticmethod
+    def _normalize_gradient_surface_sampling_radius(value) -> float:
+        try:
+            radius = float(value)
+        except Exception:
+            radius = 6.0
+        if not math.isfinite(radius):
+            radius = 6.0
+        return float(min(max(radius, 0.5), 12.0))
+
+    @staticmethod
+    def _normalize_gradient_surface_contour_count(value) -> int:
+        try:
+            count = int(value)
+        except Exception:
+            count = 9
+        return int(min(max(count, 1), 31))
+
+    @staticmethod
+    def _normalize_gradient_surface_contour_smoothing(value) -> int:
+        try:
+            count = int(value)
+        except Exception:
+            count = 32
+        return int(min(max(count, 0), 128))
+
+    @staticmethod
+    def _normalize_gradient_surface_contour_min_width(value) -> float:
+        try:
+            linewidth = float(value)
+        except Exception:
+            linewidth = 0.2
+        if not math.isfinite(linewidth):
+            linewidth = 0.2
+        return float(min(max(linewidth, 0.05), 3.0))
+
+    @staticmethod
+    def _normalize_gradient_surface_contour_width_by_value(enabled) -> bool:
+        return bool(enabled)
+
+    @staticmethod
+    def _normalize_gradient_surface_parcel_outlines_visible(enabled) -> bool:
+        return bool(enabled)
+
+    @staticmethod
+    def _normalize_gradient_surface_parcel_outline_smoothing(value) -> int:
+        try:
+            count = int(value)
+        except Exception:
+            count = 2
+        return int(min(max(count, 0), 32))
 
     @staticmethod
     def _normalize_gradient_surface_render_count(value, max_components=None) -> int:
@@ -328,6 +438,16 @@ class GradientDialogController:
     @staticmethod
     def _normalize_gradient_surface_procrustes(enabled) -> bool:
         return bool(enabled)
+
+    @staticmethod
+    def _normalize_gradient_surface_procrustes_rotation_angle(value) -> float:
+        try:
+            angle = float(value)
+        except Exception:
+            angle = 0.0
+        if not math.isfinite(angle):
+            angle = 0.0
+        return float(min(max(angle, -180.0), 180.0))
 
     @staticmethod
     def _normalize_gradient_classification_component(value, max_components=None) -> str:
@@ -523,17 +643,50 @@ class GradientDialogController:
         return self._current_gradient_component_count()
 
     def _gradient_surface_procrustes_available(self) -> bool:
+        return bool(self._available_gradient_surface_procrustes_reference_entries())
+
+    def _available_gradient_surface_procrustes_reference_entries(self):
+        options = []
         bundle = self._gradient_precomputed_bundle
-        if not isinstance(bundle, dict):
-            return False
-        avg = bundle.get("gradients_avg")
-        if avg is None:
-            return False
+        if isinstance(bundle, dict):
+            avg = bundle.get("gradients_avg")
+            if avg is not None:
+                try:
+                    avg_array = np.asarray(avg, dtype=float)
+                except Exception:
+                    avg_array = None
+                if (
+                    avg_array is not None
+                    and avg_array.ndim == 2
+                    and avg_array.shape[0] > 0
+                    and avg_array.shape[1] > 0
+                ):
+                    options.append(
+                        {
+                            "id": SURFACE_PROCRUSTES_GRADIENTS_AVG_ID,
+                            "label": "gradients_avg (precomputed bundle)",
+                        }
+                    )
+
+        for option in self._available_gradient_reference_matrix_entries():
+            entry_id = option.get("id")
+            label = str(option.get("label") or "matrix").strip() or "matrix"
+            options.append({"id": entry_id, "label": f"Workspace: {label}"})
+        return options
+
+    def _gradient_surface_mask_img(self):
+        mask_path = self._selected_gradient_surface_mask_path()
+        if not mask_path:
+            return None
+        path = Path(mask_path).expanduser()
+        if not path.exists():
+            raise RuntimeError(f"Gradient surface mask image does not exist: {path}")
         try:
-            avg_array = np.asarray(avg, dtype=float)
-        except Exception:
-            return False
-        return avg_array.ndim == 2 and avg_array.shape[0] > 0 and avg_array.shape[1] > 0
+            import nibabel as nib
+
+            return nib.load(str(path))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load gradient surface mask image: {exc}") from exc
 
     def _selected_gradient_hemisphere_mode(self) -> str:
         dialog = getattr(self, "_gradients_dialog", None)
@@ -545,6 +698,53 @@ class GradientDialogController:
             except Exception:
                 pass
         return self._normalize_gradient_hemisphere_mode(self._gradient_hemisphere_mode)
+
+    def _selected_gradient_surface_color_scale_auto(self) -> bool:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "use_surface_auto_color_scale"):
+            try:
+                self._gradient_surface_color_scale_auto = bool(
+                    dialog.use_surface_auto_color_scale()
+                )
+            except Exception:
+                pass
+        return bool(getattr(self, "_gradient_surface_color_scale_auto", True))
+
+    def _selected_gradient_surface_color_scale_min(self) -> float:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_color_scale_min"):
+            try:
+                self._gradient_surface_color_scale_min = (
+                    self._normalize_gradient_surface_color_scale_limit(
+                        dialog.selected_surface_color_scale_min(),
+                        default=-0.2,
+                    )
+                )
+            except Exception:
+                pass
+        self._gradient_surface_color_scale_min = self._normalize_gradient_surface_color_scale_limit(
+            getattr(self, "_gradient_surface_color_scale_min", -0.2),
+            default=-0.2,
+        )
+        return self._gradient_surface_color_scale_min
+
+    def _selected_gradient_surface_color_scale_max(self) -> float:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_color_scale_max"):
+            try:
+                self._gradient_surface_color_scale_max = (
+                    self._normalize_gradient_surface_color_scale_limit(
+                        dialog.selected_surface_color_scale_max(),
+                        default=0.2,
+                    )
+                )
+            except Exception:
+                pass
+        self._gradient_surface_color_scale_max = self._normalize_gradient_surface_color_scale_limit(
+            getattr(self, "_gradient_surface_color_scale_max", 0.2),
+            default=0.2,
+        )
+        return self._gradient_surface_color_scale_max
 
     def _selected_gradient_surface_mesh(self) -> str:
         dialog = getattr(self, "_gradients_dialog", None)
@@ -572,6 +772,124 @@ class GradientDialogController:
         )
         return self._gradient_surface_style
 
+    def _selected_gradient_surface_sampling_radius(self) -> float:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_sampling_radius"):
+            try:
+                self._gradient_surface_sampling_radius = self._normalize_gradient_surface_sampling_radius(
+                    dialog.selected_surface_sampling_radius()
+                )
+            except Exception:
+                pass
+        self._gradient_surface_sampling_radius = self._normalize_gradient_surface_sampling_radius(
+            getattr(self, "_gradient_surface_sampling_radius", 6.0)
+        )
+        return self._gradient_surface_sampling_radius
+
+    def _selected_gradient_surface_contour_count(self) -> int:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_contour_count"):
+            try:
+                self._gradient_surface_contour_count = self._normalize_gradient_surface_contour_count(
+                    dialog.selected_surface_contour_count()
+                )
+            except Exception:
+                pass
+        self._gradient_surface_contour_count = self._normalize_gradient_surface_contour_count(
+            getattr(self, "_gradient_surface_contour_count", 9)
+        )
+        return self._gradient_surface_contour_count
+
+    def _selected_gradient_surface_contour_smoothing(self) -> int:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_contour_smoothing"):
+            try:
+                self._gradient_surface_contour_smoothing = self._normalize_gradient_surface_contour_smoothing(
+                    dialog.selected_surface_contour_smoothing()
+                )
+            except Exception:
+                pass
+        self._gradient_surface_contour_smoothing = self._normalize_gradient_surface_contour_smoothing(
+            getattr(self, "_gradient_surface_contour_smoothing", 32)
+        )
+        return self._gradient_surface_contour_smoothing
+
+    def _selected_gradient_surface_contour_min_width(self) -> float:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_contour_min_width"):
+            try:
+                self._gradient_surface_contour_min_width = self._normalize_gradient_surface_contour_min_width(
+                    dialog.selected_surface_contour_min_width()
+                )
+            except Exception:
+                pass
+        self._gradient_surface_contour_min_width = self._normalize_gradient_surface_contour_min_width(
+            getattr(self, "_gradient_surface_contour_min_width", 0.2)
+        )
+        return self._gradient_surface_contour_min_width
+
+    def _selected_gradient_surface_contour_width_by_value(self) -> bool:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "use_surface_contour_width_by_value"):
+            try:
+                self._gradient_surface_contour_width_by_value = self._normalize_gradient_surface_contour_width_by_value(
+                    dialog.use_surface_contour_width_by_value()
+                )
+            except Exception:
+                pass
+        self._gradient_surface_contour_width_by_value = self._normalize_gradient_surface_contour_width_by_value(
+            getattr(self, "_gradient_surface_contour_width_by_value", False)
+        )
+        return bool(self._gradient_surface_contour_width_by_value)
+
+    def _selected_gradient_surface_parcel_outlines_visible(self) -> bool:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "show_surface_parcel_outlines"):
+            try:
+                self._gradient_surface_parcel_outlines_visible = (
+                    self._normalize_gradient_surface_parcel_outlines_visible(
+                        dialog.show_surface_parcel_outlines()
+                    )
+                )
+            except Exception:
+                pass
+        self._gradient_surface_parcel_outlines_visible = (
+            self._normalize_gradient_surface_parcel_outlines_visible(
+                getattr(self, "_gradient_surface_parcel_outlines_visible", True)
+            )
+        )
+        return bool(self._gradient_surface_parcel_outlines_visible)
+
+    def _selected_gradient_surface_parcel_outline_smoothing(self) -> int:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_parcel_outline_smoothing"):
+            try:
+                self._gradient_surface_parcel_outline_smoothing = (
+                    self._normalize_gradient_surface_parcel_outline_smoothing(
+                        dialog.selected_surface_parcel_outline_smoothing()
+                    )
+                )
+            except Exception:
+                pass
+        self._gradient_surface_parcel_outline_smoothing = (
+            self._normalize_gradient_surface_parcel_outline_smoothing(
+                getattr(self, "_gradient_surface_parcel_outline_smoothing", 2)
+            )
+        )
+        return self._gradient_surface_parcel_outline_smoothing
+
+    def _selected_gradient_surface_mask_path(self) -> str:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_mask_path"):
+            try:
+                self._gradient_surface_mask_path = str(dialog.selected_surface_mask_path() or "").strip()
+            except Exception:
+                pass
+        self._gradient_surface_mask_path = str(
+            getattr(self, "_gradient_surface_mask_path", "") or ""
+        ).strip()
+        return self._gradient_surface_mask_path
+
     def _selected_gradient_surface_render_count(self) -> int:
         dialog = getattr(self, "_gradients_dialog", None)
         available = self._available_gradient_network_component_count()
@@ -588,6 +906,52 @@ class GradientDialogController:
             max_components=available,
         )
         return self._gradient_surface_render_count
+
+    def _selected_gradient_surface_procrustes_ref_entry_id(self):
+        available_options = self._available_gradient_surface_procrustes_reference_entries()
+        available_ids = [option.get("id") for option in available_options]
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_procrustes_ref_entry_id"):
+            try:
+                candidate = dialog.selected_surface_procrustes_ref_entry_id()
+                if candidate in available_ids:
+                    self._gradient_surface_procrustes_ref_entry_id = candidate
+            except Exception:
+                pass
+
+        stored = getattr(self, "_gradient_surface_procrustes_ref_entry_id", None)
+        if stored in available_ids:
+            return stored
+        if available_ids:
+            self._gradient_surface_procrustes_ref_entry_id = available_ids[0]
+            return available_ids[0]
+        self._gradient_surface_procrustes_ref_entry_id = None
+        return None
+
+    def _selected_gradient_surface_procrustes_ref_label(self) -> str:
+        selected_id = self._selected_gradient_surface_procrustes_ref_entry_id()
+        for option in self._available_gradient_surface_procrustes_reference_entries():
+            if option.get("id") == selected_id:
+                return str(option.get("label") or "reference").strip() or "reference"
+        return "reference"
+
+    def _selected_gradient_surface_procrustes_rotation_angle(self) -> float:
+        dialog = getattr(self, "_gradients_dialog", None)
+        if dialog is not None and hasattr(dialog, "selected_surface_procrustes_rotation_angle"):
+            try:
+                self._gradient_surface_procrustes_rotation_angle = (
+                    self._normalize_gradient_surface_procrustes_rotation_angle(
+                        dialog.selected_surface_procrustes_rotation_angle()
+                    )
+                )
+            except Exception:
+                pass
+        self._gradient_surface_procrustes_rotation_angle = (
+            self._normalize_gradient_surface_procrustes_rotation_angle(
+                getattr(self, "_gradient_surface_procrustes_rotation_angle", 0.0)
+            )
+        )
+        return self._gradient_surface_procrustes_rotation_angle
 
     def _selected_gradient_surface_procrustes(self) -> bool:
         dialog = getattr(self, "_gradients_dialog", None)
@@ -1206,11 +1570,54 @@ class GradientDialogController:
     def _on_gradient_hemisphere_changed(self, value: str) -> None:
         self._gradient_hemisphere_mode = self._normalize_gradient_hemisphere_mode(value)
 
+    def _on_gradient_surface_color_scale_auto_changed(self, enabled: bool) -> None:
+        self._gradient_surface_color_scale_auto = bool(enabled)
+
+    def _on_gradient_surface_color_scale_min_changed(self, value: float) -> None:
+        self._gradient_surface_color_scale_min = self._normalize_gradient_surface_color_scale_limit(
+            value,
+            default=-0.2,
+        )
+
+    def _on_gradient_surface_color_scale_max_changed(self, value: float) -> None:
+        self._gradient_surface_color_scale_max = self._normalize_gradient_surface_color_scale_limit(
+            value,
+            default=0.2,
+        )
+
     def _on_gradient_surface_mesh_changed(self, value: str) -> None:
         self._gradient_surface_mesh = self._normalize_gradient_surface_mesh(value)
 
     def _on_gradient_surface_style_changed(self, value: str) -> None:
         self._gradient_surface_style = self._normalize_gradient_surface_style(value)
+
+    def _on_gradient_surface_sampling_radius_changed(self, value: float) -> None:
+        self._gradient_surface_sampling_radius = self._normalize_gradient_surface_sampling_radius(value)
+
+    def _on_gradient_surface_contour_count_changed(self, value: int) -> None:
+        self._gradient_surface_contour_count = self._normalize_gradient_surface_contour_count(value)
+
+    def _on_gradient_surface_contour_smoothing_changed(self, value: int) -> None:
+        self._gradient_surface_contour_smoothing = self._normalize_gradient_surface_contour_smoothing(value)
+
+    def _on_gradient_surface_contour_min_width_changed(self, value: float) -> None:
+        self._gradient_surface_contour_min_width = self._normalize_gradient_surface_contour_min_width(value)
+
+    def _on_gradient_surface_contour_width_by_value_changed(self, enabled: bool) -> None:
+        self._gradient_surface_contour_width_by_value = self._normalize_gradient_surface_contour_width_by_value(enabled)
+
+    def _on_gradient_surface_parcel_outlines_visible_changed(self, enabled: bool) -> None:
+        self._gradient_surface_parcel_outlines_visible = (
+            self._normalize_gradient_surface_parcel_outlines_visible(enabled)
+        )
+
+    def _on_gradient_surface_parcel_outline_smoothing_changed(self, value: int) -> None:
+        self._gradient_surface_parcel_outline_smoothing = (
+            self._normalize_gradient_surface_parcel_outline_smoothing(value)
+        )
+
+    def _on_gradient_surface_mask_path_changed(self, value: str) -> None:
+        self._gradient_surface_mask_path = str(value or "").strip()
 
     def _on_gradient_surface_render_count_changed(self, value: int) -> None:
         self._gradient_surface_render_count = self._normalize_gradient_surface_render_count(
@@ -1220,6 +1627,19 @@ class GradientDialogController:
 
     def _on_gradient_surface_procrustes_changed(self, enabled: bool) -> None:
         self._gradient_surface_procrustes = self._normalize_gradient_surface_procrustes(enabled)
+
+    def _on_gradient_surface_procrustes_ref_entry_changed(self, entry_id) -> None:
+        valid_ids = {
+            option.get("id")
+            for option in self._available_gradient_surface_procrustes_reference_entries()
+        }
+        self._gradient_surface_procrustes_ref_entry_id = entry_id if entry_id in valid_ids else None
+        self._sync_gradients_dialog_state()
+
+    def _on_gradient_surface_procrustes_rotation_changed(self, value: float) -> None:
+        self._gradient_surface_procrustes_rotation_angle = (
+            self._normalize_gradient_surface_procrustes_rotation_angle(value)
+        )
 
     def _on_gradient_classification_surface_mesh_changed(self, value: str) -> None:
         self._gradient_classification_surface_mesh = self._normalize_gradient_surface_mesh(value)
@@ -2256,6 +2676,7 @@ class GradientDialogController:
             self._gradient_component_count = 2
         self._gradient_surface_render_count = 1
         self._gradient_surface_procrustes = False
+        self._gradient_surface_procrustes_rotation_angle = 0.0
 
         parcellation_path = bundle.get("parcellation_path")
         did_reset = False
@@ -2384,6 +2805,7 @@ class GradientDialogController:
 
         self._gradient_component_count = n_grad
         self._gradient_surface_render_count = 1
+        self._gradient_surface_procrustes_rotation_angle = 0.0
         self._gradient_precomputed_selected_row = row_index
         self._last_gradients = {
             "gradients": np.asarray(components, dtype=float),
@@ -2771,14 +3193,51 @@ class GradientDialogController:
         dialog.set_component_count(component_count)
         dialog.set_surface_render_component_limit(self._available_gradient_network_component_count())
         dialog.set_surface_render_component_count(self._selected_gradient_surface_render_count())
+        if hasattr(dialog, "set_surface_procrustes_reference_options"):
+            dialog.set_surface_procrustes_reference_options(
+                self._available_gradient_surface_procrustes_reference_entries(),
+                selected_entry_id=self._selected_gradient_surface_procrustes_ref_entry_id(),
+            )
+        if hasattr(dialog, "set_surface_procrustes_rotation_angle"):
+            dialog.set_surface_procrustes_rotation_angle(
+                self._selected_gradient_surface_procrustes_rotation_angle()
+            )
         dialog.set_surface_procrustes_available(self._gradient_surface_procrustes_available())
         dialog.set_surface_procrustes_enabled(self._selected_gradient_surface_procrustes())
         dialog.set_colormap_names(names, current_colormap=current_cmap)
         dialog.set_parcellation_path(self._active_parcellation_path)
         dialog.set_hemisphere_mode(self._selected_gradient_hemisphere_mode())
+        if hasattr(dialog, "set_surface_color_scale_auto"):
+            dialog.set_surface_color_scale_auto(self._selected_gradient_surface_color_scale_auto())
+        if hasattr(dialog, "set_surface_color_scale_min"):
+            dialog.set_surface_color_scale_min(self._selected_gradient_surface_color_scale_min())
+        if hasattr(dialog, "set_surface_color_scale_max"):
+            dialog.set_surface_color_scale_max(self._selected_gradient_surface_color_scale_max())
         dialog.set_surface_mesh(self._selected_gradient_surface_mesh())
         if hasattr(dialog, "set_surface_style"):
             dialog.set_surface_style(self._selected_gradient_surface_style())
+        if hasattr(dialog, "set_surface_sampling_radius"):
+            dialog.set_surface_sampling_radius(self._selected_gradient_surface_sampling_radius())
+        if hasattr(dialog, "set_surface_contour_count"):
+            dialog.set_surface_contour_count(self._selected_gradient_surface_contour_count())
+        if hasattr(dialog, "set_surface_contour_smoothing"):
+            dialog.set_surface_contour_smoothing(self._selected_gradient_surface_contour_smoothing())
+        if hasattr(dialog, "set_surface_contour_min_width"):
+            dialog.set_surface_contour_min_width(self._selected_gradient_surface_contour_min_width())
+        if hasattr(dialog, "set_surface_contour_width_by_value"):
+            dialog.set_surface_contour_width_by_value(
+                self._selected_gradient_surface_contour_width_by_value()
+            )
+        if hasattr(dialog, "set_surface_parcel_outlines_visible"):
+            dialog.set_surface_parcel_outlines_visible(
+                self._selected_gradient_surface_parcel_outlines_visible()
+            )
+        if hasattr(dialog, "set_surface_parcel_outline_smoothing"):
+            dialog.set_surface_parcel_outline_smoothing(
+                self._selected_gradient_surface_parcel_outline_smoothing()
+            )
+        if hasattr(dialog, "set_surface_mask_path"):
+            dialog.set_surface_mask_path(self._selected_gradient_surface_mask_path())
         dialog.set_classification_surface_mesh(self._selected_gradient_classification_surface_mesh())
         dialog.set_classification_hemisphere_mode(self._selected_gradient_classification_hemisphere_mode())
         dialog.set_scatter_rotation(self._selected_gradient_scatter_rotation())
@@ -2868,6 +3327,7 @@ class GradientDialogController:
                 compute_callback=self._compute_gradients,
                 save_callback=self._save_gradients_projection,
                 render_3d_callback=self._render_gradients_3d,
+                render_static_callback=self._render_gradients_static,
                 classify_callback=self._classify_gradients_fsaverage,
                 render_network_callback=self._render_gradients_network,
                 matrix_changed_callback=self._on_gradient_matrix_entry_changed,
@@ -2876,10 +3336,31 @@ class GradientDialogController:
                 component_changed_callback=self._on_gradient_component_changed,
                 colormap_changed_callback=self._on_gradient_colormap_changed,
                 hemisphere_changed_callback=self._on_gradient_hemisphere_changed,
+                surface_color_scale_auto_changed_callback=self._on_gradient_surface_color_scale_auto_changed,
+                surface_color_scale_min_changed_callback=self._on_gradient_surface_color_scale_min_changed,
+                surface_color_scale_max_changed_callback=self._on_gradient_surface_color_scale_max_changed,
                 surface_mesh_changed_callback=self._on_gradient_surface_mesh_changed,
                 surface_style_changed_callback=self._on_gradient_surface_style_changed,
+                surface_sampling_radius_changed_callback=self._on_gradient_surface_sampling_radius_changed,
+                surface_contour_count_changed_callback=self._on_gradient_surface_contour_count_changed,
+                surface_contour_smoothing_changed_callback=self._on_gradient_surface_contour_smoothing_changed,
+                surface_contour_min_width_changed_callback=self._on_gradient_surface_contour_min_width_changed,
+                surface_contour_width_by_value_changed_callback=(
+                    self._on_gradient_surface_contour_width_by_value_changed
+                ),
+                surface_parcel_outlines_visible_changed_callback=(
+                    self._on_gradient_surface_parcel_outlines_visible_changed
+                ),
+                surface_parcel_outline_smoothing_changed_callback=(
+                    self._on_gradient_surface_parcel_outline_smoothing_changed
+                ),
+                surface_mask_changed_callback=self._on_gradient_surface_mask_path_changed,
                 surface_render_count_changed_callback=self._on_gradient_surface_render_count_changed,
                 surface_procrustes_changed_callback=self._on_gradient_surface_procrustes_changed,
+                surface_procrustes_ref_changed_callback=self._on_gradient_surface_procrustes_ref_entry_changed,
+                surface_procrustes_rotation_changed_callback=(
+                    self._on_gradient_surface_procrustes_rotation_changed
+                ),
                 classification_surface_mesh_changed_callback=self._on_gradient_classification_surface_mesh_changed,
                 classification_hemisphere_changed_callback=self._on_gradient_classification_hemisphere_changed,
                 scatter_rotation_changed_callback=self._on_gradient_scatter_rotation_changed,
@@ -2916,6 +3397,22 @@ class GradientDialogController:
             pass
         self.statusBar().showMessage("Opened Gradients window.")
 
+
+    @staticmethod
+    def _gradient_matrix_node_support(matrix: np.ndarray) -> np.ndarray:
+        """Return nodes with at least one finite, non-zero off-diagonal edge."""
+        values = np.asarray(matrix, dtype=float)
+        if values.ndim != 2 or values.shape[0] != values.shape[1]:
+            return np.zeros(values.shape[0] if values.ndim else 0, dtype=bool)
+        off_diagonal = np.array(values, copy=True)
+        np.fill_diagonal(off_diagonal, 0.0)
+        connected = np.isfinite(off_diagonal) & (np.abs(off_diagonal) > 0.0)
+        support = np.any(connected, axis=1)
+        if not np.any(support):
+            # Preserve a fully finite matrix whose meaningful values happen
+            # to be zero, while still excluding all-NaN masked rows.
+            support = np.any(np.isfinite(off_diagonal), axis=1)
+        return np.asarray(support, dtype=bool)
 
     def _compute_gradients(self) -> None:
         self._reset_gradients_output()
@@ -2973,13 +3470,24 @@ class GradientDialogController:
         if not template_labels:
             self.statusBar().showMessage("Template has no non-zero labels.")
             return
-        keep_indices = [idx for idx, label in enumerate(label_indices) if label in template_labels]
+        matrix_support = self._gradient_matrix_node_support(conn_matrix)
+        keep_indices = [
+            idx
+            for idx, label in enumerate(label_indices)
+            if label in template_labels and matrix_support[idx]
+        ]
         if not keep_indices:
             self.statusBar().showMessage(
-                "No overlap between matrix parcel_labels_group and active parcellation labels."
+                "No supported overlap between matrix parcel labels and active parcellation labels."
             )
             return
         projection_labels = [label_indices[idx] for idx in keep_indices]
+        masked_indices = [
+            idx for idx, label in enumerate(label_indices)
+            if label in template_labels and not matrix_support[idx]
+        ]
+        analysis_matrix = np.asarray(conn_matrix[np.ix_(keep_indices, keep_indices)], dtype=float)
+        analysis_matrix = np.nan_to_num(analysis_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
         kept_names = None
         if parcel_names and len(parcel_names) == conn_matrix.shape[0]:
@@ -2996,7 +3504,7 @@ class GradientDialogController:
             for comp_idx in range(1, n_grad + 1):
                 try:
                     component = nettools.dimreduce_matrix(
-                        conn_matrix,
+                        analysis_matrix,
                         method="diffusion",
                         scale_factor=1.0,
                         output_dim=comp_idx,
@@ -3005,12 +3513,12 @@ class GradientDialogController:
                     self.statusBar().showMessage(f"Failed to compute component {comp_idx}: {exc}")
                     return
                 component = np.asarray(component, dtype=float).reshape(-1)
-                if component.size != conn_matrix.shape[0]:
+                if component.size != len(keep_indices):
                     self.statusBar().showMessage(
-                        f"Component {comp_idx} size mismatch ({component.size} vs {conn_matrix.shape[0]})."
+                        f"Component {comp_idx} size mismatch ({component.size} vs {len(keep_indices)})."
                     )
                     return
-                gradients[:, comp_idx - 1] = np.asarray(component[keep_indices], dtype=float)
+                gradients[:, comp_idx - 1] = component
                 self._set_gradients_progress(0, n_grad, comp_idx, f"{comp_idx}/{n_grad} components")
                 QApplication.processEvents()
         finally:
@@ -3061,6 +3569,10 @@ class GradientDialogController:
             "keep_indices": np.asarray(keep_indices, dtype=int),
             "projection_labels": np.asarray(projection_labels, dtype=int),
             "support_mask": support_mask,
+            "matrix_node_support": np.asarray(matrix_support, dtype=bool),
+            "masked_projection_labels": np.asarray(
+                [label_indices[idx] for idx in masked_indices], dtype=int
+            ),
             "template_path": str(self._active_parcellation_path) if self._active_parcellation_path else "",
             "parcel_names": kept_names,
             "matrix_entry_id": self._selected_gradient_entry_id(),
@@ -3071,7 +3583,9 @@ class GradientDialogController:
         self._set_gradients_progress(0, n_grad, n_grad, f"{n_grad}/{n_grad} components (done)")
         self._sync_gradients_dialog_state()
         self.statusBar().showMessage(
-            f"Computed {n_grad} diffusion component(s). Projection will run only when you save, render, classify, or open the network view."
+            f"Computed {n_grad} diffusion component(s) on {len(keep_indices)} supported parcels; "
+            f"{len(masked_indices)} masked parcels will be grey on the fsaverage surface. "
+            "Projection will run only when you save, render, classify, or open the network view."
         )
 
     def _save_gradients_projection(self) -> None:
@@ -3277,35 +3791,131 @@ class GradientDialogController:
         if not use_procrustes:
             return components
 
-        bundle = self._gradient_precomputed_bundle
-        if not isinstance(bundle, dict):
-            return components
-        gradients_avg = bundle.get("gradients_avg")
-        if gradients_avg is None:
-            return components
-        gradients_avg = np.asarray(gradients_avg, dtype=float)
-        if gradients_avg.ndim != 2:
-            return components
-        if gradients_avg.shape[1] != components.shape[0]:
-            return components
+        reference = self._surface_procrustes_reference_gradient_matrix(target_count)
+        reference_gradients = np.asarray(reference.get("gradients"), dtype=float)
+        return self._align_gradient_matrix_to_reference(components, reference_gradients)
+
+    def _surface_procrustes_reference_gradient_matrix(self, required_components: int):
+        results = self._last_gradients or {}
+        if not results:
+            raise RuntimeError("No gradients are available.")
+        projection_labels = np.asarray(results.get("projection_labels"), dtype=int).reshape(-1)
+        if projection_labels.size == 0:
+            raise RuntimeError("Current gradient projection labels are unavailable.")
+
+        selected_id = self._selected_gradient_surface_procrustes_ref_entry_id()
+        if selected_id == SURFACE_PROCRUSTES_GRADIENTS_AVG_ID:
+            bundle = self._gradient_precomputed_bundle
+            if not isinstance(bundle, dict):
+                raise RuntimeError("No precomputed gradients bundle is loaded.")
+            gradients_avg = bundle.get("gradients_avg")
+            if gradients_avg is None:
+                raise RuntimeError("The precomputed bundle has no gradients_avg reference.")
+            gradients_avg = np.asarray(gradients_avg, dtype=float)
+            if gradients_avg.ndim != 2:
+                raise RuntimeError("gradients_avg must be a 2D array.")
+
+            target_count = self._normalize_gradient_surface_render_count(
+                required_components,
+                max_components=max(1, max(gradients_avg.shape)),
+            )
+            if gradients_avg.shape[1] == projection_labels.size:
+                if gradients_avg.shape[0] < target_count:
+                    raise RuntimeError(
+                        f"gradients_avg has only {gradients_avg.shape[0]} component(s)."
+                    )
+                reference_gradients = np.asarray(gradients_avg[:target_count, :], dtype=float).T
+            elif gradients_avg.shape[0] == projection_labels.size:
+                if gradients_avg.shape[1] < target_count:
+                    raise RuntimeError(
+                        f"gradients_avg has only {gradients_avg.shape[1]} component(s)."
+                    )
+                reference_gradients = np.asarray(gradients_avg[:, :target_count], dtype=float)
+            else:
+                raise RuntimeError(
+                    f"gradients_avg shape {tuple(gradients_avg.shape)} does not match "
+                    f"{projection_labels.size} projected parcels."
+                )
+            return {
+                "id": selected_id,
+                "label": "gradients_avg",
+                "gradients": np.asarray(reference_gradients, dtype=float),
+            }
+
+        entry = self._entries.get(selected_id) if selected_id in self._entries else None
+        if entry is None:
+            raise RuntimeError("Select a Procrustes reference matrix.")
+        ref_label, ref_gradients = self._reference_gradient_matrix_from_entry(
+            entry,
+            required_components,
+            label_prefix="Surface reference gradient",
+        )
+        return {
+            "id": selected_id,
+            "label": ref_label,
+            "gradients": np.asarray(ref_gradients, dtype=float),
+        }
+
+    def _align_gradient_matrix_to_reference(self, components, reference_gradients):
+        source_components = np.asarray(components, dtype=float)
+        target_components = np.asarray(reference_gradients, dtype=float)
+        if source_components.ndim != 2 or target_components.ndim != 2:
+            raise RuntimeError("Procrustes alignment requires 2D gradient matrices.")
+        if source_components.shape[0] != target_components.shape[0]:
+            raise RuntimeError(
+                "Procrustes reference parcel count does not match the current gradients."
+            )
 
         try:
             from brainspace.gradient.alignment import procrustes
         except Exception as exc:
             raise RuntimeError(f"brainspace procrustes is unavailable: {exc}") from exc
 
-        aligned = np.asarray(components, dtype=float).copy()
-        max_ref_components = min(aligned.shape[1], gradients_avg.shape[0])
+        aligned = np.asarray(source_components, dtype=float).copy()
+        max_ref_components = min(aligned.shape[1], target_components.shape[1])
         for comp_idx in range(max_ref_components):
             source = np.asarray(aligned[:, comp_idx], dtype=float).reshape(-1, 1)
-            target = np.asarray(gradients_avg[comp_idx], dtype=float).reshape(-1, 1)
+            target = np.asarray(target_components[:, comp_idx], dtype=float).reshape(-1, 1)
+            finite_mask = np.isfinite(source[:, 0]) & np.isfinite(target[:, 0])
+            if int(np.sum(finite_mask)) < 2:
+                continue
             try:
-                # Align the selected subject/session component onto the average reference.
-                aligned_component = procrustes(source, target, center=False, scale=False)
+                aligned_component = procrustes(
+                    source[finite_mask, :],
+                    target[finite_mask, :],
+                    center=False,
+                    scale=False,
+                )
             except Exception as exc:
                 raise RuntimeError(f"Failed Procrustes alignment for Gradient {comp_idx + 1}: {exc}") from exc
-            aligned[:, comp_idx] = np.asarray(aligned_component, dtype=float).reshape(-1)
+            aligned[finite_mask, comp_idx] = np.asarray(aligned_component, dtype=float).reshape(-1)
         return aligned
+
+    @staticmethod
+    def _rotate_gradient_components(components, angle_degrees: float):
+        rotated = np.asarray(components, dtype=float).copy()
+        if rotated.ndim != 2 or rotated.shape[1] < 1:
+            raise RuntimeError("Manual gradient rotation requires a 2D gradient matrix.")
+        angle = GradientDialogController._normalize_gradient_surface_procrustes_rotation_angle(
+            angle_degrees
+        )
+        if abs(angle) <= 1e-12:
+            return rotated
+
+        if rotated.shape[1] < 2:
+            if abs(abs(angle) - 180.0) <= 1e-9:
+                rotated[:, 0] *= -1.0
+                return rotated
+            raise RuntimeError("Manual rotations other than 180 degrees require at least two gradients.")
+
+        radians = math.radians(angle)
+        cosine = math.cos(radians)
+        sine = math.sin(radians)
+        first = np.asarray(rotated[:, 0], dtype=float).copy()
+        second = np.asarray(rotated[:, 1], dtype=float).copy()
+        rotated[:, 0] = cosine * first - sine * second
+        rotated[:, 1] = sine * first + cosine * second
+        return rotated
 
     def _project_gradient_matrix_to_volume(self, gradient_matrix: np.ndarray):
         results = self._last_gradients or {}
@@ -3525,29 +4135,96 @@ class GradientDialogController:
             return 0, y_index, "Spatial", "Spatial"
         return 0, 0, "Spatial", "Spatial"
 
-    def _classification_reference_gradient_payload(self, required_components: int):
+    def _reference_gradient_matrix_from_entry(self, entry, required_components: int, *, label_prefix: str = "Reference gradient"):
         try:
             required_components = int(required_components)
         except Exception:
             required_components = 1
-        required_components = max(1, min(3, required_components))
+        required_components = max(1, min(10, required_components))
 
-        entry = self._selected_gradient_classification_ref_entry()
         if entry is None:
-            raise RuntimeError("Select a reference matrix for Gradient Ref classification axes.")
+            raise RuntimeError("Select a reference matrix.")
 
         ref_label = self._gradient_matrix_label_for_entry(entry)
         try:
             ref_matrix = np.asarray(self._gradient_matrix_for_entry(entry), dtype=float)
         except Exception as exc:
             raise RuntimeError(f"Failed to load reference matrix {ref_label}: {exc}") from exc
-        if ref_matrix.ndim != 2 or ref_matrix.shape[0] != ref_matrix.shape[1]:
-            raise RuntimeError(f"Reference gradients require a square matrix. {ref_label} is not square.")
+        if ref_matrix.ndim != 2:
+            raise RuntimeError(f"Reference gradients require a 2D matrix. {ref_label} is not 2D.")
 
         results = self._last_gradients or {}
         projection_labels = np.asarray(results.get("projection_labels"), dtype=int).reshape(-1)
         if projection_labels.size == 0:
             raise RuntimeError("Current gradient projection labels are unavailable.")
+
+        if ref_matrix.shape[0] != ref_matrix.shape[1]:
+            keep_indices = np.asarray(results.get("keep_indices", []), dtype=int).reshape(-1)
+            candidates = [
+                (ref_matrix.shape[0], np.asarray(ref_matrix, dtype=float)),
+                (ref_matrix.shape[1], np.asarray(ref_matrix.T, dtype=float)),
+            ]
+            candidates.sort(key=lambda item: 0 if item[0] == projection_labels.size else 1)
+            last_error = None
+            for node_count, values_by_node in candidates:
+                if values_by_node.shape[1] < required_components:
+                    last_error = (
+                        f"Reference gradient matrix {ref_label} has only "
+                        f"{values_by_node.shape[1]} component(s)."
+                    )
+                    continue
+
+                try:
+                    ref_labels_raw, _ref_names = self._entry_parcel_metadata(
+                        entry,
+                        expected_len=node_count,
+                    )
+                except Exception:
+                    ref_labels_raw = None
+                ref_label_indices = _coerce_label_indices(ref_labels_raw, node_count)
+                ref_keep_indices = None
+                if ref_label_indices is not None:
+                    ref_label_indices = np.asarray(ref_label_indices, dtype=int).reshape(-1)
+                    if np.unique(ref_label_indices).size != ref_label_indices.size:
+                        last_error = "Reference matrix parcel_labels_group must be unique."
+                        continue
+                    label_to_index = {
+                        int(label): int(idx)
+                        for idx, label in enumerate(ref_label_indices.tolist())
+                    }
+                    missing = [int(label) for label in projection_labels.tolist() if int(label) not in label_to_index]
+                    if missing:
+                        preview = ", ".join(str(label) for label in missing[:8])
+                        if len(missing) > 8:
+                            preview += ", ..."
+                        last_error = f"Reference matrix {ref_label} is missing projection label(s): {preview}"
+                        continue
+                    ref_keep_indices = np.asarray(
+                        [label_to_index[int(label)] for label in projection_labels.tolist()],
+                        dtype=int,
+                    )
+                elif node_count == projection_labels.size:
+                    ref_keep_indices = np.arange(projection_labels.size, dtype=int)
+                elif (
+                    keep_indices.size == projection_labels.size
+                    and keep_indices.size > 0
+                    and int(np.max(keep_indices)) < node_count
+                ):
+                    ref_keep_indices = np.asarray(keep_indices, dtype=int)
+
+                if ref_keep_indices is None:
+                    continue
+                return ref_label, np.asarray(
+                    values_by_node[ref_keep_indices, :required_components],
+                    dtype=float,
+                )
+
+            if last_error:
+                raise RuntimeError(last_error)
+            raise RuntimeError(
+                "Reference gradient matrix needs parcel_labels_group matching the active projection labels, "
+                "or a parcel axis matching the current projected parcel count."
+            )
 
         ref_labels_raw, _ref_names = self._entry_parcel_metadata(entry, expected_len=ref_matrix.shape[0])
         ref_label_indices = _coerce_label_indices(ref_labels_raw, ref_matrix.shape[0])
@@ -3587,25 +4264,39 @@ class GradientDialogController:
                     "or the same row order/size as the current matrix."
                 )
 
+        analysis_matrix = np.asarray(ref_matrix[np.ix_(ref_keep_indices, ref_keep_indices)], dtype=float)
+        analysis_matrix = np.nan_to_num(analysis_matrix, nan=0.0, posinf=0.0, neginf=0.0)
         ref_gradients = np.zeros((projection_labels.size, required_components), dtype=float)
         for comp_idx in range(1, required_components + 1):
             try:
                 component = nettools.dimreduce_matrix(
-                    ref_matrix,
+                    analysis_matrix,
                     method="diffusion",
                     scale_factor=1.0,
                     output_dim=comp_idx,
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    f"Failed to compute Gradient Ref {comp_idx} from {ref_label}: {exc}"
+                    f"Failed to compute {label_prefix} {comp_idx} from {ref_label}: {exc}"
                 ) from exc
             component = np.asarray(component, dtype=float).reshape(-1)
-            if component.size != ref_matrix.shape[0]:
+            if component.size != projection_labels.size:
                 raise RuntimeError(
-                    f"Gradient Ref {comp_idx} size mismatch ({component.size} vs {ref_matrix.shape[0]})."
+                    f"{label_prefix} {comp_idx} size mismatch ({component.size} vs {projection_labels.size})."
                 )
-            ref_gradients[:, comp_idx - 1] = np.asarray(component[ref_keep_indices], dtype=float)
+            ref_gradients[:, comp_idx - 1] = np.asarray(component, dtype=float)
+        return ref_label, np.asarray(ref_gradients, dtype=float)
+
+    def _classification_reference_gradient_payload(self, required_components: int):
+        entry = self._selected_gradient_classification_ref_entry()
+        if entry is None:
+            raise RuntimeError("Select a reference matrix for Gradient Ref classification axes.")
+
+        ref_label, ref_gradients = self._reference_gradient_matrix_from_entry(
+            entry,
+            required_components,
+            label_prefix="Gradient Ref",
+        )
 
         projected_data = self._project_gradient_matrix_to_volume(ref_gradients)
         return {
@@ -3715,10 +4406,98 @@ class GradientDialogController:
         scaled_volume[finite_volume_mask] = (scaled_volume[finite_volume_mask] - src_min) * scale + tgt_min
         return scaled_values, scaled_volume
 
-    def _render_gradients_3d(self) -> None:
+    def _prepare_gradient_surface_render(self):
         if not self._last_gradients:
-            self.statusBar().showMessage("No gradients computed yet.")
-            return
+            raise RuntimeError("No gradients computed yet.")
+        available_n_grad = int(self._last_gradients.get("n_grad", 1))
+        render_count = self._selected_gradient_surface_render_count()
+        render_count = max(1, min(render_count, available_n_grad))
+        use_procrustes = self._selected_gradient_surface_procrustes()
+        manual_rotation_angle = (
+            0.0
+            if use_procrustes
+            else self._selected_gradient_surface_procrustes_rotation_angle()
+        )
+        apply_manual_rotation = abs(float(manual_rotation_angle)) > 1e-12
+        if use_procrustes:
+            component_matrix = self._surface_render_gradient_matrix(
+                render_count,
+                use_procrustes=True,
+            )
+            projected_data = self._project_gradient_matrix_to_volume(component_matrix)
+        elif apply_manual_rotation:
+            component_count = render_count
+            if available_n_grad >= 2:
+                component_count = max(component_count, 2)
+            component_matrix = self._surface_render_gradient_matrix(
+                component_count,
+                use_procrustes=False,
+            )
+            component_matrix = self._rotate_gradient_components(
+                component_matrix,
+                manual_rotation_angle,
+            )
+            component_matrix = np.asarray(component_matrix[:, :render_count], dtype=float)
+            projected_data = self._project_gradient_matrix_to_volume(component_matrix)
+        else:
+            projected_data = self._ensure_projected_gradient_data(render_count)
+        if projected_data is None:
+            raise RuntimeError("No projected fsaverage data are available.")
+        render_data = np.asarray(projected_data, dtype=float)
+        if render_count == 1 and render_data.ndim == 4:
+            render_data = np.asarray(render_data[..., 0], dtype=float)
+        elif render_data.ndim == 4 and render_data.shape[3] > render_count:
+            render_data = render_data[..., :render_count]
+        source_name = self._last_gradients.get("source_name", "matrix")
+        title = (
+            f"Gradient 1 - {source_name}"
+            if render_count == 1
+            else f"First {render_count} Gradients - {source_name}"
+        )
+        if use_procrustes:
+            title += f" | Procrustes to {self._selected_gradient_surface_procrustes_ref_label()}"
+        elif apply_manual_rotation:
+            title += f" | manual rotation {manual_rotation_angle:g} deg"
+        use_auto_color_scale = self._selected_gradient_surface_color_scale_auto()
+        color_scale_min = None if use_auto_color_scale else self._selected_gradient_surface_color_scale_min()
+        color_scale_max = None if use_auto_color_scale else self._selected_gradient_surface_color_scale_max()
+
+        support_mask_img = None
+        support_mask_data = self._last_gradients.get("support_mask")
+        if support_mask_data is not None:
+            import nibabel as nib
+
+            support_mask_array = np.asarray(support_mask_data, dtype=float)
+            if support_mask_array.shape == np.asarray(render_data).shape[:3]:
+                affine = self._last_gradients.get("affine")
+                if affine is None:
+                    affine = np.eye(4)
+                support_mask_img = nib.Nifti1Image(support_mask_array, affine)
+        return {
+            "render_data": render_data,
+            "render_count": render_count,
+            "title": title,
+            "cmap_name": self._selected_surface_colormap_name(),
+            "cmap": self._selected_surface_colormap(),
+            "color_scale_min": color_scale_min,
+            "color_scale_max": color_scale_max,
+            "hemisphere_mode": self._selected_gradient_hemisphere_mode(),
+            "surface_mesh": self._selected_gradient_surface_mesh(),
+            "surface_style": self._selected_gradient_surface_style(),
+            "sampling_radius": self._selected_gradient_surface_sampling_radius(),
+            "contour_count": self._selected_gradient_surface_contour_count(),
+            "contour_smoothing": self._selected_gradient_surface_contour_smoothing(),
+            "contour_min_linewidth": self._selected_gradient_surface_contour_min_width(),
+            "contour_width_by_value": self._selected_gradient_surface_contour_width_by_value(),
+            "show_parcel_outlines": self._selected_gradient_surface_parcel_outlines_visible(),
+            "parcel_outline_smoothing": self._selected_gradient_surface_parcel_outline_smoothing(),
+            "support_mask_img": support_mask_img,
+            "mask_img": self._gradient_surface_mask_img(),
+            "affine": self._last_gradients.get("affine"),
+            "parcellation_img": getattr(self, "_active_parcellation_img", None),
+        }
+
+    def _render_gradients_3d(self) -> None:
         try:
             from window.plot_gradient import GradientSurfaceDialog
         except Exception:
@@ -3728,80 +4507,104 @@ class GradientDialogController:
                 self.statusBar().showMessage(f"Gradient surface viewer unavailable: {exc}")
                 return
         try:
-            available_n_grad = int(self._last_gradients.get("n_grad", 1))
-            render_count = self._selected_gradient_surface_render_count()
-            render_count = max(1, min(render_count, available_n_grad))
-            use_procrustes = self._selected_gradient_surface_procrustes()
-            if use_procrustes:
-                component_matrix = self._surface_render_gradient_matrix(
-                    render_count,
-                    use_procrustes=True,
-                )
-                projected_data = self._project_gradient_matrix_to_volume(component_matrix)
-            else:
-                projected_data = self._ensure_projected_gradient_data(render_count)
-            if projected_data is None:
-                raise RuntimeError("No projected fsaverage data are available.")
-            render_data = np.asarray(projected_data, dtype=float)
-            if render_count == 1 and render_data.ndim == 4:
-                render_data = np.asarray(render_data[..., 0], dtype=float)
-            elif render_data.ndim == 4 and render_data.shape[3] > render_count:
-                render_data = render_data[..., :render_count]
-            source_name = self._last_gradients.get("source_name", "matrix")
-            cmap_name = self._selected_surface_colormap_name()
-            cmap = self._selected_surface_colormap()
-            hemisphere_mode = self._selected_gradient_hemisphere_mode()
-            surface_mesh = self._selected_gradient_surface_mesh()
-            surface_style = self._selected_gradient_surface_style()
-            title = (
-                f"Gradient 1 - {source_name}"
-                if render_count == 1
-                else f"First {render_count} Gradients - {source_name}"
-            )
-            if use_procrustes:
-                title += " | Procrustes to gradients_avg"
-            support_mask_img = None
-            support_mask_data = self._last_gradients.get("support_mask")
-            if support_mask_data is not None:
-                try:
-                    import nibabel as nib
-
-                    support_mask_array = np.asarray(support_mask_data, dtype=float)
-                    if support_mask_array.shape == np.asarray(render_data).shape[:3]:
-                        affine = self._last_gradients.get("affine")
-                        if affine is None:
-                            affine = np.eye(4)
-                        support_mask_img = nib.Nifti1Image(support_mask_array, affine)
-                except Exception:
-                    support_mask_img = None
+            payload = self._prepare_gradient_surface_render()
             self._surface_dialog = GradientSurfaceDialog.from_array(
-                render_data,
-                affine=self._last_gradients.get("affine"),
-                title=title,
-                cmap=cmap,
-                cmap_name=cmap_name,
+                payload["render_data"],
+                affine=payload["affine"],
+                title=payload["title"],
+                cmap=payload["cmap"],
+                cmap_name=payload["cmap_name"],
+                color_scale_min=payload["color_scale_min"],
+                color_scale_max=payload["color_scale_max"],
                 theme_name=self._theme_name,
-                hemisphere_mode=hemisphere_mode,
-                fsaverage_mesh=surface_mesh,
-                surface_style=surface_style,
-                parcellation_img=getattr(self, "_active_parcellation_img", None),
-                support_mask_img=support_mask_img,
+                hemisphere_mode=payload["hemisphere_mode"],
+                fsaverage_mesh=payload["surface_mesh"],
+                surface_style=payload["surface_style"],
+                parcellation_img=payload["parcellation_img"],
+                support_mask_img=payload["support_mask_img"],
+                mask_img=payload["mask_img"],
+                sampling_radius=payload["sampling_radius"],
+                contour_count=payload["contour_count"],
+                contour_smoothing=payload["contour_smoothing"],
+                contour_min_linewidth=payload["contour_min_linewidth"],
+                contour_width_by_value=payload["contour_width_by_value"],
+                show_parcel_outlines=payload["show_parcel_outlines"],
+                parcel_outline_smoothing=payload["parcel_outline_smoothing"],
                 parent=self,
             )
             screen = QApplication.primaryScreen()
             if screen is not None:
                 geom = screen.availableGeometry()
                 width = max(int(geom.width() * 0.88), 900)
-                height = min(max(300 + 300 * max(render_count, 1), 420), int(geom.height() * 0.9))
+                height = min(
+                    max(300 + 300 * max(payload["render_count"], 1), 420),
+                    int(geom.height() * 0.9),
+                )
             else:
                 width = 1500
-                height = 300 + 300 * max(render_count, 1)
+                height = 300 + 300 * max(payload["render_count"], 1)
             self._surface_dialog.resize(width, height)
             self._surface_dialog.show()
         except Exception as exc:
             self.statusBar().showMessage(f"Failed to render Gradient fsaverage surfaces: {exc}")
             return
         self.statusBar().showMessage("Opened Gradient fsaverage viewer.")
+
+    def _render_gradients_static(self) -> None:
+        try:
+            from window.plot_gradient import GradientSurfaceDialog
+        except Exception:
+            try:
+                from mrsi_viewer.window.plot_gradient import GradientSurfaceDialog
+            except Exception as exc:
+                self.statusBar().showMessage(f"Gradient surface renderer unavailable: {exc}")
+                return
+        try:
+            payload = self._prepare_gradient_surface_render()
+            default_name = f"gradient_fsaverage_{payload['render_count']}.png"
+            save_path, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save static gradient fsaverage figure",
+                str(Path(self._last_gradients.get("source_dir", str(self._default_results_dir()))) / default_name),
+                "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)",
+            )
+            if not save_path:
+                return
+            output_path = Path(save_path)
+            if output_path.suffix.lower() not in {".png", ".pdf", ".svg"}:
+                if "PDF" in selected_filter:
+                    output_path = output_path.with_suffix(".pdf")
+                elif "SVG" in selected_filter:
+                    output_path = output_path.with_suffix(".svg")
+                else:
+                    output_path = output_path.with_suffix(".png")
+            GradientSurfaceDialog.render_static(
+                payload["render_data"],
+                output_path,
+                affine=payload["affine"],
+                cmap=payload["cmap"],
+                cmap_name=payload["cmap_name"],
+                color_scale_min=payload["color_scale_min"],
+                color_scale_max=payload["color_scale_max"],
+                hemisphere_mode=payload["hemisphere_mode"],
+                fsaverage_mesh=payload["surface_mesh"],
+                surface_style=payload["surface_style"],
+                parcellation_img=payload["parcellation_img"],
+                support_mask_img=payload["support_mask_img"],
+                mask_img=payload["mask_img"],
+                sampling_radius=payload["sampling_radius"],
+                contour_count=payload["contour_count"],
+                contour_smoothing=payload["contour_smoothing"],
+                contour_min_linewidth=payload["contour_min_linewidth"],
+                contour_width_by_value=payload["contour_width_by_value"],
+                show_parcel_outlines=payload["show_parcel_outlines"],
+                parcel_outline_smoothing=payload["parcel_outline_smoothing"],
+                title=payload["title"],
+            )
+        except Exception as exc:
+            self.statusBar().showMessage(f"Failed to save static Gradient fsaverage figure: {exc}")
+            return
+        self.statusBar().showMessage(f"Saved static Gradient fsaverage figure to {output_path.name}.")
 
     def _classify_gradients_fsaverage(self) -> None:
         if not self._last_gradients:

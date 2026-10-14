@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 try:
@@ -74,6 +75,7 @@ class GradientsPrepareDialog(QDialog):
         compute_callback=None,
         save_callback=None,
         render_3d_callback=None,
+        render_static_callback=None,
         classify_callback=None,
         render_network_callback=None,
         matrix_changed_callback=None,
@@ -82,10 +84,23 @@ class GradientsPrepareDialog(QDialog):
         component_changed_callback=None,
         colormap_changed_callback=None,
         hemisphere_changed_callback=None,
+        surface_color_scale_auto_changed_callback=None,
+        surface_color_scale_min_changed_callback=None,
+        surface_color_scale_max_changed_callback=None,
         surface_mesh_changed_callback=None,
         surface_style_changed_callback=None,
+        surface_sampling_radius_changed_callback=None,
+        surface_mask_changed_callback=None,
+        surface_contour_count_changed_callback=None,
+        surface_contour_smoothing_changed_callback=None,
+        surface_contour_min_width_changed_callback=None,
+        surface_contour_width_by_value_changed_callback=None,
+        surface_parcel_outlines_visible_changed_callback=None,
+        surface_parcel_outline_smoothing_changed_callback=None,
         surface_render_count_changed_callback=None,
         surface_procrustes_changed_callback=None,
+        surface_procrustes_ref_changed_callback=None,
+        surface_procrustes_rotation_changed_callback=None,
         scatter_rotation_changed_callback=None,
         triangular_rgb_changed_callback=None,
         preload_matching_paths_changed_callback=None,
@@ -115,6 +130,7 @@ class GradientsPrepareDialog(QDialog):
         self._compute_callback = compute_callback
         self._save_callback = save_callback
         self._render_3d_callback = render_3d_callback
+        self._render_static_callback = render_static_callback
         self._classify_callback = classify_callback
         self._render_network_callback = render_network_callback
         self._matrix_changed_callback = matrix_changed_callback
@@ -123,10 +139,27 @@ class GradientsPrepareDialog(QDialog):
         self._component_changed_callback = component_changed_callback
         self._colormap_changed_callback = colormap_changed_callback
         self._hemisphere_changed_callback = hemisphere_changed_callback
+        self._surface_color_scale_auto_changed_callback = surface_color_scale_auto_changed_callback
+        self._surface_color_scale_min_changed_callback = surface_color_scale_min_changed_callback
+        self._surface_color_scale_max_changed_callback = surface_color_scale_max_changed_callback
         self._surface_mesh_changed_callback = surface_mesh_changed_callback
         self._surface_style_changed_callback = surface_style_changed_callback
+        self._surface_sampling_radius_changed_callback = surface_sampling_radius_changed_callback
+        self._surface_mask_changed_callback = surface_mask_changed_callback
+        self._surface_contour_count_changed_callback = surface_contour_count_changed_callback
+        self._surface_contour_smoothing_changed_callback = surface_contour_smoothing_changed_callback
+        self._surface_contour_min_width_changed_callback = surface_contour_min_width_changed_callback
+        self._surface_contour_width_by_value_changed_callback = surface_contour_width_by_value_changed_callback
+        self._surface_parcel_outlines_visible_changed_callback = (
+            surface_parcel_outlines_visible_changed_callback
+        )
+        self._surface_parcel_outline_smoothing_changed_callback = (
+            surface_parcel_outline_smoothing_changed_callback
+        )
         self._surface_render_count_changed_callback = surface_render_count_changed_callback
         self._surface_procrustes_changed_callback = surface_procrustes_changed_callback
+        self._surface_procrustes_ref_changed_callback = surface_procrustes_ref_changed_callback
+        self._surface_procrustes_rotation_changed_callback = surface_procrustes_rotation_changed_callback
         self._scatter_rotation_changed_callback = scatter_rotation_changed_callback
         self._triangular_rgb_changed_callback = triangular_rgb_changed_callback
         self._preload_matching_paths_changed_callback = preload_matching_paths_changed_callback
@@ -169,10 +202,23 @@ class GradientsPrepareDialog(QDialog):
         self.set_colormap_names(colormap_names or [], current_colormap=current_colormap)
         self.set_parcellation_path(parcellation_path)
         self.set_hemisphere_mode("separate")
+        self.set_surface_color_scale_auto(True)
+        self.set_surface_color_scale_min(-0.2)
+        self.set_surface_color_scale_max(0.2)
         self.set_surface_mesh("fsaverage4")
         self.set_surface_style("smooth")
+        self.set_surface_contour_count(9)
+        self.set_surface_contour_smoothing(32)
+        self.set_surface_contour_min_width(0.2)
+        self.set_surface_contour_width_by_value(False)
+        self.set_surface_parcel_outlines_visible(True)
+        self.set_surface_parcel_outline_smoothing(2)
+        self.set_surface_sampling_radius(6.0)
+        self.set_surface_mask_path("")
         self.set_surface_render_component_limit(component_count)
         self.set_surface_render_component_count(1)
+        self.set_surface_procrustes_reference_options([])
+        self.set_surface_procrustes_rotation_angle(0.0)
         self.set_surface_procrustes_enabled(False)
         self.set_surface_procrustes_available(False)
         self.set_scatter_rotation("Default")
@@ -321,6 +367,39 @@ class GradientsPrepareDialog(QDialog):
         display_layout.addWidget(self.colorbar_combo, row, 1)
         row += 1
 
+        self.surface_color_scale_auto_check = QCheckBox("Auto color scale")
+        self.surface_color_scale_auto_check.toggled.connect(
+            self._on_surface_color_scale_auto_changed
+        )
+        display_layout.addWidget(self.surface_color_scale_auto_check, row, 0, 1, 2)
+        row += 1
+
+        self.surface_color_scale_min_label = QLabel("zmin")
+        display_layout.addWidget(self.surface_color_scale_min_label, row, 0)
+        self.surface_color_scale_min_spin = QDoubleSpinBox()
+        self.surface_color_scale_min_spin.setRange(-1000000.0, 1000000.0)
+        self.surface_color_scale_min_spin.setDecimals(5)
+        self.surface_color_scale_min_spin.setSingleStep(0.01)
+        self.surface_color_scale_min_spin.setValue(-0.2)
+        self.surface_color_scale_min_spin.valueChanged.connect(
+            self._on_surface_color_scale_min_changed
+        )
+        display_layout.addWidget(self.surface_color_scale_min_spin, row, 1)
+        row += 1
+
+        self.surface_color_scale_max_label = QLabel("zmax")
+        display_layout.addWidget(self.surface_color_scale_max_label, row, 0)
+        self.surface_color_scale_max_spin = QDoubleSpinBox()
+        self.surface_color_scale_max_spin.setRange(-1000000.0, 1000000.0)
+        self.surface_color_scale_max_spin.setDecimals(5)
+        self.surface_color_scale_max_spin.setSingleStep(0.01)
+        self.surface_color_scale_max_spin.setValue(0.2)
+        self.surface_color_scale_max_spin.valueChanged.connect(
+            self._on_surface_color_scale_max_changed
+        )
+        display_layout.addWidget(self.surface_color_scale_max_spin, row, 1)
+        row += 1
+
         display_layout.addWidget(QLabel("Hemisphere"), row, 0)
         self.hemisphere_combo = QComboBox()
         self.hemisphere_combo.addItems(["Both", "LH", "RH"])
@@ -340,9 +419,95 @@ class GradientsPrepareDialog(QDialog):
         display_layout.addWidget(QLabel("Surface style"), row, 0)
         self.surface_style_combo = QComboBox()
         self.surface_style_combo.addItem("Smooth", "smooth")
+        self.surface_style_combo.addItem("Iso-contours", "contours")
         self.surface_style_combo.addItem("Parcel outlines", "parcel_outlines")
         self.surface_style_combo.currentIndexChanged.connect(self._on_surface_style_changed)
         display_layout.addWidget(self.surface_style_combo, row, 1)
+        row += 1
+
+        self.surface_contour_count_label = QLabel("Contour count")
+        display_layout.addWidget(self.surface_contour_count_label, row, 0)
+        self.surface_contour_count_spin = QSpinBox()
+        self.surface_contour_count_spin.setRange(1, 31)
+        self.surface_contour_count_spin.setValue(9)
+        self.surface_contour_count_spin.valueChanged.connect(self._on_surface_contour_count_changed)
+        display_layout.addWidget(self.surface_contour_count_spin, row, 1)
+        row += 1
+
+        self.surface_contour_smoothing_label = QLabel("Contour smoothing")
+        display_layout.addWidget(self.surface_contour_smoothing_label, row, 0)
+        self.surface_contour_smoothing_spin = QSpinBox()
+        self.surface_contour_smoothing_spin.setRange(0, 128)
+        self.surface_contour_smoothing_spin.setValue(32)
+        self.surface_contour_smoothing_spin.setSuffix(" iter")
+        self.surface_contour_smoothing_spin.valueChanged.connect(
+            self._on_surface_contour_smoothing_changed
+        )
+        display_layout.addWidget(self.surface_contour_smoothing_spin, row, 1)
+        row += 1
+
+        self.surface_contour_min_width_label = QLabel("Contour min width")
+        display_layout.addWidget(self.surface_contour_min_width_label, row, 0)
+        self.surface_contour_min_width_spin = QDoubleSpinBox()
+        self.surface_contour_min_width_spin.setRange(0.05, 3.0)
+        self.surface_contour_min_width_spin.setDecimals(2)
+        self.surface_contour_min_width_spin.setSingleStep(0.05)
+        self.surface_contour_min_width_spin.setValue(0.2)
+        self.surface_contour_min_width_spin.valueChanged.connect(
+            self._on_surface_contour_min_width_changed
+        )
+        display_layout.addWidget(self.surface_contour_min_width_spin, row, 1)
+        row += 1
+
+        self.surface_contour_width_by_value_check = QCheckBox("Vary contour width by value")
+        self.surface_contour_width_by_value_check.toggled.connect(
+            self._on_surface_contour_width_by_value_changed
+        )
+        display_layout.addWidget(self.surface_contour_width_by_value_check, row, 0, 1, 2)
+        row += 1
+
+        self.surface_parcel_outlines_visible_check = QCheckBox("Show parcel outlines")
+        self.surface_parcel_outlines_visible_check.toggled.connect(
+            self._on_surface_parcel_outlines_visible_changed
+        )
+        display_layout.addWidget(self.surface_parcel_outlines_visible_check, row, 0, 1, 2)
+        row += 1
+
+        self.surface_parcel_outline_smoothing_label = QLabel("Parcel outline smoothing")
+        display_layout.addWidget(self.surface_parcel_outline_smoothing_label, row, 0)
+        self.surface_parcel_outline_smoothing_spin = QSpinBox()
+        self.surface_parcel_outline_smoothing_spin.setRange(0, 32)
+        self.surface_parcel_outline_smoothing_spin.setValue(2)
+        self.surface_parcel_outline_smoothing_spin.setSuffix(" iter")
+        self.surface_parcel_outline_smoothing_spin.valueChanged.connect(
+            self._on_surface_parcel_outline_smoothing_changed
+        )
+        display_layout.addWidget(self.surface_parcel_outline_smoothing_spin, row, 1)
+        row += 1
+
+        display_layout.addWidget(QLabel("Sampling radius (mm)"), row, 0)
+        self.surface_sampling_radius_spin = QDoubleSpinBox()
+        self.surface_sampling_radius_spin.setRange(0.5, 12.0)
+        self.surface_sampling_radius_spin.setDecimals(1)
+        self.surface_sampling_radius_spin.setSingleStep(0.5)
+        self.surface_sampling_radius_spin.setValue(6.0)
+        self.surface_sampling_radius_spin.valueChanged.connect(self._on_surface_sampling_radius_changed)
+        display_layout.addWidget(self.surface_sampling_radius_spin, row, 1)
+        row += 1
+
+        display_layout.addWidget(QLabel("Mask image"), row, 0)
+        mask_layout = QHBoxLayout()
+        self.surface_mask_path_edit = QLineEdit()
+        self.surface_mask_path_edit.setPlaceholderText("Optional NIfTI mask")
+        self.surface_mask_path_edit.textChanged.connect(self._on_surface_mask_path_changed)
+        mask_layout.addWidget(self.surface_mask_path_edit, 1)
+        self.surface_mask_browse_button = QPushButton("Browse")
+        self.surface_mask_browse_button.clicked.connect(self._trigger_open_surface_mask)
+        mask_layout.addWidget(self.surface_mask_browse_button, 0)
+        self.surface_mask_clear_button = QPushButton("Clear")
+        self.surface_mask_clear_button.clicked.connect(self._clear_surface_mask_path)
+        mask_layout.addWidget(self.surface_mask_clear_button, 0)
+        display_layout.addLayout(mask_layout, row, 1)
         row += 1
 
         display_layout.addWidget(QLabel("Gradients to render"), row, 0)
@@ -353,14 +518,43 @@ class GradientsPrepareDialog(QDialog):
         display_layout.addWidget(self.surface_render_count_spin, row, 1)
         row += 1
 
-        self.surface_procrustes_check = QCheckBox("Align to gradients_avg (Procrustes)")
+        self.surface_procrustes_check = QCheckBox("Procrustes align gradients")
         self.surface_procrustes_check.toggled.connect(self._on_surface_procrustes_changed)
         display_layout.addWidget(self.surface_procrustes_check, row, 0, 1, 2)
         row += 1
 
+        self.surface_procrustes_ref_label = QLabel("Procrustes reference")
+        display_layout.addWidget(self.surface_procrustes_ref_label, row, 0)
+        self.surface_procrustes_ref_combo = QComboBox()
+        self.surface_procrustes_ref_combo.currentIndexChanged.connect(
+            self._on_surface_procrustes_ref_changed
+        )
+        display_layout.addWidget(self.surface_procrustes_ref_combo, row, 1)
+        row += 1
+
+        self.surface_procrustes_rotation_label = QLabel("Manual rotation (deg)")
+        display_layout.addWidget(self.surface_procrustes_rotation_label, row, 0)
+        self.surface_procrustes_rotation_spin = QDoubleSpinBox()
+        self.surface_procrustes_rotation_spin.setRange(-180.0, 180.0)
+        self.surface_procrustes_rotation_spin.setDecimals(1)
+        self.surface_procrustes_rotation_spin.setSingleStep(15.0)
+        self.surface_procrustes_rotation_spin.setValue(0.0)
+        self.surface_procrustes_rotation_spin.setSuffix(" deg")
+        self.surface_procrustes_rotation_spin.valueChanged.connect(
+            self._on_surface_procrustes_rotation_changed
+        )
+        display_layout.addWidget(self.surface_procrustes_rotation_spin, row, 1)
+        row += 1
+
         self.render_3d_button = QPushButton("Render")
         self.render_3d_button.clicked.connect(self._trigger_render_3d)
-        display_layout.addWidget(self.render_3d_button, row, 0, 1, 2)
+        display_layout.addWidget(self.render_3d_button, row, 0)
+        self.render_static_button = QPushButton("Save Static Figure")
+        self.render_static_button.setToolTip(
+            "Write the fsaverage surface figure directly to a file without opening the interactive viewer."
+        )
+        self.render_static_button.clicked.connect(self._trigger_render_static)
+        display_layout.addWidget(self.render_static_button, row, 1)
         row += 1
         display_layout.setRowStretch(row, 1)
 
@@ -658,6 +852,28 @@ class GradientsPrepareDialog(QDialog):
             except Exception:
                 pass
 
+    def _on_surface_color_scale_auto_changed(self, checked):
+        if self._surface_color_scale_auto_changed_callback is not None:
+            try:
+                self._surface_color_scale_auto_changed_callback(bool(checked))
+            except Exception:
+                pass
+        self._refresh_action_state()
+
+    def _on_surface_color_scale_min_changed(self, value):
+        if self._surface_color_scale_min_changed_callback is not None:
+            try:
+                self._surface_color_scale_min_changed_callback(float(value))
+            except Exception:
+                pass
+
+    def _on_surface_color_scale_max_changed(self, value):
+        if self._surface_color_scale_max_changed_callback is not None:
+            try:
+                self._surface_color_scale_max_changed_callback(float(value))
+            except Exception:
+                pass
+
     def _on_surface_mesh_changed(self, value):
         if self._surface_mesh_changed_callback is not None:
             try:
@@ -669,6 +885,66 @@ class GradientsPrepareDialog(QDialog):
         if self._surface_style_changed_callback is not None:
             try:
                 self._surface_style_changed_callback(self.selected_surface_style())
+            except Exception:
+                pass
+        self._refresh_action_state()
+
+    def _on_surface_sampling_radius_changed(self, value):
+        if self._surface_sampling_radius_changed_callback is not None:
+            try:
+                self._surface_sampling_radius_changed_callback(self.selected_surface_sampling_radius())
+            except Exception:
+                pass
+
+    def _on_surface_contour_count_changed(self, value):
+        if self._surface_contour_count_changed_callback is not None:
+            try:
+                self._surface_contour_count_changed_callback(int(value))
+            except Exception:
+                pass
+
+    def _on_surface_contour_smoothing_changed(self, value):
+        if self._surface_contour_smoothing_changed_callback is not None:
+            try:
+                self._surface_contour_smoothing_changed_callback(int(value))
+            except Exception:
+                pass
+
+    def _on_surface_contour_min_width_changed(self, value):
+        if self._surface_contour_min_width_changed_callback is not None:
+            try:
+                self._surface_contour_min_width_changed_callback(float(value))
+            except Exception:
+                pass
+
+    def _on_surface_contour_width_by_value_changed(self, checked):
+        if self._surface_contour_width_by_value_changed_callback is not None:
+            try:
+                self._surface_contour_width_by_value_changed_callback(bool(checked))
+            except Exception:
+                pass
+
+    def _on_surface_parcel_outlines_visible_changed(self, checked):
+        if self._surface_parcel_outlines_visible_changed_callback is not None:
+            try:
+                self._surface_parcel_outlines_visible_changed_callback(bool(checked))
+            except Exception:
+                pass
+        self._refresh_action_state()
+
+    def _on_surface_parcel_outline_smoothing_changed(self, value):
+        if self._surface_parcel_outline_smoothing_changed_callback is not None:
+            try:
+                self._surface_parcel_outline_smoothing_changed_callback(
+                    self.selected_surface_parcel_outline_smoothing()
+                )
+            except Exception:
+                pass
+
+    def _on_surface_mask_path_changed(self, _value):
+        if self._surface_mask_changed_callback is not None:
+            try:
+                self._surface_mask_changed_callback(self.selected_surface_mask_path())
             except Exception:
                 pass
 
@@ -685,6 +961,7 @@ class GradientsPrepareDialog(QDialog):
                 self._surface_procrustes_changed_callback(bool(checked))
             except Exception:
                 pass
+        self._refresh_action_state()
 
     def _on_scatter_rotation_changed(self, value):
         if self._scatter_rotation_changed_callback is not None:
@@ -799,6 +1076,22 @@ class GradientsPrepareDialog(QDialog):
             except Exception:
                 pass
 
+    def _on_surface_procrustes_ref_changed(self, _index):
+        if self._surface_procrustes_ref_changed_callback is not None:
+            try:
+                self._surface_procrustes_ref_changed_callback(
+                    self.selected_surface_procrustes_ref_entry_id()
+                )
+            except Exception:
+                pass
+
+    def _on_surface_procrustes_rotation_changed(self, value):
+        if self._surface_procrustes_rotation_changed_callback is not None:
+            try:
+                self._surface_procrustes_rotation_changed_callback(float(value))
+            except Exception:
+                pass
+
     def _on_classification_ignore_lh_changed(self, _index):
         if self._classification_ignore_lh_changed_callback is not None:
             try:
@@ -846,6 +1139,32 @@ class GradientsPrepareDialog(QDialog):
     def _trigger_render_3d(self):
         if self._render_3d_callback is not None:
             self._render_3d_callback()
+
+    def _trigger_render_static(self):
+        if self._render_static_callback is not None:
+            self._render_static_callback()
+
+    def _trigger_open_surface_mask(self):
+        start_dir = str(Path.cwd())
+        current = self.selected_surface_mask_path()
+        if current:
+            try:
+                start_dir = str(Path(current).expanduser().parent)
+            except Exception:
+                pass
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select fsaverage render mask",
+            start_dir,
+            "NIfTI (*.nii *.nii.gz);;All files (*)",
+        )
+        if path:
+            self.set_surface_mask_path(path)
+            self._on_surface_mask_path_changed(path)
+
+    def _clear_surface_mask_path(self):
+        self.set_surface_mask_path("")
+        self._on_surface_mask_path_changed("")
 
     def _trigger_classify(self):
         if self._classify_callback is not None:
@@ -915,6 +1234,15 @@ class GradientsPrepareDialog(QDialog):
     def selected_hemisphere(self) -> str:
         return self.hemisphere_combo.currentText().strip()
 
+    def use_surface_auto_color_scale(self) -> bool:
+        return bool(self.surface_color_scale_auto_check.isChecked())
+
+    def selected_surface_color_scale_min(self) -> float:
+        return float(self.surface_color_scale_min_spin.value())
+
+    def selected_surface_color_scale_max(self) -> float:
+        return float(self.surface_color_scale_max_spin.value())
+
     def selected_surface_mesh(self) -> str:
         return self.surface_mesh_combo.currentText().strip()
 
@@ -922,11 +1250,41 @@ class GradientsPrepareDialog(QDialog):
         value = self.surface_style_combo.currentData()
         return str(value or "smooth").strip()
 
+    def selected_surface_sampling_radius(self) -> float:
+        return float(self.surface_sampling_radius_spin.value())
+
+    def selected_surface_contour_count(self) -> int:
+        return int(self.surface_contour_count_spin.value())
+
+    def selected_surface_contour_smoothing(self) -> int:
+        return int(self.surface_contour_smoothing_spin.value())
+
+    def selected_surface_contour_min_width(self) -> float:
+        return float(self.surface_contour_min_width_spin.value())
+
+    def use_surface_contour_width_by_value(self) -> bool:
+        return bool(self.surface_contour_width_by_value_check.isChecked())
+
+    def show_surface_parcel_outlines(self) -> bool:
+        return bool(self.surface_parcel_outlines_visible_check.isChecked())
+
+    def selected_surface_parcel_outline_smoothing(self) -> int:
+        return int(self.surface_parcel_outline_smoothing_spin.value())
+
+    def selected_surface_mask_path(self) -> str:
+        return self.surface_mask_path_edit.text().strip()
+
     def selected_surface_render_component_count(self) -> int:
         return int(self.surface_render_count_spin.value())
 
     def use_surface_procrustes(self) -> bool:
         return bool(self.surface_procrustes_check.isChecked())
+
+    def selected_surface_procrustes_ref_entry_id(self):
+        return self.surface_procrustes_ref_combo.currentData()
+
+    def selected_surface_procrustes_rotation_angle(self) -> float:
+        return float(self.surface_procrustes_rotation_spin.value())
 
     def selected_scatter_rotation(self) -> str:
         return self.scatter_rotation_combo.currentText().strip()
@@ -1177,6 +1535,49 @@ class GradientsPrepareDialog(QDialog):
         self.classification_ref_matrix_combo.blockSignals(False)
         self._refresh_classification_reference_visibility()
 
+    def set_surface_procrustes_reference_options(self, options, selected_entry_id=None) -> None:
+        current_data = self.surface_procrustes_ref_combo.currentData()
+        target_id = selected_entry_id if selected_entry_id is not None else current_data
+        self.surface_procrustes_ref_combo.blockSignals(True)
+        self.surface_procrustes_ref_combo.clear()
+        selected_index = -1
+        for idx, item in enumerate(list(options or [])):
+            if isinstance(item, dict):
+                label = str(item.get("label", "")).strip()
+                entry_id = item.get("id")
+            else:
+                try:
+                    label, entry_id = item
+                except Exception:
+                    continue
+                label = str(label).strip()
+            if not label:
+                label = str(entry_id or "reference")
+            self.surface_procrustes_ref_combo.addItem(label, entry_id)
+            if target_id is not None and entry_id == target_id:
+                selected_index = idx
+        if selected_index < 0 and self.surface_procrustes_ref_combo.count() > 0:
+            selected_index = 0
+        if selected_index >= 0:
+            self.surface_procrustes_ref_combo.setCurrentIndex(selected_index)
+        elif self.surface_procrustes_ref_combo.count() == 0:
+            self.surface_procrustes_ref_combo.addItem("No reference available", None)
+        self.surface_procrustes_ref_combo.blockSignals(False)
+        self._refresh_action_state()
+
+    def set_surface_procrustes_rotation_angle(self, value: float) -> None:
+        try:
+            angle = float(value)
+        except Exception:
+            angle = 0.0
+        if not math.isfinite(angle):
+            angle = 0.0
+        angle = max(-180.0, min(180.0, angle))
+        self.surface_procrustes_rotation_spin.blockSignals(True)
+        self.surface_procrustes_rotation_spin.setValue(angle)
+        self.surface_procrustes_rotation_spin.blockSignals(False)
+        self._refresh_action_state()
+
     def set_progress(self, minimum: int, maximum: int, value: int, text: str) -> None:
         self.progress_bar.setRange(int(minimum), int(maximum))
         self.progress_bar.setValue(int(value))
@@ -1300,6 +1701,36 @@ class GradientsPrepareDialog(QDialog):
             self.hemisphere_combo.setCurrentText(display)
         self.hemisphere_combo.blockSignals(False)
 
+    def set_surface_color_scale_auto(self, enabled: bool) -> None:
+        self.surface_color_scale_auto_check.blockSignals(True)
+        self.surface_color_scale_auto_check.setChecked(bool(enabled))
+        self.surface_color_scale_auto_check.blockSignals(False)
+        self._refresh_action_state()
+
+    def set_surface_color_scale_min(self, value: float) -> None:
+        try:
+            limit = float(value)
+        except Exception:
+            limit = -0.2
+        if not math.isfinite(limit):
+            limit = -0.2
+        limit = max(-1000000.0, min(1000000.0, limit))
+        self.surface_color_scale_min_spin.blockSignals(True)
+        self.surface_color_scale_min_spin.setValue(limit)
+        self.surface_color_scale_min_spin.blockSignals(False)
+
+    def set_surface_color_scale_max(self, value: float) -> None:
+        try:
+            limit = float(value)
+        except Exception:
+            limit = 0.2
+        if not math.isfinite(limit):
+            limit = 0.2
+        limit = max(-1000000.0, min(1000000.0, limit))
+        self.surface_color_scale_max_spin.blockSignals(True)
+        self.surface_color_scale_max_spin.setValue(limit)
+        self.surface_color_scale_max_spin.blockSignals(False)
+
     def set_surface_mesh(self, value: str) -> None:
         text = str(value or "fsaverage4").strip()
         if self.surface_mesh_combo.findText(text) < 0:
@@ -1312,12 +1743,86 @@ class GradientsPrepareDialog(QDialog):
         text = str(value or "smooth").strip().lower().replace("-", "_").replace(" ", "_")
         if text in {"parcel", "parcels", "parcel_boundaries", "parcel_boundary", "parcel_outline", "parcel_outlines"}:
             text = "parcel_outlines"
-        if text not in {"smooth", "parcel_outlines"}:
+        if text in {"contour", "contours", "contour_lines", "isoline", "isolines", "iso_contour", "iso_contours", "isocontour", "isocontours"}:
+            text = "contours"
+        if text not in {"smooth", "contours", "parcel_outlines"}:
             text = "smooth"
         index = self.surface_style_combo.findData(text)
         self.surface_style_combo.blockSignals(True)
         self.surface_style_combo.setCurrentIndex(index if index >= 0 else 0)
         self.surface_style_combo.blockSignals(False)
+        self._refresh_action_state()
+
+    def set_surface_contour_count(self, value: int) -> None:
+        try:
+            count = int(value)
+        except Exception:
+            count = 9
+        count = max(1, min(31, count))
+        self.surface_contour_count_spin.blockSignals(True)
+        self.surface_contour_count_spin.setValue(count)
+        self.surface_contour_count_spin.blockSignals(False)
+
+    def set_surface_contour_smoothing(self, value: int) -> None:
+        try:
+            count = int(value)
+        except Exception:
+            count = 32
+        count = max(0, min(128, count))
+        self.surface_contour_smoothing_spin.blockSignals(True)
+        self.surface_contour_smoothing_spin.setValue(count)
+        self.surface_contour_smoothing_spin.blockSignals(False)
+
+    def set_surface_contour_min_width(self, value: float) -> None:
+        try:
+            linewidth = float(value)
+        except Exception:
+            linewidth = 0.2
+        if not math.isfinite(linewidth):
+            linewidth = 0.2
+        linewidth = max(0.05, min(3.0, linewidth))
+        self.surface_contour_min_width_spin.blockSignals(True)
+        self.surface_contour_min_width_spin.setValue(linewidth)
+        self.surface_contour_min_width_spin.blockSignals(False)
+
+    def set_surface_contour_width_by_value(self, enabled: bool) -> None:
+        self.surface_contour_width_by_value_check.blockSignals(True)
+        self.surface_contour_width_by_value_check.setChecked(bool(enabled))
+        self.surface_contour_width_by_value_check.blockSignals(False)
+
+    def set_surface_parcel_outlines_visible(self, enabled: bool) -> None:
+        self.surface_parcel_outlines_visible_check.blockSignals(True)
+        self.surface_parcel_outlines_visible_check.setChecked(bool(enabled))
+        self.surface_parcel_outlines_visible_check.blockSignals(False)
+        self._refresh_action_state()
+
+    def set_surface_parcel_outline_smoothing(self, value: int) -> None:
+        try:
+            count = int(value)
+        except Exception:
+            count = 2
+        count = max(0, min(32, count))
+        self.surface_parcel_outline_smoothing_spin.blockSignals(True)
+        self.surface_parcel_outline_smoothing_spin.setValue(count)
+        self.surface_parcel_outline_smoothing_spin.blockSignals(False)
+
+    def set_surface_sampling_radius(self, value: float) -> None:
+        try:
+            radius = float(value)
+        except Exception:
+            radius = 6.0
+        if not math.isfinite(radius):
+            radius = 6.0
+        radius = max(0.5, min(12.0, radius))
+        self.surface_sampling_radius_spin.blockSignals(True)
+        self.surface_sampling_radius_spin.setValue(radius)
+        self.surface_sampling_radius_spin.blockSignals(False)
+
+    def set_surface_mask_path(self, path) -> None:
+        text = "" if path is None else str(path).strip()
+        self.surface_mask_path_edit.blockSignals(True)
+        self.surface_mask_path_edit.setText(text)
+        self.surface_mask_path_edit.blockSignals(False)
 
     def set_surface_render_component_limit(self, value: int) -> None:
         try:
@@ -1345,6 +1850,7 @@ class GradientsPrepareDialog(QDialog):
         self.surface_procrustes_check.blockSignals(True)
         self.surface_procrustes_check.setChecked(bool(enabled))
         self.surface_procrustes_check.blockSignals(False)
+        self._refresh_action_state()
 
     def set_surface_procrustes_available(self, available: bool) -> None:
         self._surface_procrustes_available = bool(available)
@@ -1599,6 +2105,13 @@ class GradientsPrepareDialog(QDialog):
 
     def _refresh_action_state(self) -> None:
         can_interact = not self._busy
+        contour_controls_enabled = can_interact and self.selected_surface_style() == "contours"
+        parcel_outline_controls_enabled = (
+            can_interact and self.selected_surface_style() == "parcel_outlines"
+        )
+        parcel_outline_smoothing_enabled = (
+            parcel_outline_controls_enabled and self.show_surface_parcel_outlines()
+        )
         self.compute_button.setEnabled(self._can_compute and can_interact and not self._precomputed_mode)
         self.matrix_combo.setEnabled(can_interact)
         self.parcel_label_key_combo.setEnabled(can_interact and not self._precomputed_mode)
@@ -1606,10 +2119,41 @@ class GradientsPrepareDialog(QDialog):
         self.components_spin.setEnabled(can_interact and not self._precomputed_mode)
         self.parcellation_button.setEnabled(can_interact)
         self.hemisphere_combo.setEnabled(can_interact)
+        self.surface_color_scale_auto_check.setEnabled(can_interact)
+        color_scale_enabled = can_interact and not self.surface_color_scale_auto_check.isChecked()
+        self.surface_color_scale_min_label.setEnabled(color_scale_enabled)
+        self.surface_color_scale_min_spin.setEnabled(color_scale_enabled)
+        self.surface_color_scale_max_label.setEnabled(color_scale_enabled)
+        self.surface_color_scale_max_spin.setEnabled(color_scale_enabled)
         self.surface_mesh_combo.setEnabled(can_interact)
         self.surface_style_combo.setEnabled(can_interact)
+        self.surface_contour_count_label.setEnabled(contour_controls_enabled)
+        self.surface_contour_count_spin.setEnabled(contour_controls_enabled)
+        self.surface_contour_smoothing_label.setEnabled(contour_controls_enabled)
+        self.surface_contour_smoothing_spin.setEnabled(contour_controls_enabled)
+        self.surface_contour_min_width_label.setEnabled(contour_controls_enabled)
+        self.surface_contour_min_width_spin.setEnabled(contour_controls_enabled)
+        self.surface_contour_width_by_value_check.setEnabled(contour_controls_enabled)
+        self.surface_parcel_outlines_visible_check.setEnabled(parcel_outline_controls_enabled)
+        self.surface_parcel_outline_smoothing_label.setEnabled(parcel_outline_smoothing_enabled)
+        self.surface_parcel_outline_smoothing_spin.setEnabled(parcel_outline_smoothing_enabled)
+        self.surface_sampling_radius_spin.setEnabled(can_interact)
+        self.surface_mask_path_edit.setEnabled(can_interact)
+        self.surface_mask_browse_button.setEnabled(can_interact)
+        self.surface_mask_clear_button.setEnabled(can_interact)
         self.surface_render_count_spin.setEnabled(can_interact)
         self.surface_procrustes_check.setEnabled(can_interact and self._surface_procrustes_available)
+        surface_ref_enabled = (
+            can_interact
+            and self._surface_procrustes_available
+            and self.surface_procrustes_check.isChecked()
+            and self.surface_procrustes_ref_combo.currentData() is not None
+        )
+        manual_rotation_enabled = can_interact and not self.surface_procrustes_check.isChecked()
+        self.surface_procrustes_ref_label.setEnabled(surface_ref_enabled)
+        self.surface_procrustes_ref_combo.setEnabled(surface_ref_enabled)
+        self.surface_procrustes_rotation_label.setEnabled(manual_rotation_enabled)
+        self.surface_procrustes_rotation_spin.setEnabled(manual_rotation_enabled)
         self.scatter_rotation_combo.setEnabled(can_interact)
         self.triangular_rgb_check.setEnabled(can_interact)
         self.preload_matching_paths_check.setEnabled(
@@ -1648,6 +2192,7 @@ class GradientsPrepareDialog(QDialog):
             combo.setEnabled(can_interact)
         self.save_button.setEnabled(self._has_results and can_interact)
         self.render_3d_button.setEnabled(self._has_results and can_interact)
+        self.render_static_button.setEnabled(self._has_results and can_interact)
         self.classify_button.setEnabled(
             self._has_results
             and self._can_classify

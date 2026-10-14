@@ -7,6 +7,7 @@ import textwrap
 import unittest
 from unittest import mock
 
+import nibabel as nib
 import numpy as np
 
 import services.gradient_dialog_controller as gradient_module
@@ -51,16 +52,32 @@ class _ViewerStub:
                 "id": "entry-1",
                 "label": "matrix_a",
                 "path": Path("/tmp/matrix_a.npz"),
-            }
+            },
+            "entry-ref": {
+                "id": "entry-ref",
+                "label": "matrix_ref",
+                "path": Path("/tmp/matrix_ref.npz"),
+            },
         }
-        self._matrix = np.asarray(
-            [
-                [0.0, 1.0, 2.0],
-                [1.0, 0.0, 3.0],
-                [2.0, 3.0, 0.0],
-            ],
-            dtype=float,
-        )
+        self._matrix_by_entry = {
+            "entry-1": np.asarray(
+                [
+                    [0.0, 1.0, 2.0],
+                    [1.0, 0.0, 3.0],
+                    [2.0, 3.0, 0.0],
+                ],
+                dtype=float,
+            ),
+            "entry-ref": np.asarray(
+                [
+                    [0.0, 3.0, 2.0],
+                    [3.0, 0.0, 1.0],
+                    [2.0, 1.0, 0.0],
+                ],
+                dtype=float,
+            ),
+        }
+        self._matrix = self._matrix_by_entry["entry-1"]
         self._data_access = _DataAccessStub()
         self._gradient_selected_entry_id = "entry-1"
         self._gradient_component_count = 2
@@ -68,7 +85,20 @@ class _ViewerStub:
         self._gradient_precomputed_selected_row = None
         self._gradient_use_precomputed_bundle = False
         self._gradient_surface_style = "smooth"
+        self._gradient_surface_color_scale_auto = True
+        self._gradient_surface_color_scale_min = -0.2
+        self._gradient_surface_color_scale_max = 0.2
+        self._gradient_surface_sampling_radius = 6.0
+        self._gradient_surface_contour_count = 9
+        self._gradient_surface_contour_smoothing = 32
+        self._gradient_surface_contour_min_width = 0.2
+        self._gradient_surface_contour_width_by_value = False
+        self._gradient_surface_parcel_outlines_visible = True
+        self._gradient_surface_parcel_outline_smoothing = 2
+        self._gradient_surface_mask_path = ""
         self._active_parcellation_path = Path("/tmp/template.nii.gz")
+        self._gradient_surface_procrustes_ref_entry_id = None
+        self._gradient_surface_procrustes_rotation_angle = 0.0
         self._active_parcellation_img = _TemplateImageStub()
         self._active_parcellation_data = np.asarray(
             [
@@ -92,8 +122,13 @@ class _ViewerStub:
     def _current_entry(self):
         return None
 
-    def _matrix_for_entry(self, _entry):
-        return np.asarray(self._matrix, dtype=float), None
+    def _entry_ids(self):
+        return list(self._entries.keys())
+
+    def _matrix_for_entry(self, entry):
+        entry_id = entry.get("id") if isinstance(entry, dict) else None
+        matrix = self._matrix_by_entry.get(entry_id, self._matrix)
+        return np.asarray(matrix, dtype=float), None
 
 
 class _NetToolsStub:
@@ -139,6 +174,22 @@ def _make_controller(viewer):
 
 
 class GradientDialogControllerTests(unittest.TestCase):
+    def test_matrix_support_excludes_empty_or_nan_masked_nodes(self):
+        viewer = _ViewerStub()
+        controller = _make_controller(viewer)
+        matrix = np.asarray(
+            [
+                [0.0, 1.0, np.nan],
+                [1.0, 0.0, 0.0],
+                [np.nan, 0.0, np.nan],
+            ],
+            dtype=float,
+        )
+        np.testing.assert_array_equal(
+            controller._gradient_matrix_node_support(matrix),
+            np.asarray([True, True, False]),
+        )
+
     def test_compute_gradients_defers_projection_until_render(self):
         viewer = _ViewerStub()
         controller = _make_controller(viewer)
@@ -165,6 +216,14 @@ class GradientDialogControllerTests(unittest.TestCase):
         self.assertIs(viewer._open_gradients_dialog.__self__, viewer)
         self.assertEqual(viewer._normalize_gradient_surface_mesh("bad-mesh"), "fsaverage4")
         self.assertEqual(viewer._normalize_gradient_surface_style("parcel boundary"), "parcel_outlines")
+        self.assertEqual(viewer._normalize_gradient_surface_sampling_radius(99), 12.0)
+        self.assertEqual(viewer._normalize_gradient_surface_color_scale_limit(2e6), 1000000.0)
+        self.assertEqual(viewer._normalize_gradient_surface_contour_count(99), 31)
+        self.assertEqual(viewer._normalize_gradient_surface_contour_smoothing(-5), 0)
+        self.assertEqual(viewer._normalize_gradient_surface_contour_min_width(99), 3.0)
+        self.assertIs(viewer._normalize_gradient_surface_contour_width_by_value(1), True)
+        self.assertIs(viewer._normalize_gradient_surface_parcel_outlines_visible(1), True)
+        self.assertEqual(viewer._normalize_gradient_surface_parcel_outline_smoothing(99), 32)
 
     def test_classification_scatter_call_sets_default_proximity_keywords(self):
         source = textwrap.dedent(inspect.getsource(GradientDialogController._classify_gradients_fsaverage))
@@ -217,7 +276,100 @@ class GradientDialogControllerTests(unittest.TestCase):
 
         self.assertIn("surface_style_changed_callback", init_source)
         self.assertIn('"Parcel outlines"', ui_source)
+        self.assertIn('"Iso-contours"', ui_source)
         self.assertIn("selected_surface_style", callback_source)
+
+    def test_surface_sampling_radius_control_is_exposed(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        callback_source = inspect.getsource(GradientsPrepareDialog._on_surface_sampling_radius_changed)
+
+        self.assertIn("surface_sampling_radius_changed_callback", init_source)
+        self.assertIn('"Sampling radius (mm)"', ui_source)
+        self.assertIn("selected_surface_sampling_radius", callback_source)
+
+    def test_surface_color_scale_controls_are_exposed_and_auto_gated(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        refresh_source = inspect.getsource(GradientsPrepareDialog._refresh_action_state)
+
+        self.assertIn("surface_color_scale_auto_changed_callback", init_source)
+        self.assertIn("surface_color_scale_min_changed_callback", init_source)
+        self.assertIn("surface_color_scale_max_changed_callback", init_source)
+        self.assertIn('"Auto color scale"', ui_source)
+        self.assertIn('"zmin"', ui_source)
+        self.assertIn('"zmax"', ui_source)
+        self.assertIn("not self.surface_color_scale_auto_check.isChecked()", refresh_source)
+
+    def test_surface_contour_controls_are_exposed_and_style_gated(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        refresh_source = inspect.getsource(GradientsPrepareDialog._refresh_action_state)
+
+        self.assertIn("surface_contour_count_changed_callback", init_source)
+        self.assertIn("surface_contour_smoothing_changed_callback", init_source)
+        self.assertIn("surface_contour_min_width_changed_callback", init_source)
+        self.assertIn("surface_contour_width_by_value_changed_callback", init_source)
+        self.assertIn('"Contour count"', ui_source)
+        self.assertIn('"Contour smoothing"', ui_source)
+        self.assertIn('"Contour min width"', ui_source)
+        self.assertIn('"Vary contour width by value"', ui_source)
+        self.assertIn('selected_surface_style() == "contours"', refresh_source)
+
+    def test_surface_parcel_outline_smoothing_control_is_exposed_and_style_gated(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        refresh_source = inspect.getsource(GradientsPrepareDialog._refresh_action_state)
+        callback_source = inspect.getsource(GradientsPrepareDialog._on_surface_parcel_outline_smoothing_changed)
+
+        self.assertIn("surface_parcel_outlines_visible_changed_callback", init_source)
+        self.assertIn("surface_parcel_outline_smoothing_changed_callback", init_source)
+        self.assertIn('"Show parcel outlines"', ui_source)
+        self.assertIn('"Parcel outline smoothing"', ui_source)
+        self.assertIn("setRange(0, 32)", ui_source)
+        self.assertIn("selected_surface_parcel_outline_smoothing", callback_source)
+        self.assertIn('selected_surface_style() == "parcel_outlines"', refresh_source)
+        self.assertIn("show_surface_parcel_outlines", refresh_source)
+
+    def test_surface_procrustes_reference_control_is_exposed_and_alignment_gated(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        refresh_source = inspect.getsource(GradientsPrepareDialog._refresh_action_state)
+        callback_source = inspect.getsource(GradientsPrepareDialog._on_surface_procrustes_ref_changed)
+
+        self.assertIn("surface_procrustes_ref_changed_callback", init_source)
+        self.assertIn('"Procrustes reference"', ui_source)
+        self.assertIn("selected_surface_procrustes_ref_entry_id", callback_source)
+        self.assertIn("surface_procrustes_check.isChecked()", refresh_source)
+
+    def test_surface_manual_rotation_control_is_disabled_when_alignment_checked(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        refresh_source = inspect.getsource(GradientsPrepareDialog._refresh_action_state)
+        callback_source = inspect.getsource(GradientsPrepareDialog._on_surface_procrustes_rotation_changed)
+
+        self.assertIn("surface_procrustes_rotation_changed_callback", init_source)
+        self.assertIn('"Manual rotation (deg)"', ui_source)
+        self.assertIn("surface_procrustes_rotation_changed_callback", callback_source)
+        self.assertIn("not self.surface_procrustes_check.isChecked()", refresh_source)
+
+    def test_surface_mask_control_is_exposed(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        callback_source = inspect.getsource(GradientsPrepareDialog._on_surface_mask_path_changed)
+
+        self.assertIn("surface_mask_changed_callback", init_source)
+        self.assertIn('"Mask image"', ui_source)
+        self.assertIn("selected_surface_mask_path", callback_source)
+
+    def test_static_surface_action_is_exposed(self):
+        init_source = inspect.getsource(GradientsPrepareDialog.__init__)
+        ui_source = inspect.getsource(GradientsPrepareDialog._build_ui)
+        trigger_source = inspect.getsource(GradientsPrepareDialog._trigger_render_static)
+
+        self.assertIn("render_static_callback", init_source)
+        self.assertIn('QPushButton("Save Static Figure")', ui_source)
+        self.assertIn("self._render_static_callback", trigger_source)
 
     def test_surface_style_normalizes_parcel_outline_aliases(self):
         self.assertEqual(
@@ -225,9 +377,186 @@ class GradientDialogControllerTests(unittest.TestCase):
             "parcel_outlines",
         )
         self.assertEqual(
+            GradientSurfaceDialog._normalize_surface_style("isoline"),
+            "contours",
+        )
+        self.assertEqual(
+            GradientDialogController._normalize_gradient_surface_style("iso contours"),
+            "contours",
+        )
+        self.assertEqual(
             GradientSurfaceDialog._normalize_surface_style("bad-style"),
             "smooth",
         )
+        self.assertEqual(GradientSurfaceDialog._normalize_contour_count(0), 1)
+        self.assertEqual(GradientSurfaceDialog._normalize_contour_count(99), 31)
+        self.assertEqual(GradientSurfaceDialog._normalize_contour_smoothing(-1), 0)
+        self.assertEqual(GradientSurfaceDialog._normalize_contour_smoothing(999), 128)
+        self.assertEqual(GradientSurfaceDialog._normalize_contour_min_linewidth(-1), 0.05)
+        self.assertEqual(GradientSurfaceDialog._normalize_contour_min_linewidth(99), 3.0)
+
+    def test_surface_display_range_respects_manual_color_scale(self):
+        data = np.asarray([[-0.1, 0.0, 0.1]], dtype=float)
+
+        vmin, vmax, _threshold = GradientSurfaceDialog._compute_display_range(
+            data,
+            color_scale_min=-0.5,
+            color_scale_max=0.25,
+        )
+
+        self.assertEqual(vmin, -0.5)
+        self.assertEqual(vmax, 0.25)
+
+    def test_shared_isoline_levels_respects_requested_count(self):
+        levels = GradientSurfaceDialog._shared_isoline_levels(
+            [np.asarray([-2.0, -1.0, 0.0, 1.0, 2.0])],
+            level_count=5,
+        )
+
+        self.assertEqual(levels.size, 5)
+
+    def test_isoline_linewidth_is_uniform_by_default(self):
+        renderer = GradientSurfaceDialog.__new__(GradientSurfaceDialog)
+        renderer._contour_min_linewidth = 0.2
+        renderer._contour_width_by_value = False
+        levels = np.asarray([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=float)
+
+        widths = [renderer._isoline_linewidth(level, levels)[0] for level in levels]
+
+        self.assertEqual(len(set(np.round(widths, 12))), 1)
+
+    def test_isoline_linewidth_respects_minimum_when_value_width_enabled(self):
+        renderer = GradientSurfaceDialog.__new__(GradientSurfaceDialog)
+        renderer._contour_min_linewidth = 1.0
+        renderer._contour_width_by_value = True
+        levels = np.asarray([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=float)
+
+        linewidth, _is_zero = renderer._isoline_linewidth(-2.0, levels)
+
+        self.assertGreaterEqual(linewidth, 1.0)
+
+    def test_manual_gradient_rotation_180_flips_single_component(self):
+        components = np.asarray([[1.0], [-2.0], [3.0]], dtype=float)
+
+        rotated = GradientDialogController._rotate_gradient_components(components, 180.0)
+
+        np.testing.assert_array_equal(rotated, -components)
+
+    def test_manual_gradient_rotation_90_uses_first_two_components(self):
+        components = np.asarray(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+        rotated = GradientDialogController._rotate_gradient_components(components, 90.0)
+
+        np.testing.assert_allclose(
+            rotated,
+            np.asarray(
+                [
+                    [0.0, 1.0],
+                    [-1.0, 0.0],
+                ],
+                dtype=float,
+            ),
+            atol=1e-12,
+        )
+
+    def test_surface_procrustes_reference_options_include_workspace_reference(self):
+        viewer = _ViewerStub()
+        controller = _make_controller(viewer)
+
+        options = controller._available_gradient_surface_procrustes_reference_entries()
+
+        self.assertEqual([option["id"] for option in options], ["entry-ref"])
+        self.assertIn("Workspace: matrix_ref", options[0]["label"])
+
+    def test_workspace_surface_procrustes_reference_computes_matching_gradients(self):
+        viewer = _ViewerStub()
+        controller = _make_controller(viewer)
+        viewer._last_gradients = {
+            "projection_labels": np.asarray([1, 2, 3], dtype=int),
+            "keep_indices": np.asarray([0, 1, 2], dtype=int),
+        }
+        viewer._gradient_surface_procrustes_ref_entry_id = "entry-ref"
+        nettools_stub = _NetToolsStub()
+
+        with mock.patch.object(gradient_module, "nettools", nettools_stub):
+            payload = controller._surface_procrustes_reference_gradient_matrix(2)
+
+        self.assertEqual(payload["id"], "entry-ref")
+        self.assertEqual(payload["label"], "matrix_ref")
+        np.testing.assert_array_equal(
+            payload["gradients"],
+            np.asarray(
+                [
+                    [1.0, 2.0],
+                    [2.0, 3.0],
+                    [3.0, 4.0],
+                ],
+                dtype=float,
+            ),
+        )
+
+    def test_workspace_surface_procrustes_reference_accepts_direct_gradient_matrix(self):
+        viewer = _ViewerStub()
+        controller = _make_controller(viewer)
+        viewer._entries["entry-grad"] = {
+            "id": "entry-grad",
+            "label": "gradient_ref",
+            "path": Path("/tmp/gradient_ref.npz"),
+        }
+        viewer._matrix_by_entry["entry-grad"] = np.asarray(
+            [
+                [10.0, 20.0],
+                [30.0, 40.0],
+                [50.0, 60.0],
+            ],
+            dtype=float,
+        )
+        viewer._last_gradients = {
+            "projection_labels": np.asarray([1, 2, 3], dtype=int),
+            "keep_indices": np.asarray([0, 1, 2], dtype=int),
+        }
+        viewer._gradient_surface_procrustes_ref_entry_id = "entry-grad"
+
+        payload = controller._surface_procrustes_reference_gradient_matrix(2)
+
+        self.assertEqual(payload["id"], "entry-grad")
+        np.testing.assert_array_equal(
+            payload["gradients"],
+            np.asarray(
+                [
+                    [10.0, 20.0],
+                    [30.0, 40.0],
+                    [50.0, 60.0],
+                ],
+                dtype=float,
+            ),
+        )
+
+    def test_surface_contour_segments_follow_mesh_faces(self):
+        coords = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=float,
+        )
+        faces = np.asarray([[0, 1, 2]], dtype=int)
+        values = np.asarray([0.0, 1.0, 2.0], dtype=float)
+
+        contours = GradientSurfaceDialog._surface_contour_segments((coords, faces), values, [0.5])
+
+        self.assertEqual(len(contours), 1)
+        level, segments = contours[0]
+        self.assertEqual(level, 0.5)
+        self.assertEqual(segments.shape, (1, 2, 3))
+        self.assertTrue(np.allclose(segments[0, :, 2], 0.0))
 
     def test_boundary_segments_use_unique_edges_between_different_labels(self):
         coords = np.asarray(
@@ -250,6 +579,55 @@ class GradientDialogControllerTests(unittest.TestCase):
             for segment in segments
         }
         self.assertEqual(len(edge_keys), 3)
+
+    def test_smoothed_boundary_segments_add_curve_segments(self):
+        coords = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=float,
+        )
+        faces = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=int)
+        labels = np.asarray([1.0, 2.0, 2.0, 1.0], dtype=float)
+
+        raw = GradientSurfaceDialog._boundary_segments_from_labels((coords, faces), labels)
+        smoothed = GradientSurfaceDialog._smoothed_boundary_segments_from_labels(
+            (coords, faces),
+            labels,
+            iterations=2,
+        )
+
+        self.assertGreater(smoothed.shape[0], raw.shape[0])
+        self.assertEqual(smoothed.shape[1:], (2, 3))
+
+    def test_clean_label_texture_removes_single_vertex_island(self):
+        coords = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ],
+            dtype=float,
+        )
+        faces = np.asarray(
+            [
+                [0, 1, 3],
+                [0, 3, 2],
+                [0, 2, 4],
+                [0, 4, 1],
+            ],
+            dtype=int,
+        )
+        labels = np.asarray([2.0, 1.0, 1.0, 1.0, 1.0], dtype=float)
+
+        cleaned = GradientSurfaceDialog._clean_label_texture_for_boundaries((coords, faces), labels)
+
+        self.assertEqual(cleaned[0], 1.0)
 
     def test_filled_label_texture_replaces_empty_vertices_with_nearest_label(self):
         coords = np.asarray(
@@ -289,6 +667,40 @@ class GradientDialogControllerTests(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(filled, np.asarray([10.0, 10.0, 20.0, 20.0]))
+
+    def test_surface_mask_resamples_to_gradient_grid(self):
+        renderer = GradientSurfaceDialog.__new__(GradientSurfaceDialog)
+        renderer._img = nib.Nifti1Image(np.zeros((4, 4, 4), dtype=float), np.eye(4))
+        renderer._data = np.zeros((4, 4, 4, 1), dtype=float)
+        mask_img = nib.Nifti1Image(np.ones((2, 2, 2), dtype=float), np.diag([2.0, 2.0, 2.0, 1.0]))
+
+        resampled = renderer._mask_to_gradient_grid(mask_img)
+
+        self.assertEqual(resampled.shape, (4, 4, 4))
+        self.assertTrue(np.allclose(resampled.affine, np.eye(4)))
+
+    def test_surface_texture_applies_optional_mask_after_fill(self):
+        renderer = GradientSurfaceDialog.__new__(GradientSurfaceDialog)
+        renderer._surface_style = "smooth"
+        renderer._sampling_radius = 6.0
+        coords = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        )
+        faces = np.asarray([[0, 1, 2]], dtype=int)
+        values = np.asarray([1.0, np.nan, 3.0], dtype=float)
+        mask = np.asarray([1.0, 1.0, 0.0], dtype=float)
+        comp_img = nib.Nifti1Image(np.zeros((2, 2, 2), dtype=float), np.eye(4))
+
+        with mock.patch.object(GradientSurfaceDialog, "_vol_to_surf_robust", return_value=values):
+            texture = renderer._surface_texture(comp_img, (coords, faces), mask_texture=mask)
+
+        self.assertTrue(np.isfinite(texture[1]))
+        self.assertTrue(np.isnan(texture[2]))
 
     def test_project_paths_callback_receives_selected_path_only(self):
         dialog = GradientScatterDialog.__new__(GradientScatterDialog)
